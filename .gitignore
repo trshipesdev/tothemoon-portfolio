@@ -1,0 +1,11 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+*.log
+state_*.json
+
+# OS
+.DS_Store
+Thumbs.db

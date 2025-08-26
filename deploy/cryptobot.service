@@ -1,0 +1,19 @@
+[Unit]
+Description=Crypto Bot (Final Full Build)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/cryptobot
+EnvironmentFile=/home/ubuntu/cryptobot/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/cryptobot/bot_full.py
+Restart=always
+RestartSec=3
+User=ubuntu
+# Harden a bit
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
