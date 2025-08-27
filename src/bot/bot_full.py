@@ -177,6 +177,21 @@ except Exception:
 # Read from env first (default ON for safety)
 SHADOW_MODE = os.getenv("SHADOW_MODE", "true").strip().lower() in ("1","true","on","yes")
 
+
+def _git_sha_short():
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True
+        ).strip()
+    except Exception:
+        import os
+        return os.getenv("GIT_SHA", "local")
+
+BUILD = {"sha": _git_sha_short()}
+
+
 # Allow toggling at runtime and persist to STATE
 def set_shadow_mode(val: bool):
     global SHADOW_MODE
@@ -608,6 +623,24 @@ def tg_allowed(user_id: int) -> bool:
 # ================================
 from telegram import Update
 from telegram.ext import ContextTypes
+@require_auth
+async def cmd_version(update, context):
+    await update.message.reply_text(
+        f"build {BUILD['sha']} | shadow={'ON' if SHADOW_MODE else 'OFF'} | mode={CONFIG['mode']}"
+    )
+
+@require_auth
+async def cmd_restart(update, context):
+    # Safety: only allow if user typed '/restart now'
+    if not (context.args and context.args[0].lower() == "now"):
+        await update.message.reply_text("Confirm with: /restart now")
+        return
+    await update.message.reply_text("Restarting service… back in a few seconds.")
+    import threading, os, time
+    def _reboot():
+        time.sleep(0.5)
+        os._exit(0)  # systemd brings it back
+    threading.Thread(target=_reboot, daemon=True).start()
 
 def require_auth(fn):
     @wraps(fn)
@@ -931,6 +964,9 @@ def start_telegram():
     app.add_handler(CommandHandler("buy",  cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("shadow", cmd_shadow))
+    app.add_handler(CommandHandler("version",  cmd_version))
+    app.add_handler(CommandHandler("restart",  cmd_restart))
+
 
 
     log("Telegram polling (PTB v20+) starting…")
