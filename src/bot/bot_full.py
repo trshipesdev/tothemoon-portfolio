@@ -539,6 +539,25 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
     STATE["pnl_hist"].append(pnl)
     return {"sold": proceeds, "pnl": pnl}
 
+# --- LIVE stubs (fill later) + unified exec wrappers ---
+def live_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float) -> Dict[str, Any]:
+    # TODO: wire real DEX routers (Jupiter/Uniswap) here.
+    # For safety, refuse live orders until wired.
+    return {"error": "LIVE_EXEC_NOT_WIRED"}
+
+def live_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[str, Any]:
+    return {"error": "LIVE_EXEC_NOT_WIRED"}
+
+def exec_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float) -> Dict[str, Any]:
+    if SHADOW_MODE:
+        return shadow_buy(symbol, chain, usd, price, liq_usd)
+    return live_buy(symbol, chain, usd, price, liq_usd)
+
+def exec_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[str, Any]:
+    if SHADOW_MODE:
+        return shadow_sell(symbol, usd, price, liq_usd)
+    return live_sell(symbol, usd, price, liq_usd)
+
 # LIVE adapters: placeholders to integrate Jupiter/Uniswap routers safely.
 # Keep SHADOW_MODE=True until you wire these with your keys & routes.
 
@@ -739,32 +758,24 @@ async def cmd_help_long(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("See top-of-file docs: OBJECTIVES×STRATEGIES, AGE LOGIC, ALERTS, RUN.")
 
 @require_auth
-async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_buy(update, context):
     try:
-        args = context.args
-        symbol = args[0].upper()
-        usd = float(args[1])
-        chain = (args[2] if len(args) > 2 else "sol").lower()
-        price = float(args[3]) if len(args) > 3 else 1.0
-        liq = float(args[4]) if len(args) > 4 else 100000.0
+        symbol = context.args[0].upper()
+        usd = float(context.args[1])
+        chain = (context.args[2] if len(context.args) > 2 else "sol").lower()
+        price = float(context.args[3]) if len(context.args) > 3 else 1.0
+        liq = float(context.args[4]) if len(context.args) > 4 else 100000.0
         if usd <= 0:
             raise ValueError
-
-        if not SHADOW_MODE:
-            await update.message.reply_text(
-                "Shadow mode is OFF (live). Live trading isn’t wired here yet — no order placed."
-            )
+        res = exec_buy(symbol, chain, usd, price, liq)
+        if "error" in res:
+            await update.message.reply_text(f"❌ Live trade blocked: {res['error']}. Shadow mode is {'ON' if SHADOW_MODE else 'OFF'}.")
             return
-
-        res = shadow_buy(symbol, chain, usd, price, liq)
         await update.message.reply_text(
-            f"BOUGHT {symbol} ${usd:.2f} on {chain} @~{res['price']:.6f} "
-            f"units={res['units']:.4f} | vault=${STATE['vault_usd']:.2f}"
+            f"{'BOUGHT' if SHADOW_MODE else 'LIVE BUY'} {symbol} ${usd:.2f} on {chain} @~{res['price']:.6f} units={res['units']:.4f}"
         )
     except Exception:
-        await update.message.reply_text(
-            "Usage: /buy SYMBOL USD [chain=sol] [price=1.0] [liq=100000]"
-        )
+        await update.message.reply_text("Usage: /buy SYMBOL USD [chain] [price] [liq]")
 
 def _parse_amount_for_sell(pos, token: str) -> float:
     t = token.strip().lower()
@@ -777,22 +788,13 @@ def _parse_amount_for_sell(pos, token: str) -> float:
 
 
 @require_auth
-async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_sell(update, context):
     try:
-        args = context.args
-        symbol = args[0].upper()
-        amt_token = args[1]
-
-        if not SHADOW_MODE:
-            await update.message.reply_text(
-                "Shadow mode is OFF (live). Live trading isn’t wired here yet — no order placed."
-            )
-            return
-
-        # default ≈ +2% over avg so you see PnL movement in shadow
+        symbol = context.args[0].upper()
+        amt_token = context.args[1]
         default_price = STATE["positions"].get(symbol, {}).get("avg", 0.0) * 1.02 or 1.0
-        price = float(args[2]) if len(args) > 2 else default_price
-        liq = float(args[3]) if len(args) > 3 else 100000.0
+        price = float(context.args[2]) if len(context.args) > 2 else default_price
+        liq = float(context.args[3]) if len(context.args) > 3 else 100000.0
 
         pos = STATE["positions"].get(symbol)
         if not pos:
@@ -800,15 +802,15 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         usd = _parse_amount_for_sell(pos, amt_token)
-        res = shadow_sell(symbol, usd, price, liq)
+        res = exec_sell(symbol, usd, price, liq)
+        if "error" in res:
+            await update.message.reply_text(f"❌ Live trade blocked: {res['error']}. Shadow mode is {'ON' if SHADOW_MODE else 'OFF'}.")
+            return
         await update.message.reply_text(
-            f"SOLD {symbol} ${usd:.2f} @~{price:.6f} proceeds ${res['sold']:.2f} "
-            f"pnl ${res['pnl']:.2f} | vault=${STATE['vault_usd']:.2f}"
+            f"{'SOLD' if SHADOW_MODE else 'LIVE SELL'} {symbol} ${usd:.2f} @~{price:.6f} realized pnl ${res['pnl']:.2f}"
         )
     except Exception:
-        await update.message.reply_text(
-            "Usage: /sell SYMBOL <USD|%|all> [price≈+2% over avg] [liq=100000]"
-        )
+        await update.message.reply_text("Usage: /sell SYMBOL <USD|%|all> [price] [liq]")
 
 # ================================
 # P) FLASK ADMIN [CODE:FLASK]
