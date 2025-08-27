@@ -623,6 +623,14 @@ def tg_allowed(user_id: int) -> bool:
 # ================================
 from telegram import Update
 from telegram.ext import ContextTypes
+
+def require_auth(fn):
+    @wraps(fn)
+    async def w(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update and update.effective_user and not tg_allowed(update.effective_user.id):
+            return
+        return await fn(update, context)
+    return w
 @require_auth
 async def cmd_version(update, context):
     await update.message.reply_text(
@@ -641,14 +649,6 @@ async def cmd_restart(update, context):
         time.sleep(0.5)
         os._exit(0)  # systemd brings it back
     threading.Thread(target=_reboot, daemon=True).start()
-
-def require_auth(fn):
-    @wraps(fn)
-    async def w(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update and update.effective_user and not tg_allowed(update.effective_user.id):
-            return
-        return await fn(update, context)
-    return w
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # deliberately ungated so you can get your numeric user id
