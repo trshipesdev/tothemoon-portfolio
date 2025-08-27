@@ -1,14 +1,14 @@
-requests
-python-telegram-bot==13.15
-flask
-boto3
-pydantic
-# Optional EVM + Solana when you wire live trading:
-web3
-solders
+# Core
+requests>=2.31,<3
+python-telegram-bot>=20,<21
+Flask>=3,<4
+boto3>=1.34,<2
+pydantic>=2,<3
+python-dotenv>=1.0.1
 
-python-telegram-bot>=22.0,<23
-httpx>=0.28,<0.29
+# Optional (only needed when you wire LIVE trading)
+web3>=6,<7
 solana>=0.36.9
 
-python-dotenv>=1.0.1
+# If you truly need httpx separately, keep this; otherwise you can drop it
+httpx>=0.28,<0.29
