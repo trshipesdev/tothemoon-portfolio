@@ -1,12 +1,14 @@
-# --- core runtime ---
+# Core
+requests>=2.31,<3
 python-telegram-bot>=20,<21
-flask
-requests
-pydantic
-python-dotenv
+Flask>=3,<4
+boto3>=1.34,<2
+pydantic>=2,<3
+python-dotenv>=1.0.1
 
-# --- optional (install later when wiring live trading) ---
-# web3
-# solana>=0.36.9
-# solders
-# boto3
+# Optional (only needed when you wire LIVE trading)
+web3>=6,<7
+solana>=0.36.9
+
+# If you truly need httpx separately, keep this; otherwise you can drop it
+httpx>=0.28,<0.29

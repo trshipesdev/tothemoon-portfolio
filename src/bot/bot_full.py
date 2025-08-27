@@ -174,7 +174,15 @@ except Exception:
 # ================================
 # B) GLOBAL CONFIG [CODE:CONFIG]
 # ================================
-SHADOW_MODE = True  # Flip to False ONLY after you fill env secrets
+# Read from env first (default ON for safety)
+SHADOW_MODE = os.getenv("SHADOW_MODE", "true").strip().lower() in ("1","true","on","yes")
+
+# Allow toggling at runtime and persist to STATE
+def set_shadow_mode(val: bool):
+    global SHADOW_MODE
+    SHADOW_MODE = bool(val)
+    STATE["shadow_mode"] = SHADOW_MODE
+    save_state()
 
 CONFIG: Dict[str, Any] = {
     "tenant": {
@@ -612,6 +620,25 @@ def require_auth(fn):
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # deliberately ungated so you can get your numeric user id
     await update.message.reply_text(f"your id: {update.effective_user.id}")
+@require_auth
+async def cmd_shadow(update, context):
+    # /shadow       -> show current
+    # /shadow on    -> paper trading ON
+    # /shadow off   -> paper trading OFF (live flag)
+    arg = (context.args[0].lower() if context.args else "status")
+    if arg in ("on", "true", "1"):
+        set_shadow_mode(True)
+        await update.message.reply_text("Shadow mode: ON (paper trading).")
+    elif arg in ("off", "false", "0"):
+        set_shadow_mode(False)
+        await update.message.reply_text(
+            "Shadow mode: OFF (live flag set). "
+            "⚠️ Live execution not wired yet, so no on-chain orders will be placed."
+        )
+    else:
+        await update.message.reply_text(
+            f"Shadow mode is currently {'ON' if SHADOW_MODE else 'OFF'}. Usage: /shadow on|off"
+        )
 
 @require_auth
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -619,6 +646,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s, p in STATE["positions"].items():
         pos_lines.append(f"{s} {p['chain']} units={p['units']:.4f} usd~${p['usd']:.2f} avg~{p['avg']:.6f}")
     msg = (
+        f"Shadow: {'ON' if SHADOW_MODE else 'OFF'}\n"
         f"Vault: ${STATE['vault_usd']:.2f} (deployable ~${deployable_now():.2f})\n"
         f"Objective: {CONFIG['objective']['kind']} | Mode: {CONFIG['mode']}\n"
         f"Open today: ${STATE['open_today_usd']:.2f}\n"
@@ -678,22 +706,32 @@ async def cmd_help_long(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("See top-of-file docs: OBJECTIVES×STRATEGIES, AGE LOGIC, ALERTS, RUN.")
 
 @require_auth
-async def cmd_buy(update, ctx):
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        symbol = ctx.args[0].upper()
-        usd = float(ctx.args[1])
-        chain = (ctx.args[2] if len(ctx.args) > 2 else "sol").lower()
-        price = float(ctx.args[3]) if len(ctx.args) > 3 else 1.0
-        liq = float(ctx.args[4]) if len(ctx.args) > 4 else 100000.0
+        args = context.args
+        symbol = args[0].upper()
+        usd = float(args[1])
+        chain = (args[2] if len(args) > 2 else "sol").lower()
+        price = float(args[3]) if len(args) > 3 else 1.0
+        liq = float(args[4]) if len(args) > 4 else 100000.0
         if usd <= 0:
             raise ValueError
+
+        if not SHADOW_MODE:
+            await update.message.reply_text(
+                "Shadow mode is OFF (live). Live trading isn’t wired here yet — no order placed."
+            )
+            return
+
         res = shadow_buy(symbol, chain, usd, price, liq)
         await update.message.reply_text(
-            f"BOUGHT {symbol} ${usd:.2f} on {chain} @~{res['price']:.6f} units={res['units']:.4f}"
+            f"BOUGHT {symbol} ${usd:.2f} on {chain} @~{res['price']:.6f} "
+            f"units={res['units']:.4f} | vault=${STATE['vault_usd']:.2f}"
         )
     except Exception:
-        await update.message.reply_text("Usage: /buy SYMBOL USD [chain] [price] [liq]")
-
+        await update.message.reply_text(
+            "Usage: /buy SYMBOL USD [chain=sol] [price=1.0] [liq=100000]"
+        )
 
 def _parse_amount_for_sell(pos, token: str) -> float:
     t = token.strip().lower()
@@ -706,14 +744,22 @@ def _parse_amount_for_sell(pos, token: str) -> float:
 
 
 @require_auth
-async def cmd_sell(update, ctx):
+async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        symbol = ctx.args[0].upper()
-        amt_token = ctx.args[1]
-        # default price = ~+2% over avg so you can realize PnL in shadow
+        args = context.args
+        symbol = args[0].upper()
+        amt_token = args[1]
+
+        if not SHADOW_MODE:
+            await update.message.reply_text(
+                "Shadow mode is OFF (live). Live trading isn’t wired here yet — no order placed."
+            )
+            return
+
+        # default ≈ +2% over avg so you see PnL movement in shadow
         default_price = STATE["positions"].get(symbol, {}).get("avg", 0.0) * 1.02 or 1.0
-        price = float(ctx.args[2]) if len(ctx.args) > 2 else default_price
-        liq = float(ctx.args[3]) if len(ctx.args) > 3 else 100000.0
+        price = float(args[2]) if len(args) > 2 else default_price
+        liq = float(args[3]) if len(args) > 3 else 100000.0
 
         pos = STATE["positions"].get(symbol)
         if not pos:
@@ -723,10 +769,13 @@ async def cmd_sell(update, ctx):
         usd = _parse_amount_for_sell(pos, amt_token)
         res = shadow_sell(symbol, usd, price, liq)
         await update.message.reply_text(
-            f"SOLD {symbol} ${usd:.2f} @~{price:.6f} realized pnl ${res['pnl']:.2f}"
+            f"SOLD {symbol} ${usd:.2f} @~{price:.6f} proceeds ${res['sold']:.2f} "
+            f"pnl ${res['pnl']:.2f} | vault=${STATE['vault_usd']:.2f}"
         )
     except Exception:
-        await update.message.reply_text("Usage: /sell SYMBOL <USD|%|all> [price] [liq]")
+        await update.message.reply_text(
+            "Usage: /sell SYMBOL <USD|%|all> [price≈+2% over avg] [liq=100000]"
+        )
 
 # ================================
 # P) FLASK ADMIN [CODE:FLASK]
@@ -881,20 +930,36 @@ def start_telegram():
     app.add_handler(CommandHandler("help_long", cmd_help_long))
     app.add_handler(CommandHandler("buy",  cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
+    app.add_handler(CommandHandler("shadow", cmd_shadow))
+
 
     log("Telegram polling (PTB v20+) starting…")
     # This call BLOCKS on the main thread and owns its own asyncio loop.
     app.run_polling(allowed_updates=["message"], drop_pending_updates=False)
 
 def start_flask():
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8787), daemon=True).start()
+    threading.Thread(target=lambda: app.run(host="127.0.0.1", port=8787), daemon=True).start()
+
 
 def main():
+    # Load persisted state first so the log shows correct mode
+    load_state()
+
+    # If we’ve ever toggled via /shadow, prefer that over env
+    global SHADOW_MODE
+    if "shadow_mode" in STATE:
+        SHADOW_MODE = bool(STATE["shadow_mode"])
+    else:
+        # First run: record whatever env said
+        STATE["shadow_mode"] = SHADOW_MODE
+        save_state()
+
     log(f"Starting Crypto Bot (shadow mode {SHADOW_MODE})")
     # run engine + flask in background threads so Telegram can block main
     start_flask()
     threading.Thread(target=engine_loop, daemon=True).start()
     start_telegram()
+
 
 if __name__ == "__main__":
     main()
