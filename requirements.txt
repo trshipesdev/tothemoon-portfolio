@@ -1,14 +1,12 @@
-requests
-python-telegram-bot==13.15
+# --- core runtime ---
+python-telegram-bot>=20,<21
 flask
-boto3
+requests
 pydantic
-# Optional EVM + Solana when you wire live trading:
-web3
-solders
+python-dotenv
 
-python-telegram-bot>=22.0,<23
-httpx>=0.28,<0.29
-solana>=0.36.9
-
-python-dotenv>=1.0.1
+# --- optional (install later when wiring live trading) ---
+# web3
+# solana>=0.36.9
+# solders
+# boto3
