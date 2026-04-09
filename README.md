@@ -1,5 +1,5 @@
 # Crypto Bot — Final Full Build (Code + Docs)
-
+WIP WIP WIP WIP WIP
 This repo contains a single Python file (`bot_full.py`) with:
 - Multi-chain scanner (Solana, ETH/WETH, Base, BSC, Polygon) — **shadow-mode by default**
 - Objective × Strategy engine (they work *together*)
