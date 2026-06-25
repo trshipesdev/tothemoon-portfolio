@@ -9,3 +9,6 @@ state_*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Private hand-off docs (kept local, never published)
+HANDOFF-SETUP.md
