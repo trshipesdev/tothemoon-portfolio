@@ -2944,6 +2944,11 @@ def main():
     env_moon = os.getenv("MOONSHOT_MODE", "").strip().lower()
     if env_moon in ("enter", "suggest"):
         CONFIG["moonshot"]["mode"] = env_moon
+    # AI auto-pilot on/off survives restarts via env
+    if os.getenv("AI_ENABLED", "").strip().lower() in ("1", "true", "on", "yes"):
+        CONFIG["ai"]["enabled"] = True
+    if os.getenv("AI_AUTO_APPLY", "").strip().lower() in ("1", "true", "on", "yes"):
+        CONFIG["ai"]["auto_apply"] = True
 
     # Validate CONFIG mode is defined
     if CONFIG["mode"] not in CONFIG["modes"]:
