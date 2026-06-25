@@ -119,7 +119,11 @@
             <template x-for="[sym, p] in posEntries" :key="sym">
               <tr :class="p.pnl_pct >= 0 ? 'border-l-2 border-green-700' : 'border-l-2 border-red-800'"
                   class="border-b border-gray-800/50 hover:bg-gray-900/50">
-                <td class="py-2 pr-3 font-bold" x-text="sym"></td>
+                <td class="py-2 pr-3 font-bold">
+                  <a x-show="dexUrl(p.chain, p.address)" :href="dexUrl(p.chain, p.address)" target="_blank" rel="noopener"
+                     class="text-blue-400 hover:underline" x-text="sym" title="Open chart on DexScreener"></a>
+                  <span x-show="!dexUrl(p.chain, p.address)" x-text="sym"></span>
+                </td>
                 <td class="py-2 pr-3 text-gray-400 uppercase" x-text="p.chain"></td>
                 <td class="py-2 pr-3 text-right text-gray-500" x-text="fmtP(p.avg)"></td>
                 <td class="py-2 pr-3 text-right" x-text="fmtP(p.cur_price)"></td>
@@ -399,7 +403,11 @@
           <template x-for="t in (history.trades ?? []).slice().reverse().slice(0, 100)" :key="t.ts + t.symbol">
             <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
               <td class="py-1.5 pr-3 text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></td>
-              <td class="py-1.5 pr-3 font-bold" x-text="t.symbol"></td>
+              <td class="py-1.5 pr-3 font-bold">
+                <a x-show="dexUrl(t.chain, t.address)" :href="dexUrl(t.chain, t.address)" target="_blank" rel="noopener"
+                   class="text-blue-400 hover:underline" x-text="t.symbol" title="Open chart on DexScreener"></a>
+                <span x-show="!dexUrl(t.chain, t.address)" x-text="t.symbol"></span>
+              </td>
               <td :class="t.side === 'buy' ? 'text-blue-400' : 'text-orange-400'"
                   class="py-1.5 pr-3 uppercase font-bold" x-text="t.side"></td>
               <td class="py-1.5 pr-3 text-right"
@@ -500,7 +508,11 @@
             <template x-for="(e, i) in filteredScout" :key="i">
               <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
                 <td class="py-1.5 pr-3 text-gray-600 whitespace-nowrap" x-text="fmtTime(e.ts)" :title="fmtTimeUTC(e.ts)"></td>
-                <td class="py-1.5 pr-3 font-bold" x-text="e.symbol"></td>
+                <td class="py-1.5 pr-3 font-bold">
+                  <a x-show="dexUrl(e.chain, e.address)" :href="dexUrl(e.chain, e.address)" target="_blank" rel="noopener"
+                     class="text-blue-400 hover:underline" x-text="e.symbol" title="Open chart on DexScreener"></a>
+                  <span x-show="!dexUrl(e.chain, e.address)" x-text="e.symbol"></span>
+                </td>
                 <td class="py-1.5 pr-3 uppercase text-gray-500" x-text="e.chain"></td>
                 <td class="py-1.5 pr-3 font-bold uppercase"
                     :class="{'text-green-400': e.decision==='entered','text-yellow-400': e.decision==='suggested','text-gray-500': e.decision==='rejected'}"
@@ -1031,6 +1043,11 @@ function app() {
       return arr.map(x => '+' + (x * 100).toFixed(0) + '%').join(', ');
     },
     fmtSl(v) { return v != null ? '-' + (v * 100).toFixed(0) + '%' : '—'; },
+    dexUrl(chain, address) {
+      if (!address) return null;
+      const slug = { sol: 'solana', eth: 'ethereum', base: 'base', bsc: 'bsc', poly: 'polygon' }[chain] || chain;
+      return `https://dexscreener.com/${slug}/${address}`;
+    },
     heatCls(h) {
       return { alt_season: 'text-green-400', neutral: 'text-blue-400', btc_season: 'text-yellow-400', btc_max: 'text-red-400' }[h] ?? 'text-gray-500';
     },

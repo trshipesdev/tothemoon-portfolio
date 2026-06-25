@@ -2166,5 +2166,65 @@ class TestDynamicGas(unittest.TestCase):
         self.assertAlmostEqual(usd, 13.5, places=2)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 39. Clickable token links + plain-English exit reasons
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTokenLinks(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_dex_link_sol(self):
+        self.assertEqual(bot._dex_link("sol", "ABC"), "https://dexscreener.com/solana/ABC")
+
+    def test_dex_link_eth(self):
+        self.assertEqual(bot._dex_link("eth", "0x1"), "https://dexscreener.com/ethereum/0x1")
+
+    def test_dex_link_empty_address(self):
+        self.assertEqual(bot._dex_link("sol", ""), "")
+
+    def test_dex_link_unknown_chain_passthrough(self):
+        self.assertEqual(bot._dex_link("weird", "X"), "https://dexscreener.com/weird/X")
+
+    def test_buy_records_address_in_trade_log(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0, "tokaddr")
+        last = bot.STATE["trade_log"][-1]
+        self.assertEqual(last["address"], "tokaddr")
+
+    def test_sell_records_address_in_trade_log(self):
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0, "tokaddr")
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        sells = [t for t in bot.STATE["trade_log"] if t["side"] == "sell"]
+        self.assertEqual(sells[-1]["address"], "tokaddr")
+
+    def test_scout_records_address(self):
+        bot.STATE["scout_log"] = []
+        bot._scout("TST", "eth", "rejected", "x", None, "0xabc")
+        self.assertEqual(bot.STATE["scout_log"][0]["address"], "0xabc")
+
+
+class TestExitPlain(unittest.TestCase):
+
+    def test_rug(self):
+        self.assertIn("rug", bot._exit_plain("RUG liq 50000→10000").lower())
+
+    def test_velocity(self):
+        self.assertIn("dropped", bot._exit_plain("VELOCITY -17% in 5m").lower())
+
+    def test_trail(self):
+        self.assertIn("peak", bot._exit_plain("TRAIL STOP -15% from peak 0.002").lower())
+
+    def test_liq_drain(self):
+        self.assertIn("liquidity", bot._exit_plain("LIQ DRAIN 50000→40000 over 3 ticks").lower())
+
+    def test_fixed_sl(self):
+        self.assertIn("loss", bot._exit_plain("fixed_sl").lower())
+
+    def test_unknown_passthrough(self):
+        self.assertEqual(bot._exit_plain("something weird"), "something weird")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
