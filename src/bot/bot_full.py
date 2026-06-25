@@ -102,7 +102,11 @@ CONFIG: Dict[str, Any] = {
     "moonshot": {
         "mode":             "suggest",  # enter | suggest
         "size_mult":        1.5,
-        "liq_min":          25000,
+        # Lowered 25k→15k based on rejection analysis: both moonshots we missed
+        # (+106%, +274%) sat at $17–22k liq, just under the old floor. Pools below
+        # ~$10k almost all dumped AND are near-impossible to exit, so 15k is the
+        # data-backed sweet spot. Momentum exits cap the downside on the misses.
+        "liq_min":          15000,
         "liq_max":          250000,
         "hype_min":         80,         # 0–100
         "price_impact_max": 0.02,
