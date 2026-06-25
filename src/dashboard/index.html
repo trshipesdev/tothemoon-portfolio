@@ -232,6 +232,17 @@
                   class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
           </button>
         </div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Skim profit to income
+            <span class="text-gray-600 text-xs block" x-text="'(' + ((state.config?.skim_pct ?? 0.1)*100).toFixed(0) + '% of each win set aside)'"></span>
+          </span>
+          <button @click="toggleSkim()"
+                  :class="state.skim_enabled ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.skim_enabled ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
       </div>
 
       <!-- Manual Buy -->
@@ -345,7 +356,7 @@
       <div class="mb-4 bg-gray-900 rounded-xl p-4">
         <canvas id="pnlChart" height="100"></canvas>
       </div>
-      <div class="grid grid-cols-3 gap-3 mb-4">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
         <div class="bg-gray-900 rounded-xl p-3 text-center">
           <div class="text-gray-500 text-xs mb-1">Total Realized</div>
           <div :class="(history.total_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
@@ -364,6 +375,10 @@
             <span class="text-red-400" x-text="'-$' + fmt(Math.abs(history.avg_loss ?? 0))"></span>
           </div>
         </div>
+        <div class="bg-gray-900 rounded-xl p-3 text-center">
+          <div class="text-gray-500 text-xs mb-1">Gas paid</div>
+          <div class="font-bold text-yellow-400/80" x-text="'$' + fmt(state.gas_paid_usd ?? 0)"></div>
+        </div>
       </div>
       <table class="w-full text-xs">
         <thead>
@@ -371,14 +386,15 @@
             <th class="text-left py-2 pr-3 font-normal">Time</th>
             <th class="text-left py-2 pr-3 font-normal">Symbol</th>
             <th class="text-left py-2 pr-3 font-normal">Side</th>
-            <th class="text-right py-2 pr-3 font-normal">USD</th>
+            <th class="text-right py-2 pr-3 font-normal">$ In / Out</th>
+            <th class="text-right py-2 pr-3 font-normal">Gas</th>
             <th class="text-right py-2 pr-3 font-normal">PnL</th>
             <th class="text-right py-2 font-normal">Running</th>
           </tr>
         </thead>
         <tbody>
           <template x-if="!(history.trades?.length)">
-            <tr><td colspan="6" class="py-12 text-center text-gray-700">No trades yet</td></tr>
+            <tr><td colspan="7" class="py-12 text-center text-gray-700">No trades yet</td></tr>
           </template>
           <template x-for="t in (history.trades ?? []).slice().reverse().slice(0, 100)" :key="t.ts + t.symbol">
             <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
@@ -386,7 +402,11 @@
               <td class="py-1.5 pr-3 font-bold" x-text="t.symbol"></td>
               <td :class="t.side === 'buy' ? 'text-blue-400' : 'text-orange-400'"
                   class="py-1.5 pr-3 uppercase font-bold" x-text="t.side"></td>
-              <td class="py-1.5 pr-3 text-right text-gray-300" x-text="'$' + fmt(t.usd)"></td>
+              <td class="py-1.5 pr-3 text-right"
+                  :class="t.side === 'buy' ? 'text-red-300' : 'text-green-300'"
+                  x-text="(t.side === 'buy' ? '−$' : '+$') + fmt(t.usd)"
+                  :title="t.side === 'buy' ? 'money spent buying in' : 'money received selling out'"></td>
+              <td class="py-1.5 pr-3 text-right text-gray-600" x-text="t.gas != null ? '$' + fmt(t.gas) : '—'"></td>
               <td :class="(t.pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
                   class="py-1.5 pr-3 text-right font-bold"
                   x-text="t.pnl != null ? ((t.pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(t.pnl))) : '—'"></td>
@@ -437,6 +457,133 @@
             <div class="text-gray-500 text-xs" x-text="h.ms ? h.ms + ' ms' : '—'"></div>
           </div>
         </template>
+      </div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div x-show="tab === 'Settings'" class="grid md:grid-cols-2 gap-4">
+
+      <!-- Strategy tuning -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider">Strategy tuning</h3>
+
+        <label class="block text-xs text-gray-400">Presale safety score (min to auto-enter)
+          <div class="flex gap-2 mt-1">
+            <input x-model="cfg.presale_min_score" type="number" min="0" max="100"
+                   class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+            <button @click="post('/api/config', {presale_min_score: +cfg.presale_min_score}).then(refresh)"
+                    class="bg-blue-700 hover:bg-blue-600 rounded-lg px-3 text-xs font-bold">Set</button>
+          </div>
+          <span class="text-gray-600 text-xs" x-text="'current: ' + (state.config?.presale_min_score ?? '—') + '  (0 = off, 10 = social buzz, 70 = needs audit/KYC)'"></span>
+        </label>
+
+        <div class="flex items-center justify-between pt-1">
+          <span class="text-sm">Simulate gas/fees
+            <span class="text-gray-600 text-xs block">subtract real network costs from paper trades</span>
+          </span>
+          <button @click="post('/api/config', {gas_sim: !state.config?.gas_sim}).then(refresh)"
+                  :class="state.config?.gas_sim ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.gas_sim ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <div class="text-gray-600 text-xs" x-text="'gas paid so far (paper): $' + fmt(state.gas_paid_usd ?? 0)"></div>
+      </div>
+
+      <!-- Re-entry rules -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider">Re-entry rules</h3>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Re-entry enabled</span>
+          <button @click="post('/api/config', {reentry: {enabled: !state.config?.reentry?.enabled}}).then(refresh)"
+                  :class="state.config?.reentry?.enabled ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.reentry?.enabled ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Skip hard-dump exits
+            <span class="text-gray-600 text-xs block">don't re-buy tokens that crashed on you</span>
+          </span>
+          <button @click="post('/api/config', {reentry: {skip_hard_exits: !state.config?.reentry?.skip_hard_exits}}).then(refresh)"
+                  :class="state.config?.reentry?.skip_hard_exits ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.reentry?.skip_hard_exits ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <label class="block text-xs text-gray-400">Cooldown after exit (minutes)
+          <div class="flex gap-2 mt-1">
+            <input x-model="cfg.cooldown_min" type="number" min="0"
+                   class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+            <button @click="post('/api/config', {reentry: {cooldown_min: +cfg.cooldown_min}}).then(refresh)"
+                    class="bg-blue-700 hover:bg-blue-600 rounded-lg px-3 text-xs font-bold">Set</button>
+          </div>
+          <span class="text-gray-600 text-xs" x-text="'current: ' + (state.config?.reentry?.cooldown_min ?? '—') + ' min'"></span>
+        </label>
+      </div>
+
+      <!-- Pump detector tuning -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider">Old-coin pump detector</h3>
+        <label class="block text-xs text-gray-400">Volume spike multiplier (h1 vs avg)
+          <input x-model="cfg.volume_x" type="number" step="0.5" min="1"
+                 class="w-full mt-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+        </label>
+        <label class="block text-xs text-gray-400">Social mentions multiplier
+          <input x-model="cfg.mentions_x" type="number" step="0.5" min="1"
+                 class="w-full mt-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+        </label>
+        <button @click="post('/api/config/oldcoin', {volume_x: +cfg.volume_x, mentions_x: +cfg.mentions_x}).then(refresh)"
+                class="w-full bg-blue-700 hover:bg-blue-600 rounded-lg py-2 text-xs font-bold">Save pump settings</button>
+        <span class="text-gray-600 text-xs" x-text="'current: vol ' + (state.config?.oldcoin?.volume_x ?? '—') + '× · mentions ' + (state.config?.oldcoin?.mentions_x ?? '—') + '×'"></span>
+      </div>
+
+      <!-- DOGE trusted bag -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider">DOGE trusted bag</h3>
+        <label class="block text-xs text-gray-400">Core bag (units to always hold)
+          <input x-model="cfg.doge_core" type="number" min="0"
+                 class="w-full mt-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+        </label>
+        <label class="block text-xs text-gray-400">Exit band (trim between these prices)
+          <div class="flex gap-2 mt-1">
+            <input x-model="cfg.doge_lo" type="number" step="0.01" placeholder="low $"
+                   class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+            <input x-model="cfg.doge_hi" type="number" step="0.01" placeholder="high $"
+                   class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+          </div>
+        </label>
+        <button @click="saveDoge()"
+                class="w-full bg-blue-700 hover:bg-blue-600 rounded-lg py-2 text-xs font-bold">Save DOGE settings</button>
+        <span class="text-gray-600 text-xs"
+              x-text="'current: core ' + (state.config?.doge?.core_units ?? '—') + ' · band ' + JSON.stringify(state.config?.doge?.exit_band ?? [])"></span>
+      </div>
+
+      <!-- Backup / restore -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider">Backup &amp; restore</h3>
+        <button @click="doExport()"
+                class="w-full bg-gray-700 hover:bg-gray-600 rounded-lg py-2 text-xs font-bold">⬇ Export state (download JSON)</button>
+        <label class="block text-xs text-gray-400">Import / patch state (paste JSON)
+          <textarea x-model="importText" rows="3" placeholder='{"vault_usd": 1000}'
+                    class="w-full mt-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs font-mono"></textarea>
+        </label>
+        <button @click="doImport()"
+                class="w-full bg-yellow-700 hover:bg-yellow-600 rounded-lg py-2 text-xs font-bold">⬆ Apply import</button>
+      </div>
+
+      <!-- Danger zone -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3 border border-red-900/40">
+        <h3 class="text-red-500 text-xs uppercase tracking-wider">Danger zone</h3>
+        <div class="text-gray-500 text-xs">Build: <span x-text="state.build ?? '—'"></span> · drawdown brake:
+          <span :class="state.brake_active ? 'text-red-400' : 'text-gray-400'" x-text="state.brake_active ? 'ACTIVE' : 'off'"></span>
+        </div>
+        <button @click="doRestart()"
+                class="w-full bg-red-900 hover:bg-red-800 rounded-lg py-2 text-xs font-bold text-red-200">↻ Restart bot</button>
+        <span class="text-gray-600 text-xs block">Saves state, then the bot relaunches itself (a few seconds of downtime).</span>
       </div>
     </div>
 
@@ -496,7 +643,7 @@
 <script>
 function app() {
   return {
-    tabs: ['Positions', 'Controls', 'History', 'Alerts', 'RPC'],
+    tabs: ['Positions', 'Controls', 'History', 'Alerts', 'RPC', 'Settings'],
     tab:  'Positions',
 
     state:   { shadow_mode: true, mode: '…', signals: {}, objective: {}, watchlist: {} },
@@ -511,6 +658,8 @@ function app() {
     obj:      { target: '', weeks: '' },
     wl:       { symbol: '', address: '' },
     sprayDate: '',
+    cfg:      { presale_min_score: '', cooldown_min: '', volume_x: '', mentions_x: '', doge_core: '', doge_lo: '', doge_hi: '' },
+    importText: '',
 
     editModal:     { show: false, sym: '', tp: '', sl: '' },
     showTokenModal: false,
@@ -541,7 +690,18 @@ function app() {
         this.get('/api/alerts'),
         this.get('/api/rpc'),
       ]);
-      if (s)   this.state   = s;
+      if (s) {
+        this.state = s;
+        // Seed the Settings inputs from live config (only fill blanks, don't clobber typing)
+        const c = s.config || {};
+        if (this.cfg.presale_min_score === '') this.cfg.presale_min_score = c.presale_min_score ?? '';
+        if (this.cfg.cooldown_min === '')      this.cfg.cooldown_min      = c.reentry?.cooldown_min ?? '';
+        if (this.cfg.volume_x === '')          this.cfg.volume_x          = c.oldcoin?.volume_x ?? '';
+        if (this.cfg.mentions_x === '')        this.cfg.mentions_x        = c.oldcoin?.mentions_x ?? '';
+        if (this.cfg.doge_core === '')         this.cfg.doge_core         = c.doge?.core_units ?? '';
+        if (this.cfg.doge_lo === '')           this.cfg.doge_lo           = c.doge?.exit_band?.[0] ?? '';
+        if (this.cfg.doge_hi === '')           this.cfg.doge_hi           = c.doge?.exit_band?.[1] ?? '';
+      }
       if (p)   this.pos     = p;
       if (h) { this.history = h; this.$nextTick(() => this.drawChart(h)); }
       if (al)  this.alerts  = al;
@@ -582,6 +742,41 @@ function app() {
     async setMode(m) { await this.post('/api/mode', { mode: m }); await this.refresh(); },
     async toggleShadow()  { await this.post('/api/shadow', { enabled: !this.state.shadow_mode }); await this.refresh(); },
     async toggleAutoOld() { await this.post('/api/auto_old', { enabled: !this.state.auto_old }); await this.refresh(); },
+    async toggleSkim()    { await this.post('/api/skim', { enabled: !this.state.skim_enabled }); await this.refresh(); },
+
+    async saveDoge() {
+      const body = {};
+      if (this.cfg.doge_core !== '') body.core_units = +this.cfg.doge_core;
+      if (this.cfg.doge_lo !== '' && this.cfg.doge_hi !== '') body.exit_band = [+this.cfg.doge_lo, +this.cfg.doge_hi];
+      await this.post('/api/doge', body);
+      await this.refresh();
+    },
+    async doExport() {
+      const data = await this.get('/api/export');
+      if (!data) return;
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'tothemoon-state.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+      this.toast = { show: true, msg: 'Downloaded ✓', ok: true };
+      setTimeout(() => this.toast.show = false, 3000);
+    },
+    async doImport() {
+      let patch;
+      try { patch = JSON.parse(this.importText); }
+      catch { this.toast = { show: true, msg: 'Invalid JSON', ok: false }; setTimeout(() => this.toast.show = false, 3000); return; }
+      if (!confirm('Apply this patch to the bot state? This overwrites matching keys.')) return;
+      await this.post('/api/import', patch.state ? patch : { state: patch });
+      this.importText = '';
+      await this.refresh();
+    },
+    async doRestart() {
+      if (!confirm('Restart the bot? It saves state and relaunches (a few seconds of downtime).')) return;
+      await this.post('/api/restart', {});
+      this.toast = { show: true, msg: 'Restarting… refresh in ~10s', ok: true };
+    },
 
     async setBoost() {
       await this.post('/api/boost', { mult: +this.boost.mult, hours: +this.boost.hours });

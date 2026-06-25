@@ -118,14 +118,19 @@ CONFIG: Dict[str, Any] = {
         "vol_dry_pct":       0.20,  # alert if h1 vol < 20% of entry vol
         "liq_drain_ticks":   3,     # exit if liq declining for 3 consecutive ticks
         "liq_drain_pct":     0.05,  # each tick must drop >5% to count as drain
-        # Re-entry after exit
+        # Re-entry after exit (tightened: don't chase tokens that hard-dumped)
         "reentry": {
             "enabled":        True,
-            "cooldown_min":   5,    # wait at least 5 min after exit
-            "stable_ticks":   3,    # price must hold tight for 3 consecutive ticks (~60s)
-            "stable_range_pct": 0.04,  # within 4% high-low over those ticks
-            "liq_floor_pct":  0.60, # liq must be >= 60% of what it was at our entry
-            "vol_min_h1":     3000.0,  # h1 volume must still be alive
+            "cooldown_min":   15,   # wait at least 15 min after exit (was 5 — stop fast re-buys)
+            "stable_ticks":   4,    # price must hold tight for 4 consecutive ticks (~80s)
+            "stable_range_pct": 0.03,  # within 3% high-low over those ticks (was 4%)
+            "liq_floor_pct":  0.70, # liq must be >= 70% of entry liq (was 60%)
+            "vol_min_h1":     5000.0,  # h1 volume must still be alive (was 3000)
+            # Only re-enter tokens that COOLED OFF (trailing stop), never ones that
+            # hard-dumped (rug / velocity crash / liq drain / stop-loss). This is the
+            # fix for the "re-bought a loser 24s later" behavior.
+            "skip_hard_exits": True,
+            "max_per_day":    1,    # at most 1 re-entry attempt per token per day
         },
     },
 
@@ -162,6 +167,12 @@ CONFIG: Dict[str, Any] = {
     "stealth":  {"split_parts": [2, 4], "slip_bps_jitter": 30, "candidate_shuffle": True, "burst_per_30s": 4},
     "presale":  {"min_score": 70},  # legacy — use presale_min_score at top level
     "skim_pct": 0.10,  # fraction of realized profit moved to income_usd when skim is ON
+
+    # Network gas/transaction fees, applied to BOTH legs of every paper trade so
+    # shadow PnL reflects real on-chain costs. Approx USD per swap, per chain.
+    # Solana is ~free; Ethereum mainnet is brutal on small trades.
+    "gas_sim": True,
+    "gas_usd": {"sol": 0.001, "base": 0.02, "poly": 0.02, "bsc": 0.15, "eth": 6.0},
 }
 
 random.seed(CONFIG["tenant"]["jitter_seed"])
@@ -189,6 +200,7 @@ STATE: Dict[str, Any] = {
     "brake_alerted":    False,
     "reentry_watch":    {},  # sym → {exit_ts, entry_liq, entry_vol_h1, address, chain, price_samples}
     "open_burst":       [],  # timestamps of recent position opens for burst rate-limiting
+    "gas_paid_usd":     0.0,  # cumulative simulated gas/fees paid across all paper trades
 }
 
 _state_path_env = os.getenv("STATE_PATH", "")
@@ -659,6 +671,13 @@ def _jitter_slip(base_slip: float) -> float:
     return base_slip + random.uniform(0, jitter_bps / 10000)
 
 
+def _gas_usd(chain: str) -> float:
+    """Estimated network gas/fee in USD for one swap on `chain` (0 if gas sim off)."""
+    if not CONFIG.get("gas_sim", True):
+        return 0.0
+    return float(CONFIG.get("gas_usd", {}).get(chain, 0.05))
+
+
 def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float, address: str = "") -> Dict[str, Any]:
     if symbol not in STATE["positions"] and not _stealth_ok():
         log(f"BURST GUARD: skipping new open for {symbol} (too many opens in 30s)")
@@ -674,7 +693,7 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         "avg": 0.0, "realized": 0.0, "time": now_utc().isoformat(),
         "address": address, "add_count": 0, "last_add_ts": 0.0,
         "peak_price": filled_price, "entry_vol_h1": 0.0,
-        "entry_liq": liq_usd, "liq_ticks": [],
+        "entry_liq": liq_usd, "liq_ticks": [], "fees_usd": 0.0,
     })
     if address and not pos.get("address"):
         pos["address"] = address
@@ -682,15 +701,18 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         pos["peak_price"] = filled_price
     if is_new_pos:
         STATE.setdefault("open_burst", []).append(time.time())
+    gas = _gas_usd(chain)   # network fee to enter — a sunk cost on top of the buy
     new_total_units = pos["units"] + units
     pos["avg"]      = (pos["avg"] * pos["units"] + filled_price * units) / max(1e-9, new_total_units)
     pos["usd"]      += usd
     pos["units"]     = new_total_units
-    STATE["vault_usd"]      -= usd
+    pos["fees_usd"]  = pos.get("fees_usd", 0.0) + gas
+    STATE["vault_usd"]      -= (usd + gas)
     STATE["open_today_usd"] += usd
+    STATE["gas_paid_usd"]    = STATE.get("gas_paid_usd", 0.0) + gas
     STATE.setdefault("trade_log", []).append({
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
-        "side": "buy", "usd": usd, "price": filled_price, "units": units, "pnl": None,
+        "side": "buy", "usd": usd, "price": filled_price, "units": units, "gas": gas, "pnl": None,
     })
     return {"price": filled_price, "units": units}
 
@@ -701,15 +723,20 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
         return {"sold": 0.0, "pnl": 0.0}
     portion  = min(1.0, usd / max(1e-9, pos["usd"]))
     units    = pos["units"] * portion
-    proceeds = units * price * (1 - 0.002)
+    gas      = _gas_usd(pos.get("chain", "sol"))           # exit network fee
+    fee_share = pos.get("fees_usd", 0.0) * portion          # proportional entry gas
+    proceeds = units * price * (1 - 0.002) - gas            # exit fee out of proceeds
     cost     = units * pos["avg"]
-    pnl      = proceeds - cost
+    pnl      = proceeds - cost - fee_share                  # entry gas folded into PnL
     pos["units"]       -= units
     pos["usd"]         -= cost
+    pos["fees_usd"]     = max(0.0, pos.get("fees_usd", 0.0) - fee_share)
     if pos["units"] <= 0:
         pos["avg"]      = 0.0
         pos["tp_index"] = 0   # reset for potential re-entry into same symbol
+        pos["fees_usd"] = 0.0
     pos["realized"]    += pnl
+    STATE["gas_paid_usd"] = STATE.get("gas_paid_usd", 0.0) + gas
     if STATE.get("skim", {}).get("enabled") and pnl > 0:
         skim = pnl * CONFIG.get("skim_pct", 0.10)
         STATE["income_usd"] = STATE.get("income_usd", 0.0) + skim
@@ -718,7 +745,7 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
     STATE["pnl_hist"].append(pnl)
     STATE.setdefault("trade_log", []).append({
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "?"),
-        "side": "sell", "usd": proceeds, "price": price, "units": units, "pnl": pnl,
+        "side": "sell", "usd": proceeds, "price": price, "units": units, "gas": gas, "pnl": pnl,
     })
     return {"sold": proceeds, "pnl": pnl}
 
@@ -1306,8 +1333,19 @@ def manage_trusted_coins():
 # ---------------------------------------------------------------------------
 # Re-entry watch
 # ---------------------------------------------------------------------------
+# Exit reasons that mean the token FAILED (dumped) — don't chase these back in.
+# Only cooled-off winners (TRAIL STOP) qualify for re-entry.
+_HARD_EXIT_PREFIXES = ("RUG", "VELOCITY", "LIQ DRAIN", "fixed_sl")
+
+
 def _add_reentry_watch(sym: str, pos: Dict, cur_liq: float, cur_vol_h1: float, reason: str):
-    if not CONFIG["moonshot"]["reentry"]["enabled"] or not pos.get("address"):
+    R = CONFIG["moonshot"]["reentry"]
+    if not R["enabled"] or not pos.get("address"):
+        return
+    # Skip re-entry for hard-dump exits (rug, velocity crash, liq drain, stop-loss).
+    # This is the fix for re-buying a token that just failed us.
+    if R.get("skip_hard_exits", True) and reason.startswith(_HARD_EXIT_PREFIXES):
+        log(f"REENTRY SKIP {sym}: hard exit ({reason}) — not chasing it back")
         return
     STATE.setdefault("reentry_watch", {})[sym] = {
         "exit_ts":      time.time(),
@@ -1470,6 +1508,7 @@ def api_state():
         **{k: v for k, v in STATE.items() if k not in ("trade_log", "liq_prev")},
         "deployable_usd":  deployable_now(),
         "mode":            CONFIG["mode"],
+        "modes":           list(CONFIG["modes"].keys()),
         "mode_tp":         mode_cfg.get("tp", []),
         "mode_sl":         mode_cfg.get("sl", 0.0),
         "shadow_mode":     SHADOW_MODE,
@@ -1478,6 +1517,22 @@ def api_state():
         "objective_kind":  CONFIG["objective"]["kind"],
         "objective":       CONFIG["objective"],
         "watchlist":       CONFIG["oldcoin"].get("watchlist", {}),
+        "skim_enabled":    STATE.get("skim", {}).get("enabled", False),
+        "build":           BUILD.get("sha", "local"),
+        "brake_active":    drawdown_brake_active(),
+        # Tunable config surfaced so the dashboard can edit it
+        "config": {
+            "presale_min_score": CONFIG.get("presale_min_score", 10),
+            "gas_sim":           CONFIG.get("gas_sim", True),
+            "gas_usd":           CONFIG.get("gas_usd", {}),
+            "skim_pct":          CONFIG.get("skim_pct", 0.10),
+            "reentry":           CONFIG["moonshot"]["reentry"],
+            "oldcoin": {
+                "volume_x":   CONFIG["oldcoin"]["volume_x"],
+                "mentions_x": CONFIG["oldcoin"]["mentions_x"],
+            },
+            "doge": TRUSTED.get("DOGE", {}),
+        },
     })
 
 
@@ -1744,6 +1799,90 @@ def api_config_oldcoin():
     if "auto_join" in data:
         CONFIG["oldcoin"]["auto_join"] = bool(data["auto_join"])
     return jsonify({"ok": True})
+
+
+@app.route("/api/skim", methods=["POST"])
+@_dash_auth
+def api_skim():
+    enabled = bool((flask_request.get_json() or {}).get("enabled", False))
+    STATE.setdefault("skim", {})["enabled"] = enabled
+    save_state()
+    return jsonify({"ok": True, "skim_enabled": enabled})
+
+
+@app.route("/api/doge", methods=["POST"])
+@_dash_auth
+def api_doge():
+    """Tune the DOGE trusted-coin bag: core_units, exit_band [lo,hi], floor."""
+    data = flask_request.get_json() or {}
+    spec = TRUSTED.setdefault("DOGE", {})
+    if "core_units" in data:
+        spec["core_units"] = float(data["core_units"])
+    if "exit_band" in data and isinstance(data["exit_band"], list) and len(data["exit_band"]) == 2:
+        lo, hi = float(data["exit_band"][0]), float(data["exit_band"][1])
+        if 0 < lo < hi:
+            spec["exit_band"] = [lo, hi]
+        else:
+            return jsonify({"error": "exit_band must be 0 < lo < hi"}), 400
+    if "floor" in data:
+        spec["floor"] = float(data["floor"])
+    return jsonify({"ok": True, "doge": spec})
+
+
+@app.route("/api/config", methods=["POST"])
+@_dash_auth
+def api_config():
+    """Generic tuning: presale_min_score, gas_sim, skim_pct, reentry params."""
+    data = flask_request.get_json() or {}
+    if "presale_min_score" in data:
+        CONFIG["presale_min_score"] = int(data["presale_min_score"])
+    if "gas_sim" in data:
+        CONFIG["gas_sim"] = bool(data["gas_sim"])
+    if "skim_pct" in data:
+        CONFIG["skim_pct"] = max(0.0, min(1.0, float(data["skim_pct"])))
+    if isinstance(data.get("reentry"), dict):
+        for k in ("enabled", "cooldown_min", "stable_ticks", "stable_range_pct",
+                  "liq_floor_pct", "vol_min_h1", "skip_hard_exits", "max_per_day"):
+            if k in data["reentry"]:
+                CONFIG["moonshot"]["reentry"][k] = data["reentry"][k]
+    return jsonify({"ok": True})
+
+
+@app.route("/api/export", methods=["GET"])
+@_dash_auth
+def api_export():
+    return jsonify({
+        "state":                STATE,
+        "config_mode":          CONFIG["mode"],
+        "config_moonshot_mode": CONFIG["moonshot"]["mode"],
+        "config_objective":     CONFIG["objective"],
+        "shadow_mode":          SHADOW_MODE,
+    })
+
+
+@app.route("/api/import", methods=["POST"])
+@_dash_auth
+def api_import():
+    """Shallow-merge a JSON patch into STATE (same as /import_state in Telegram)."""
+    data = flask_request.get_json() or {}
+    patch = data.get("state", data)   # accept either {state:{...}} or a bare patch
+    if not isinstance(patch, dict):
+        return jsonify({"error": "expected a JSON object"}), 400
+    STATE.update(patch)
+    save_state()
+    return jsonify({"ok": True, "keys": list(patch.keys())})
+
+
+@app.route("/api/restart", methods=["POST"])
+@_dash_auth
+def api_restart():
+    """Flush state and exit; Docker (restart=unless-stopped) brings it back."""
+    save_state()
+    def _reboot():
+        time.sleep(0.3)
+        os._exit(0)
+    threading.Thread(target=_reboot, daemon=True).start()
+    return jsonify({"ok": True, "restarting": True})
 
 # ---------------------------------------------------------------------------
 # Alerts + logging

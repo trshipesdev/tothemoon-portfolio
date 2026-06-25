@@ -1725,5 +1725,186 @@ class TestEngineOnceSmoke(unittest.TestCase):
             self.fail(f"engine_once raised with position: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 33. Gas / fee simulation in paper trades
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGasSimulation(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.CONFIG["gas_sim"] = True
+
+    def test_gas_helper_returns_chain_cost(self):
+        self.assertAlmostEqual(bot._gas_usd("eth"), bot.CONFIG["gas_usd"]["eth"])
+        self.assertAlmostEqual(bot._gas_usd("sol"), bot.CONFIG["gas_usd"]["sol"])
+
+    def test_gas_helper_zero_when_disabled(self):
+        bot.CONFIG["gas_sim"] = False
+        self.assertEqual(bot._gas_usd("eth"), 0.0)
+        bot.CONFIG["gas_sim"] = True
+
+    def test_gas_unknown_chain_default(self):
+        self.assertGreater(bot._gas_usd("madeupchain"), 0.0)
+
+    def test_buy_charges_gas_to_vault(self):
+        gas = bot._gas_usd("eth")
+        bot.shadow_buy("TST", "eth", 50.0, 1.0, 100000.0)
+        # vault drops by usd + gas
+        self.assertAlmostEqual(bot.STATE["vault_usd"], 1000.0 - 50.0 - gas, places=4)
+
+    def test_buy_tracks_gas_paid(self):
+        before = bot.STATE.get("gas_paid_usd", 0.0)
+        bot.shadow_buy("TST", "eth", 50.0, 1.0, 100000.0)
+        self.assertGreater(bot.STATE["gas_paid_usd"], before)
+
+    def test_position_stores_entry_fee(self):
+        bot.shadow_buy("TST", "eth", 50.0, 1.0, 100000.0)
+        self.assertAlmostEqual(bot.STATE["positions"]["TST"]["fees_usd"], bot._gas_usd("eth"), places=6)
+
+    def test_eth_gas_hurts_pnl_more_than_sol(self):
+        # Same trade on eth vs sol — eth should net worse due to higher gas
+        bot.shadow_buy("SOLT", "sol", 50.0, 1.0, 100000.0)
+        sol_res = bot.shadow_sell("SOLT", bot.STATE["positions"]["SOLT"]["usd"], 2.0, 100000.0)
+        _reset(1000.0)
+        bot.shadow_buy("ETHT", "eth", 50.0, 1.0, 100000.0)
+        eth_res = bot.shadow_sell("ETHT", bot.STATE["positions"]["ETHT"]["usd"], 2.0, 100000.0)
+        self.assertGreater(sol_res["pnl"], eth_res["pnl"])
+
+    def test_gas_disabled_no_charge(self):
+        bot.CONFIG["gas_sim"] = False
+        bot.shadow_buy("TST", "eth", 50.0, 1.0, 100000.0)
+        self.assertAlmostEqual(bot.STATE["vault_usd"], 950.0, places=4)
+        bot.CONFIG["gas_sim"] = True
+
+    def test_full_sell_clears_fees(self):
+        bot.shadow_buy("TST", "eth", 50.0, 1.0, 100000.0)
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        self.assertEqual(pos["fees_usd"], 0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 34. Re-entry tightening — skip hard-dump exits
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReentryHardExitSkip(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+        bot.CONFIG["moonshot"]["reentry"]["enabled"] = True
+        bot.CONFIG["moonshot"]["reentry"]["skip_hard_exits"] = True
+
+    def _pos(self):
+        return {"address": "0xtok", "chain": "sol", "entry_liq": 50000.0, "entry_vol_h1": 1000.0}
+
+    def test_velocity_exit_skipped(self):
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "VELOCITY -17.0% in 5m")
+        self.assertNotIn("TST", bot.STATE["reentry_watch"])
+
+    def test_rug_exit_skipped(self):
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "RUG liq 50000→10000")
+        self.assertNotIn("TST", bot.STATE["reentry_watch"])
+
+    def test_liq_drain_skipped(self):
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "LIQ DRAIN 50000→40000 over 3 ticks")
+        self.assertNotIn("TST", bot.STATE["reentry_watch"])
+
+    def test_fixed_sl_skipped(self):
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "fixed_sl")
+        self.assertNotIn("TST", bot.STATE["reentry_watch"])
+
+    def test_trail_stop_allowed(self):
+        # Cooled-off winner — SHOULD be watched for re-entry
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "TRAIL STOP -15.0% from peak 0.002")
+        self.assertIn("TST", bot.STATE["reentry_watch"])
+
+    def test_skip_disabled_allows_all(self):
+        bot.CONFIG["moonshot"]["reentry"]["skip_hard_exits"] = False
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "VELOCITY -17%")
+        self.assertIn("TST", bot.STATE["reentry_watch"])
+        bot.CONFIG["moonshot"]["reentry"]["skip_hard_exits"] = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 35. New control endpoints (skim, doge, config, export, import, restart)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNewControlEndpoints(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        self.c = bot.app.test_client()
+
+    # /api/skim
+    def test_skim_on(self):
+        r = self.c.post("/api/skim", json={"enabled": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(bot.STATE["skim"]["enabled"])
+
+    def test_skim_off(self):
+        bot.STATE["skim"] = {"enabled": True}
+        self.c.post("/api/skim", json={"enabled": False})
+        self.assertFalse(bot.STATE["skim"]["enabled"])
+
+    # /api/doge
+    def test_doge_core_units(self):
+        r = self.c.post("/api/doge", json={"core_units": 50000})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.TRUSTED["DOGE"]["core_units"], 50000)
+
+    def test_doge_band_valid(self):
+        r = self.c.post("/api/doge", json={"exit_band": [0.4, 0.8]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.TRUSTED["DOGE"]["exit_band"], [0.4, 0.8])
+
+    def test_doge_band_invalid_400(self):
+        r = self.c.post("/api/doge", json={"exit_band": [0.8, 0.4]})
+        self.assertEqual(r.status_code, 400)
+
+    # /api/config
+    def test_config_presale_score(self):
+        r = self.c.post("/api/config", json={"presale_min_score": 30})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.CONFIG["presale_min_score"], 30)
+
+    def test_config_gas_sim_toggle(self):
+        self.c.post("/api/config", json={"gas_sim": False})
+        self.assertFalse(bot.CONFIG["gas_sim"])
+        self.c.post("/api/config", json={"gas_sim": True})
+        self.assertTrue(bot.CONFIG["gas_sim"])
+
+    def test_config_reentry_nested(self):
+        self.c.post("/api/config", json={"reentry": {"cooldown_min": 20}})
+        self.assertEqual(bot.CONFIG["moonshot"]["reentry"]["cooldown_min"], 20)
+
+    # /api/export
+    def test_export_returns_state(self):
+        r = self.c.get("/api/export")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("state", r.get_json())
+
+    # /api/import
+    def test_import_patch(self):
+        r = self.c.post("/api/import", json={"state": {"vault_usd": 555.0}})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.STATE["vault_usd"], 555.0)
+
+    def test_import_bare_patch(self):
+        r = self.c.post("/api/import", json={"income_usd": 42.0})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.STATE["income_usd"], 42.0)
+
+    # /api/state surfaces new config
+    def test_state_exposes_config_block(self):
+        d = self.c.get("/api/state").get_json()
+        self.assertIn("config", d)
+        self.assertIn("presale_min_score", d["config"])
+        self.assertIn("gas_sim", d["config"])
+        self.assertIn("skim_enabled", d)
+        self.assertIn("build", d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
