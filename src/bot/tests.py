@@ -1906,5 +1906,97 @@ class TestNewControlEndpoints(unittest.TestCase):
         self.assertIn("build", d)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 36. Scout log — decision recording + reject reasons
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestScoutLog(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+        bot.STATE["scout_log"] = []
+
+    def _sc(self, hype=90, liq=50000, age_min=15, positive=True):
+        return bot.Score(hype, liq, age_min, positive)
+
+    def test_reject_reason_none_when_passing(self):
+        self.assertIsNone(bot.moonshot_reject_reason(self._sc()))
+
+    def test_reject_reason_liq_low(self):
+        r = bot.moonshot_reject_reason(self._sc(liq=bot.CONFIG["moonshot"]["liq_min"] - 1))
+        self.assertIn("liquidity", r)
+
+    def test_reject_reason_age(self):
+        r = bot.moonshot_reject_reason(self._sc(age_min=bot.CONFIG["scan"]["new_max_age_min"] + 5))
+        self.assertIn("age", r)
+
+    def test_reject_reason_negative_trend(self):
+        r = bot.moonshot_reject_reason(self._sc(positive=False))
+        self.assertIn("negative", r)
+
+    def test_reject_reason_low_hype(self):
+        r = bot.moonshot_reject_reason(self._sc(hype=bot.CONFIG["moonshot"]["hype_min"] - 1))
+        self.assertIn("hype", r)
+
+    def test_passes_filters_matches_reject_reason(self):
+        sc_ok  = self._sc()
+        sc_bad = self._sc(liq=1)
+        self.assertEqual(bot.passes_moonshot_filters(sc_ok), bot.moonshot_reject_reason(sc_ok) is None)
+        self.assertEqual(bot.passes_moonshot_filters(sc_bad), bot.moonshot_reject_reason(sc_bad) is None)
+
+    def test_scout_records_entry(self):
+        bot._scout("TST", "sol", "entered", "passed", self._sc())
+        self.assertEqual(len(bot.STATE["scout_log"]), 1)
+        e = bot.STATE["scout_log"][0]
+        self.assertEqual(e["symbol"], "TST")
+        self.assertEqual(e["decision"], "entered")
+        self.assertEqual(e["hype"], 90)
+
+    def test_scout_caps_at_300(self):
+        for i in range(320):
+            bot._scout(f"T{i}", "sol", "rejected", "x")
+        self.assertLessEqual(len(bot.STATE["scout_log"]), 300)
+        # most recent retained
+        self.assertEqual(bot.STATE["scout_log"][-1]["symbol"], "T319")
+
+    def test_scout_without_score(self):
+        bot._scout("TST", "eth", "rejected", "no score")
+        e = bot.STATE["scout_log"][0]
+        self.assertNotIn("hype", e)
+
+
+class TestScoutLogEndpoint(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+        bot.STATE["scout_log"] = []
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        self.c = bot.app.test_client()
+
+    def test_endpoint_empty(self):
+        d = self.c.get("/api/scoutlog").get_json()
+        self.assertEqual(d["scout"], [])
+        self.assertIn("counts", d)
+
+    def test_endpoint_returns_reversed(self):
+        bot._scout("FIRST", "sol", "rejected", "x")
+        bot._scout("LAST", "sol", "entered", "y")
+        d = self.c.get("/api/scoutlog").get_json()
+        self.assertEqual(d["scout"][0]["symbol"], "LAST")   # most recent first
+
+    def test_endpoint_counts(self):
+        bot._scout("A", "sol", "entered", "x")
+        bot._scout("B", "sol", "rejected", "y")
+        bot._scout("C", "sol", "rejected", "z")
+        d = self.c.get("/api/scoutlog").get_json()
+        self.assertEqual(d["counts"]["entered"], 1)
+        self.assertEqual(d["counts"]["rejected"], 2)
+
+    def test_state_excludes_scout_log(self):
+        bot._scout("A", "sol", "entered", "x")
+        d = self.c.get("/api/state").get_json()
+        self.assertNotIn("scout_log", d)   # served via its own endpoint
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

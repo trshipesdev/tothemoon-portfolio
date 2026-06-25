@@ -460,6 +460,62 @@
       </div>
     </div>
 
+    <!-- SCOUT -->
+    <div x-show="tab === 'Scout'">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-bold text-gray-300">Scout Log — every coin it evaluated &amp; why</h2>
+        <div class="flex gap-2 text-xs">
+          <span class="px-2 py-1 rounded bg-green-900/40 text-green-400" x-text="'entered ' + (scoutCounts.entered ?? 0)"></span>
+          <span class="px-2 py-1 rounded bg-yellow-900/40 text-yellow-400" x-text="'suggested ' + (scoutCounts.suggested ?? 0)"></span>
+          <span class="px-2 py-1 rounded bg-gray-800 text-gray-400" x-text="'rejected ' + (scoutCounts.rejected ?? 0)"></span>
+        </div>
+      </div>
+      <div class="flex gap-2 mb-3 text-xs">
+        <template x-for="f in ['all','entered','suggested','rejected']" :key="f">
+          <button @click="scoutFilter = f"
+                  :class="scoutFilter === f ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'"
+                  class="px-3 py-1 rounded-lg" x-text="f"></button>
+        </template>
+      </div>
+      <template x-if="scout.length === 0">
+        <div class="text-center py-16 text-gray-600">
+          Nothing scouted yet. The bot logs each candidate it evaluates here on the next scan (~20s).
+        </div>
+      </template>
+      <div x-show="scout.length > 0" class="overflow-x-auto">
+        <table class="w-full text-xs min-w-[760px]">
+          <thead>
+            <tr class="text-gray-600 border-b border-gray-800">
+              <th class="text-left py-2 pr-3 font-normal">Time</th>
+              <th class="text-left py-2 pr-3 font-normal">Symbol</th>
+              <th class="text-left py-2 pr-3 font-normal">Chain</th>
+              <th class="text-left py-2 pr-3 font-normal">Decision</th>
+              <th class="text-right py-2 pr-3 font-normal">Hype</th>
+              <th class="text-right py-2 pr-3 font-normal">Liq</th>
+              <th class="text-right py-2 pr-3 font-normal">Age</th>
+              <th class="text-left py-2 font-normal">Reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="(e, i) in filteredScout" :key="i">
+              <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
+                <td class="py-1.5 pr-3 text-gray-600 whitespace-nowrap" x-text="fmtTime(e.ts)" :title="fmtTimeUTC(e.ts)"></td>
+                <td class="py-1.5 pr-3 font-bold" x-text="e.symbol"></td>
+                <td class="py-1.5 pr-3 uppercase text-gray-500" x-text="e.chain"></td>
+                <td class="py-1.5 pr-3 font-bold uppercase"
+                    :class="{'text-green-400': e.decision==='entered','text-yellow-400': e.decision==='suggested','text-gray-500': e.decision==='rejected'}"
+                    x-text="e.decision"></td>
+                <td class="py-1.5 pr-3 text-right text-gray-400" x-text="e.hype ?? '—'"></td>
+                <td class="py-1.5 pr-3 text-right text-gray-400" x-text="e.liq != null ? '$' + fmt(e.liq) : '—'"></td>
+                <td class="py-1.5 pr-3 text-right text-gray-400" x-text="e.age_min != null ? e.age_min + 'm' : '—'"></td>
+                <td class="py-1.5 text-gray-400" x-text="e.reason"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- SETTINGS -->
     <div x-show="tab === 'Settings'" class="grid md:grid-cols-2 gap-4">
 
@@ -643,7 +699,7 @@
 <script>
 function app() {
   return {
-    tabs: ['Positions', 'Controls', 'History', 'Alerts', 'RPC', 'Settings'],
+    tabs: ['Positions', 'Scout', 'Controls', 'History', 'Alerts', 'RPC', 'Settings'],
     tab:  'Positions',
 
     state:   { shadow_mode: true, mode: '…', signals: {}, objective: {}, watchlist: {} },
@@ -651,6 +707,9 @@ function app() {
     history: { trades: [], total_pnl: 0, win_rate: 0, avg_win: 0, avg_loss: 0 },
     alerts:  [],
     rpc:     {},
+    scout:        [],
+    scoutCounts:  {},
+    scoutFilter:  'all',
 
     buy:      { symbol: '', usd: '', chain: 'sol', address: '' },
     sell:     { symbol: '', amount: '100%' },
@@ -674,6 +733,9 @@ function app() {
     },
     get pos_count() { return this.posEntries.length; },
     get total_pnl()  { return this.posEntries.reduce((s, [, p]) => s + (p.pnl_usd || 0), 0); },
+    get filteredScout() {
+      return this.scoutFilter === 'all' ? this.scout : this.scout.filter(e => e.decision === this.scoutFilter);
+    },
 
     // ── Init ──
     async init() {
@@ -683,13 +745,15 @@ function app() {
     },
 
     async refresh() {
-      const [s, p, h, al, rpc] = await Promise.all([
+      const [s, p, h, al, rpc, sc] = await Promise.all([
         this.get('/api/state'),
         this.get('/api/positions'),
         this.get('/api/history'),
         this.get('/api/alerts'),
         this.get('/api/rpc'),
+        this.get('/api/scoutlog'),
       ]);
+      if (sc) { this.scout = sc.scout || []; this.scoutCounts = sc.counts || {}; }
       if (s) {
         this.state = s;
         // Seed the Settings inputs from live config (only fill blanks, don't clobber typing)

@@ -201,6 +201,7 @@ STATE: Dict[str, Any] = {
     "reentry_watch":    {},  # sym → {exit_ts, entry_liq, entry_vol_h1, address, chain, price_samples}
     "open_burst":       [],  # timestamps of recent position opens for burst rate-limiting
     "gas_paid_usd":     0.0,  # cumulative simulated gas/fees paid across all paper trades
+    "scout_log":        [],  # recent candidate evaluations: why it entered/suggested/rejected
 }
 
 _state_path_env = os.getenv("STATE_PATH", "")
@@ -228,6 +229,8 @@ def load_state():
         STATE.setdefault("reentry_watch", {})
         STATE.setdefault("open_burst",    [])
         STATE.setdefault("brake_alerted", False)
+        STATE.setdefault("gas_paid_usd",  0.0)
+        STATE.setdefault("scout_log",     [])
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -548,18 +551,42 @@ class Score:
         self.positive = positive
 
 
-def passes_moonshot_filters(sc: Score) -> bool:
+def moonshot_reject_reason(sc: Score) -> Optional[str]:
+    """Return a human-readable reason the candidate fails the filters, or None if it passes."""
     ms = CONFIG["moonshot"]
     spray = STATE.get("spray_until")
     spraying = spray and now_utc().date().isoformat() <= spray
     liq_min  = ms["liq_min"] * (0.7 if spraying else 1.0)
     hype_min = max(50, ms["hype_min"] - (20 if spraying else 0))
-    return (
-        liq_min <= sc.liq <= ms["liq_max"]
-        and sc.age_min <= CONFIG["scan"]["new_max_age_min"]
-        and sc.positive
-        and sc.hype >= hype_min
-    )
+    if sc.liq < liq_min:
+        return f"liquidity ${sc.liq:,.0f} below min ${liq_min:,.0f}"
+    if sc.liq > ms["liq_max"]:
+        return f"liquidity ${sc.liq:,.0f} above max ${ms['liq_max']:,.0f}"
+    if sc.age_min > CONFIG["scan"]["new_max_age_min"]:
+        return f"age {sc.age_min:.0f}m over {CONFIG['scan']['new_max_age_min']}m limit"
+    if not sc.positive:
+        return "price trend is negative (24h)"
+    if sc.hype < hype_min:
+        return f"hype {sc.hype} below min {hype_min}"
+    return None
+
+
+def passes_moonshot_filters(sc: Score) -> bool:
+    return moonshot_reject_reason(sc) is None
+
+
+def _scout(symbol: str, chain: str, decision: str, reason: str, sc: Optional[Score] = None):
+    """Record why the scanner did (or didn't) act on a candidate, for the dashboard Scout log."""
+    log_list: List[Dict[str, Any]] = STATE.setdefault("scout_log", [])
+    entry: Dict[str, Any] = {
+        "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
+        "decision": decision, "reason": reason,
+    }
+    if sc is not None:
+        entry.update({"hype": sc.hype, "liq": round(sc.liq, 0), "age_min": round(sc.age_min, 1)})
+    log_list.append(entry)
+    if len(log_list) > 300:                # keep the most recent 300 evaluations
+        del log_list[: len(log_list) - 300]
 
 # ---------------------------------------------------------------------------
 # Objectives × strategy
@@ -1505,7 +1532,7 @@ def dashboard_ui(path):
 def api_state():
     mode_cfg = CONFIG["modes"].get(CONFIG["mode"], {})
     return jsonify({
-        **{k: v for k, v in STATE.items() if k not in ("trade_log", "liq_prev")},
+        **{k: v for k, v in STATE.items() if k not in ("trade_log", "liq_prev", "scout_log")},
         "deployable_usd":  deployable_now(),
         "mode":            CONFIG["mode"],
         "modes":           list(CONFIG["modes"].keys()),
@@ -1592,6 +1619,17 @@ def api_alerts():
 @_dash_auth
 def api_rpc():
     return jsonify(STATE.get("rpc", {}).get("health", {}))
+
+
+@app.route("/api/scoutlog")
+@_dash_auth
+def api_scoutlog():
+    """Recent candidate evaluations (most recent first) — what it looked at and why it decided."""
+    log_list = STATE.get("scout_log", [])
+    counts = {"entered": 0, "suggested": 0, "rejected": 0}
+    for e in log_list:
+        counts[e.get("decision", "rejected")] = counts.get(e.get("decision", "rejected"), 0) + 1
+    return jsonify({"scout": list(reversed(log_list)), "counts": counts})
 
 
 @app.route("/api/mode", methods=["POST"])
@@ -2316,7 +2354,9 @@ def engine_once():
         is_new = c["age_min"] <= CONFIG["scan"]["new_max_age_min"]
 
         if is_new:
-            if not passes_moonshot_filters(sc):
+            reject = moonshot_reject_reason(sc)
+            if reject:
+                _scout(symbol, chain, "rejected", reject, sc)
                 continue
             # Presale safety gate — for very new tokens score for audit/social signals
             ps_meta = {
@@ -2330,6 +2370,7 @@ def engine_once():
             if ps < ps_threshold:
                 log(f"PRESALE GATE {symbol}: score {ps} < {ps_threshold}, suggest only")
                 send_alert(f"⚠️ NEW {symbol} ({chain}): presale score {ps} — no audit/KYC signals, suggest only")
+                _scout(symbol, chain, "rejected", f"presale score {ps} < {ps_threshold} (no social/audit signal)", sc)
                 continue
             if CONFIG["moonshot"]["mode"] == "enter":
                 usd = size_ticket_usd(chain)
@@ -2337,12 +2378,15 @@ def engine_once():
                     shadow_buy(symbol, chain, usd, price, liq, c.get("address", ""))
                     log(f"ENTER {symbol} new launch ${usd:.2f} (presale score {ps})")
                     send_alert(f"🚀 ENTER {symbol} ({chain}) new launch ${usd:.2f} @~{price:.6f} [ps:{ps}]")
+                    _scout(symbol, chain, "entered", f"passed filters, ps {ps}, sized ${usd:.0f}", sc)
                 else:
                     log(f"SUGGEST {symbol} new launch (caps/impact)")
                     send_alert(f"👀 SUGGEST {symbol} ({chain}) new launch — too big to enter (caps/impact) [ps:{ps}]")
+                    _scout(symbol, chain, "suggested", f"passed filters but blocked by caps/price-impact (ps {ps})", sc)
             else:
                 log(f"SUGGEST {symbol} new launch (mode=suggest) [ps:{ps}]")
                 send_alert(f"👀 SUGGEST {symbol} ({chain}) new launch [ps:{ps}]")
+                _scout(symbol, chain, "suggested", f"passed filters, ps {ps} (moonshot mode = suggest)", sc)
         else:
             if detect_oldcoin_pump(symbol, CONFIG["oldcoin"]["volume_x"], CONFIG["oldcoin"]["mentions_x"]):
                 if CONFIG["oldcoin"]["auto_join"]:
