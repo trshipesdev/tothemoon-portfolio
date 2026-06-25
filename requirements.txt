@@ -1,4 +1,5 @@
 # Core
+flask-cors>=4,<5
 python-telegram-bot==20.8
 httpx==0.26.0
 requests>=2.31,<3
@@ -7,5 +8,9 @@ boto3>=1.34,<2
 pydantic>=2,<3
 python-dotenv>=1.0.1
 
-# Optional (EVM later)
+# EVM
 web3>=6,<7
+
+# Solana
+solders>=0.21.0
+base58>=2.1.1

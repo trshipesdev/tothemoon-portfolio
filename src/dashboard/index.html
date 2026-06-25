@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tothemoon</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    body { background: #030712; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #111827; }
+    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+    input, select { outline: none; }
+    .tab-active { border-bottom: 2px solid #3b82f6; color: white; }
+  </style>
+</head>
+<body class="text-gray-100 font-mono text-sm min-h-screen">
+
+<div x-data="app()" x-init="init()" x-cloak class="flex flex-col min-h-screen">
+
+  <!-- ── HEADER ── -->
+  <header class="flex items-center justify-between px-4 py-2.5 border-b border-gray-800 bg-gray-950 sticky top-0 z-10">
+    <div class="flex items-center gap-3">
+      <span class="text-base font-bold tracking-tight">🚀 tothemoon</span>
+      <span :class="state.shadow_mode ? 'bg-yellow-500 text-black' : 'bg-green-600 text-white'"
+            class="px-2 py-0.5 rounded-full text-xs font-bold"
+            x-text="state.shadow_mode ? 'SHADOW' : 'LIVE'"></span>
+      <span class="text-gray-500 text-xs hidden sm:block"
+            x-text="'mode: ' + (state.mode || '…')"></span>
+    </div>
+    <div class="flex items-center gap-3">
+      <span class="text-gray-600 text-xs hidden md:block" x-text="lastRefresh ? 'updated ' + lastRefresh : ''"></span>
+      <button @click="refresh()" title="Refresh"
+              class="text-gray-500 hover:text-white px-2 py-1 rounded hover:bg-gray-800">↻</button>
+      <button @click="showTokenModal = true" title="Set auth token"
+              class="text-gray-600 hover:text-gray-300 text-xs px-2 py-1 rounded hover:bg-gray-800">⚙</button>
+    </div>
+  </header>
+
+  <!-- ── STATS STRIP ── -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-2 p-3 border-b border-gray-800 bg-gray-950">
+    <div class="bg-gray-900 rounded-lg p-3">
+      <div class="text-gray-500 text-xs mb-1">Vault</div>
+      <div class="text-lg font-bold" x-text="'$' + fmt(state.vault_usd)"></div>
+      <div class="text-gray-500 text-xs" x-text="'deployable $' + fmt(state.deployable_usd)"></div>
+    </div>
+    <div class="bg-gray-900 rounded-lg p-3">
+      <div class="text-gray-500 text-xs mb-1">Unrealized PnL</div>
+      <div :class="total_pnl >= 0 ? 'text-green-400' : 'text-red-400'"
+           class="text-lg font-bold"
+           x-text="(total_pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(total_pnl))"></div>
+      <div class="text-gray-500 text-xs"
+           x-text="pos_count + ' open · today $' + fmt(state.open_today_usd)"></div>
+    </div>
+    <div class="bg-gray-900 rounded-lg p-3">
+      <div class="text-gray-500 text-xs mb-1">BTC Dominance</div>
+      <div class="text-lg font-bold"
+           x-text="(state.signals?.btc_d?.toFixed(1) ?? '—') + '%'"></div>
+      <div :class="heatCls(state.signals?.heat)" class="text-xs font-bold"
+           x-text="state.signals?.heat ?? '—'"></div>
+    </div>
+    <div class="bg-gray-900 rounded-lg p-3">
+      <div class="text-gray-500 text-xs mb-1">Active</div>
+      <div class="text-xs space-y-0.5">
+        <div x-show="state.boost?.mult > 1" class="text-blue-400"
+             x-text="'boost ' + state.boost?.mult + '× · exp ' + (state.boost?.expires ?? '').slice(11,16)"></div>
+        <div x-show="state.spray_until" class="text-purple-400"
+             x-text="'spray until ' + state.spray_until"></div>
+        <div x-show="state.objective_kind !== 'off'" class="text-teal-400"
+             x-text="'obj: +$' + fmt(state.objective?.target_usd) + ' in ' + state.objective?.horizon_weeks + 'w'"></div>
+        <div x-show="!state.boost?.mult && !state.spray_until && state.objective_kind === 'off'"
+             class="text-gray-600">nothing active</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TABS ── -->
+  <nav class="flex border-b border-gray-800 bg-gray-950 px-2 overflow-x-auto">
+    <template x-for="t in tabs" :key="t">
+      <button @click="tab = t"
+              :class="tab === t ? 'tab-active text-white' : 'text-gray-500 hover:text-gray-300'"
+              class="px-4 py-2.5 text-xs whitespace-nowrap border-b-2 border-transparent"
+              x-text="t"></button>
+    </template>
+  </nav>
+
+  <!-- ── MAIN CONTENT ── -->
+  <main class="flex-1 overflow-auto p-4">
+
+    <!-- POSITIONS -->
+    <div x-show="tab === 'Positions'">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-bold text-gray-300">Open Positions</h2>
+        <span class="text-gray-600 text-xs" x-text="pos_count + ' open'"></span>
+      </div>
+      <template x-if="pos_count === 0">
+        <div class="text-center py-16 text-gray-600">No open positions</div>
+      </template>
+      <div x-show="pos_count > 0" class="overflow-x-auto">
+        <table class="w-full text-xs min-w-[820px]">
+          <thead>
+            <tr class="text-gray-600 border-b border-gray-800">
+              <th class="text-left py-2 pr-3 font-normal">Symbol</th>
+              <th class="text-left py-2 pr-3 font-normal">Chain</th>
+              <th class="text-right py-2 pr-3 font-normal">Avg</th>
+              <th class="text-right py-2 pr-3 font-normal">Current</th>
+              <th class="text-right py-2 pr-3 font-normal">m5</th>
+              <th class="text-right py-2 pr-3 font-normal">Trail</th>
+              <th class="text-right py-2 pr-3 font-normal">Value</th>
+              <th class="text-right py-2 pr-3 font-normal">PnL</th>
+              <th class="text-right py-2 pr-3 font-normal">TP / SL</th>
+              <th class="text-left py-2 font-normal">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="[sym, p] in posEntries" :key="sym">
+              <tr :class="p.pnl_pct >= 0 ? 'border-l-2 border-green-700' : 'border-l-2 border-red-800'"
+                  class="border-b border-gray-800/50 hover:bg-gray-900/50">
+                <td class="py-2 pr-3 font-bold" x-text="sym"></td>
+                <td class="py-2 pr-3 text-gray-400 uppercase" x-text="p.chain"></td>
+                <td class="py-2 pr-3 text-right text-gray-500" x-text="fmtP(p.avg)"></td>
+                <td class="py-2 pr-3 text-right" x-text="fmtP(p.cur_price)"></td>
+                <td :class="(p.change_m5 ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
+                    class="py-2 pr-3 text-right"
+                    x-text="p.change_m5 != null ? ((p.change_m5 >= 0 ? '+' : '') + p.change_m5.toFixed(1) + '%') : '—'"></td>
+                <td :class="(p.trail_pct ?? 0) >= -5 ? 'text-gray-400' : (p.trail_pct ?? 0) >= -10 ? 'text-yellow-400' : 'text-red-400'"
+                    class="py-2 pr-3 text-right"
+                    x-text="p.trail_pct != null ? (p.trail_pct >= 0 ? '+' : '') + p.trail_pct.toFixed(1) + '%' : '—'"></td>
+                <td class="py-2 pr-3 text-right" x-text="'$' + fmt(p.value)"></td>
+                <td :class="p.pnl_pct >= 0 ? 'text-green-400' : 'text-red-400'"
+                    class="py-2 pr-3 text-right font-bold"
+                    x-text="(p.pnl_pct >= 0 ? '+' : '') + p.pnl_pct.toFixed(1) + '%'"></td>
+                <td class="py-2 pr-3 text-right text-gray-600">
+                  <span x-text="fmtTp(p.tp_override ?? state.mode_tp)"></span>
+                  <span class="mx-1 text-gray-700">/</span>
+                  <span x-text="fmtSl(p.sl_override ?? state.mode_sl)"></span>
+                </td>
+                <td class="py-2">
+                  <div class="flex gap-1">
+                    <button @click="quickSell(sym, '25%')"
+                            class="px-1.5 py-0.5 bg-gray-800 hover:bg-orange-800 rounded">25%</button>
+                    <button @click="quickSell(sym, '50%')"
+                            class="px-1.5 py-0.5 bg-gray-800 hover:bg-orange-800 rounded">50%</button>
+                    <button @click="quickSell(sym, 'all')"
+                            class="px-1.5 py-0.5 bg-gray-800 hover:bg-red-800 rounded">All</button>
+                    <button @click="editPos(sym, p)"
+                            class="px-1.5 py-0.5 bg-gray-800 hover:bg-blue-900 rounded">TP/SL</button>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Re-entry watch -->
+      <template x-if="Object.keys(state.reentry_watch ?? {}).length > 0">
+        <div class="mt-6">
+          <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-2">Re-entry Watch</h3>
+          <div class="overflow-x-auto">
+            <table class="w-full text-xs min-w-[500px]">
+              <thead>
+                <tr class="text-gray-700 border-b border-gray-800">
+                  <th class="text-left py-1.5 pr-3 font-normal">Symbol</th>
+                  <th class="text-left py-1.5 pr-3 font-normal">Chain</th>
+                  <th class="text-left py-1.5 pr-3 font-normal">Exit reason</th>
+                  <th class="text-right py-1.5 pr-3 font-normal">Samples</th>
+                  <th class="text-right py-1.5 font-normal">Exit</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="[sym, w] in Object.entries(state.reentry_watch ?? {})" :key="sym">
+                  <tr class="border-b border-gray-800/30 text-gray-400">
+                    <td class="py-1.5 pr-3 font-bold text-gray-300" x-text="sym"></td>
+                    <td class="py-1.5 pr-3 uppercase" x-text="w.chain"></td>
+                    <td class="py-1.5 pr-3 text-gray-600 truncate max-w-[180px]" x-text="w.exit_reason"></td>
+                    <td class="py-1.5 pr-3 text-right" x-text="(w.price_samples ?? []).length + ' / 3'"></td>
+                    <td class="py-1.5 text-right text-gray-600" x-text="w.exit_ts ? new Date(w.exit_ts * 1000).toLocaleTimeString() : '—'"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- CONTROLS -->
+    <div x-show="tab === 'Controls'" class="grid grid-cols-1 md:grid-cols-2 gap-4 max-w-3xl">
+
+      <!-- Mode -->
+      <div class="bg-gray-900 rounded-xl p-4">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-3">Strategy Mode</h3>
+        <div class="flex gap-2 flex-wrap">
+          <template x-for="m in ['safe','default','hype','degen']" :key="m">
+            <button @click="setMode(m)"
+                    :class="state.mode === m ? 'bg-blue-600 text-white ring-1 ring-blue-400' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'"
+                    class="px-4 py-2 rounded-lg text-xs font-bold" x-text="m.toUpperCase()"></button>
+          </template>
+        </div>
+      </div>
+
+      <!-- Toggles -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-4">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider">Execution</h3>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Shadow mode</span>
+          <button @click="toggleShadow()"
+                  :class="state.shadow_mode ? 'bg-yellow-500' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative">
+            <span :class="state.shadow_mode ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Moonshot mode</span>
+          <select @change="post('/api/moonshot', {mode: $event.target.value})"
+                  class="bg-gray-800 rounded px-2 py-1 text-xs border border-gray-700">
+            <option value="suggest" :selected="state.moonshot_mode === 'suggest'">Suggest only</option>
+            <option value="enter"   :selected="state.moonshot_mode === 'enter'">Auto-enter</option>
+          </select>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Auto-join pumps</span>
+          <button @click="toggleAutoOld()"
+                  :class="state.auto_old ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative">
+            <span :class="state.auto_old ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Manual Buy -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-2">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-3">Manual Buy</h3>
+        <input x-model="buy.symbol" placeholder="SYMBOL" maxlength="20"
+               class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs uppercase placeholder-gray-600 focus:border-blue-500"/>
+        <div class="flex gap-2">
+          <input x-model="buy.usd" type="number" min="1" placeholder="USD"
+                 class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600 focus:border-blue-500"/>
+          <select x-model="buy.chain" class="bg-gray-800 border border-gray-700 rounded-lg px-2 py-2 text-xs">
+            <template x-for="c in ['sol','eth','base','bsc','poly']" :key="c">
+              <option :value="c" x-text="c.toUpperCase()"></option>
+            </template>
+          </select>
+        </div>
+        <input x-model="buy.address" placeholder="Token address (required for live)"
+               class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600 focus:border-blue-500"/>
+        <button @click="submitBuy()"
+                class="w-full bg-green-700 hover:bg-green-600 rounded-lg py-2 text-xs font-bold">
+          BUY
+        </button>
+      </div>
+
+      <!-- Manual Sell -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-2">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-3">Manual Sell</h3>
+        <select x-model="sell.symbol" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs">
+          <option value="">Select position…</option>
+          <template x-for="[sym, p] in posEntries" :key="sym">
+            <option :value="sym" x-text="sym + '  (' + p.chain.toUpperCase() + ' · $' + fmt(p.value) + ')'"></option>
+          </template>
+        </select>
+        <input x-model="sell.amount" placeholder="Amount: 50%  /  $100  /  all"
+               class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600 focus:border-orange-500"/>
+        <button @click="submitSell()"
+                class="w-full bg-orange-700 hover:bg-orange-600 rounded-lg py-2 text-xs font-bold">
+          SELL
+        </button>
+      </div>
+
+      <!-- Boost + Spray -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-1">Boost / Spray</h3>
+        <div class="flex gap-2">
+          <input x-model="boost.mult" type="number" step="0.1" min="0.1" placeholder="Mult"
+                 class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600"/>
+          <input x-model="boost.hours" type="number" min="1" placeholder="Hours"
+                 class="w-20 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600"/>
+          <button @click="setBoost()"
+                  class="bg-blue-700 hover:bg-blue-600 rounded-lg px-3 text-xs font-bold">Boost</button>
+        </div>
+        <div class="flex gap-2">
+          <input x-model="sprayDate" type="date"
+                 class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+          <button @click="post('/api/spray', {until: sprayDate}).then(() => refresh())"
+                  class="bg-purple-700 hover:bg-purple-600 rounded-lg px-3 text-xs font-bold">Spray</button>
+          <button @click="post('/api/spray', {until: null}).then(() => refresh())"
+                  class="bg-gray-700 hover:bg-gray-600 rounded-lg px-3 text-xs">Off</button>
+        </div>
+      </div>
+
+      <!-- Objective -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-2">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-1">Objective</h3>
+        <div class="flex gap-2">
+          <input x-model="obj.target" type="number" placeholder="Target $"
+                 class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600"/>
+          <input x-model="obj.weeks" type="number" min="1" placeholder="Weeks"
+                 class="w-20 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600"/>
+          <button @click="setObjective()"
+                  class="bg-teal-700 hover:bg-teal-600 rounded-lg px-3 text-xs font-bold">Set</button>
+        </div>
+        <button @click="post('/api/objective', {kind:'off'}).then(() => refresh())"
+                class="w-full bg-gray-800 hover:bg-gray-700 rounded-lg py-1.5 text-xs text-gray-400">
+          Clear objective
+        </button>
+        <div class="text-gray-600 text-xs"
+             x-text="'current: ' + (state.objective_kind !== 'off' ? '+$' + fmt(state.objective?.target_usd) + ' in ' + state.objective?.horizon_weeks + 'w' : 'off')"></div>
+      </div>
+
+      <!-- Watchlist -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-2 md:col-span-2">
+        <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-1">Pump Watchlist</h3>
+        <div class="flex gap-2">
+          <input x-model="wl.symbol" placeholder="SYMBOL" maxlength="10"
+                 class="w-24 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs uppercase placeholder-gray-600"/>
+          <input x-model="wl.address" placeholder="Token address"
+                 class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs placeholder-gray-600"/>
+          <button @click="addWatchlist()"
+                  class="bg-gray-700 hover:bg-gray-600 rounded-lg px-3 text-xs font-bold">Add</button>
+        </div>
+        <div class="space-y-1 mt-2">
+          <template x-if="Object.keys(state.watchlist ?? {}).length === 0">
+            <div class="text-gray-700 text-xs py-2">No tokens on watchlist</div>
+          </template>
+          <template x-for="[sym, addr] in Object.entries(state.watchlist ?? {})" :key="sym">
+            <div class="flex items-center justify-between bg-gray-800 rounded px-3 py-1.5">
+              <span class="font-bold text-xs" x-text="sym"></span>
+              <span class="text-gray-500 text-xs truncate mx-3 flex-1" x-text="addr"></span>
+              <button @click="post('/api/watchlist/remove', {symbol: sym}).then(() => refresh())"
+                      class="text-red-600 hover:text-red-400 text-xs">✕</button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- HISTORY -->
+    <div x-show="tab === 'History'">
+      <div class="mb-4 bg-gray-900 rounded-xl p-4">
+        <canvas id="pnlChart" height="100"></canvas>
+      </div>
+      <div class="grid grid-cols-3 gap-3 mb-4">
+        <div class="bg-gray-900 rounded-xl p-3 text-center">
+          <div class="text-gray-500 text-xs mb-1">Total Realized</div>
+          <div :class="(history.total_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
+               class="font-bold"
+               x-text="((history.total_pnl ?? 0) >= 0 ? '+$' : '-$') + fmt(Math.abs(history.total_pnl ?? 0))"></div>
+        </div>
+        <div class="bg-gray-900 rounded-xl p-3 text-center">
+          <div class="text-gray-500 text-xs mb-1">Win Rate</div>
+          <div class="font-bold" x-text="((history.win_rate ?? 0) * 100).toFixed(1) + '%'"></div>
+        </div>
+        <div class="bg-gray-900 rounded-xl p-3 text-center">
+          <div class="text-gray-500 text-xs mb-1">Avg W / L</div>
+          <div class="font-bold text-xs space-x-1">
+            <span class="text-green-400" x-text="'+$' + fmt(history.avg_win ?? 0)"></span>
+            <span class="text-gray-600">/</span>
+            <span class="text-red-400" x-text="'-$' + fmt(Math.abs(history.avg_loss ?? 0))"></span>
+          </div>
+        </div>
+      </div>
+      <table class="w-full text-xs">
+        <thead>
+          <tr class="text-gray-600 border-b border-gray-800">
+            <th class="text-left py-2 pr-3 font-normal">Time</th>
+            <th class="text-left py-2 pr-3 font-normal">Symbol</th>
+            <th class="text-left py-2 pr-3 font-normal">Side</th>
+            <th class="text-right py-2 pr-3 font-normal">USD</th>
+            <th class="text-right py-2 pr-3 font-normal">PnL</th>
+            <th class="text-right py-2 font-normal">Running</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-if="!(history.trades?.length)">
+            <tr><td colspan="6" class="py-12 text-center text-gray-700">No trades yet</td></tr>
+          </template>
+          <template x-for="t in (history.trades ?? []).slice().reverse().slice(0, 100)" :key="t.ts + t.symbol">
+            <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
+              <td class="py-1.5 pr-3 text-gray-600" x-text="t.ts?.slice(0, 16)"></td>
+              <td class="py-1.5 pr-3 font-bold" x-text="t.symbol"></td>
+              <td :class="t.side === 'buy' ? 'text-blue-400' : 'text-orange-400'"
+                  class="py-1.5 pr-3 uppercase font-bold" x-text="t.side"></td>
+              <td class="py-1.5 pr-3 text-right text-gray-300" x-text="'$' + fmt(t.usd)"></td>
+              <td :class="(t.pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
+                  class="py-1.5 pr-3 text-right font-bold"
+                  x-text="t.pnl != null ? ((t.pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(t.pnl))) : '—'"></td>
+              <td :class="(t.running_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
+                  class="py-1.5 text-right"
+                  x-text="((t.running_pnl ?? 0) >= 0 ? '+$' : '-$') + fmt(Math.abs(t.running_pnl ?? 0))"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ALERTS -->
+    <div x-show="tab === 'Alerts'">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-bold text-gray-300">Alert Log</h2>
+        <span class="text-gray-600 text-xs" x-text="alerts.length + ' entries (last 200)'"></span>
+      </div>
+      <template x-if="alerts.length === 0">
+        <div class="text-center py-16 text-gray-700">No alerts yet — bot sends alerts here for TP/SL hits, entries, and pump detection</div>
+      </template>
+      <div class="space-y-1">
+        <template x-for="a in alerts" :key="a.ts + a.msg">
+          <div :class="a.critical
+                  ? 'border-l-4 border-red-500 bg-red-950/20'
+                  : 'border-l-4 border-gray-800 bg-gray-900'"
+               class="px-3 py-2 rounded-r-lg text-xs">
+            <span class="text-gray-600 mr-2 select-none" x-text="a.ts?.slice(0, 19).replace('T', ' ')"></span>
+            <span x-text="a.msg"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- RPC -->
+    <div x-show="tab === 'RPC'">
+      <h2 class="font-bold text-gray-300 mb-4">RPC Health</h2>
+      <template x-if="Object.keys(rpc).length === 0">
+        <p class="text-gray-700 text-sm py-12 text-center">First check runs 5 min after startup</p>
+      </template>
+      <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
+        <template x-for="[chain, h] in Object.entries(rpc)" :key="chain">
+          <div class="bg-gray-900 rounded-xl p-4 text-center">
+            <div class="font-bold uppercase mb-2" x-text="chain"></div>
+            <div :class="h.status === 'ok' ? 'text-green-400' : 'text-red-400'"
+                 class="text-2xl mb-1"
+                 x-text="h.status === 'ok' ? '✓' : '✗'"></div>
+            <div class="text-gray-500 text-xs" x-text="h.ms ? h.ms + ' ms' : '—'"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ── TOAST ── -->
+  <div x-show="toast.show" x-transition.opacity
+       :class="toast.ok ? 'bg-green-800 border-green-600' : 'bg-red-900 border-red-700'"
+       class="fixed bottom-5 right-5 px-4 py-3 rounded-xl border shadow-xl text-sm z-50"
+       x-text="toast.msg"></div>
+
+  <!-- ── EDIT TP/SL MODAL ── -->
+  <div x-show="editModal.show" x-transition.opacity
+       class="fixed inset-0 bg-black/70 flex items-center justify-center z-40 p-4">
+    <div @click.stop class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-sm space-y-4">
+      <h3 class="font-bold" x-text="'TP / SL override — ' + editModal.sym"></h3>
+      <div>
+        <label class="text-gray-500 text-xs">TP levels (comma-separated, e.g. 0.3,0.6)</label>
+        <input x-model="editModal.tp" placeholder="blank to use mode default"
+               class="mt-1 w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+      </div>
+      <div>
+        <label class="text-gray-500 text-xs">SL (e.g. 0.12)</label>
+        <input x-model="editModal.sl" placeholder="blank to use mode default"
+               class="mt-1 w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+      </div>
+      <div class="flex gap-2 pt-1">
+        <button @click="saveOverride()"
+                class="flex-1 bg-blue-700 hover:bg-blue-600 rounded-lg py-2 text-xs font-bold">Save</button>
+        <button @click="editModal.show = false"
+                class="flex-1 bg-gray-700 hover:bg-gray-600 rounded-lg py-2 text-xs">Cancel</button>
+        <button @click="clearOverride()"
+                class="flex-1 bg-red-900 hover:bg-red-800 rounded-lg py-2 text-xs text-red-300">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── AUTH TOKEN MODAL ── -->
+  <div x-show="showTokenModal" x-transition.opacity
+       class="fixed inset-0 bg-black/70 flex items-center justify-center z-40 p-4">
+    <div @click.stop class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-sm space-y-4">
+      <h3 class="font-bold">Dashboard Token</h3>
+      <p class="text-gray-500 text-xs">Paste your DASHBOARD_TOKEN here. Stored in localStorage.</p>
+      <input x-model="tokenInput" type="password" placeholder="Leave blank if DASHBOARD_TOKEN not set"
+             class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs"/>
+      <div class="flex gap-2">
+        <button @click="saveToken()"
+                class="flex-1 bg-blue-700 hover:bg-blue-600 rounded-lg py-2 text-xs font-bold">Save</button>
+        <button @click="showTokenModal = false"
+                class="flex-1 bg-gray-700 hover:bg-gray-600 rounded-lg py-2 text-xs">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+<script>
+function app() {
+  return {
+    tabs: ['Positions', 'Controls', 'History', 'Alerts', 'RPC'],
+    tab:  'Positions',
+
+    state:   { shadow_mode: true, mode: '…', signals: {}, objective: {}, watchlist: {} },
+    pos:     {},
+    history: { trades: [], total_pnl: 0, win_rate: 0, avg_win: 0, avg_loss: 0 },
+    alerts:  [],
+    rpc:     {},
+
+    buy:      { symbol: '', usd: '', chain: 'sol', address: '' },
+    sell:     { symbol: '', amount: '100%' },
+    boost:    { mult: '2', hours: '4' },
+    obj:      { target: '', weeks: '' },
+    wl:       { symbol: '', address: '' },
+    sprayDate: '',
+
+    editModal:     { show: false, sym: '', tp: '', sl: '' },
+    showTokenModal: false,
+    tokenInput:    '',
+    toast:         { show: false, msg: '', ok: true },
+    lastRefresh:   '',
+    chart:         null,
+
+    // ── Computed ──
+    get posEntries() {
+      return Object.entries(this.pos).filter(([, p]) => p.units > 0);
+    },
+    get pos_count() { return this.posEntries.length; },
+    get total_pnl()  { return this.posEntries.reduce((s, [, p]) => s + (p.pnl_usd || 0), 0); },
+
+    // ── Init ──
+    async init() {
+      this.tokenInput = localStorage.getItem('dash_token') || '';
+      await this.refresh();
+      setInterval(() => this.refresh(), 20000);
+    },
+
+    async refresh() {
+      const [s, p, h, al, rpc] = await Promise.all([
+        this.get('/api/state'),
+        this.get('/api/positions'),
+        this.get('/api/history'),
+        this.get('/api/alerts'),
+        this.get('/api/rpc'),
+      ]);
+      if (s)   this.state   = s;
+      if (p)   this.pos     = p;
+      if (h) { this.history = h; this.$nextTick(() => this.drawChart(h)); }
+      if (al)  this.alerts  = al;
+      if (rpc) this.rpc     = rpc;
+      this.lastRefresh = new Date().toLocaleTimeString();
+    },
+
+    // ── HTTP helpers ──
+    _headers() {
+      const tok = localStorage.getItem('dash_token') || '';
+      return tok ? { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' }
+                 : { 'Content-Type': 'application/json' };
+    },
+    async get(url) {
+      try {
+        const r = await fetch(url, { headers: this._headers() });
+        if (r.ok) return r.json();
+        if (r.status === 401) this.showTokenModal = true;
+      } catch {}
+      return null;
+    },
+    async post(url, body) {
+      try {
+        const r = await fetch(url, { method: 'POST', headers: this._headers(), body: JSON.stringify(body) });
+        const d = await r.json();
+        if (r.ok) { this.toast = { show: true, msg: 'Done ✓', ok: true }; }
+        else       { this.toast = { show: true, msg: d.error || 'Error', ok: false }; }
+        setTimeout(() => this.toast.show = false, 3000);
+        return r.ok ? d : null;
+      } catch (e) {
+        this.toast = { show: true, msg: String(e), ok: false };
+        setTimeout(() => this.toast.show = false, 3000);
+        return null;
+      }
+    },
+
+    // ── Actions ──
+    async setMode(m) { await this.post('/api/mode', { mode: m }); await this.refresh(); },
+    async toggleShadow()  { await this.post('/api/shadow', { enabled: !this.state.shadow_mode }); await this.refresh(); },
+    async toggleAutoOld() { await this.post('/api/auto_old', { enabled: !this.state.auto_old }); await this.refresh(); },
+
+    async setBoost() {
+      await this.post('/api/boost', { mult: +this.boost.mult, hours: +this.boost.hours });
+      await this.refresh();
+    },
+    async setObjective() {
+      await this.post('/api/objective', { kind: 'target', target_usd: +this.obj.target, weeks: +this.obj.weeks });
+      await this.refresh();
+    },
+    async addWatchlist() {
+      if (!this.wl.symbol || !this.wl.address) return;
+      await this.post('/api/watchlist/add', { symbol: this.wl.symbol.toUpperCase(), address: this.wl.address });
+      this.wl = { symbol: '', address: '' };
+      await this.refresh();
+    },
+
+    async submitBuy() {
+      if (!this.buy.symbol || !this.buy.usd) return;
+      const ok = await this.post('/api/buy', {
+        symbol: this.buy.symbol.toUpperCase(), usd: +this.buy.usd,
+        chain: this.buy.chain, address: this.buy.address,
+      });
+      if (ok) { this.buy = { symbol: '', usd: '', chain: 'sol', address: '' }; await this.refresh(); }
+    },
+    async submitSell() {
+      if (!this.sell.symbol) return;
+      const ok = await this.post('/api/sell', { symbol: this.sell.symbol, amount: this.sell.amount });
+      if (ok) { this.sell = { symbol: '', amount: '100%' }; await this.refresh(); }
+    },
+    async quickSell(sym, amount) {
+      if (!confirm(`Sell ${amount} of ${sym}?`)) return;
+      await this.post('/api/sell', { symbol: sym, amount });
+      await this.refresh();
+    },
+
+    editPos(sym, p) {
+      this.editModal = {
+        show: true, sym,
+        tp: (p.tp_override ?? []).join(','),
+        sl: p.sl_override ?? '',
+      };
+    },
+    async saveOverride() {
+      const { sym, tp, sl } = this.editModal;
+      await this.post('/api/position/tp', { symbol: sym, tp: tp ? tp.split(',').map(Number) : null });
+      await this.post('/api/position/sl', { symbol: sym, sl: sl !== '' ? +sl : null });
+      this.editModal.show = false;
+      await this.refresh();
+    },
+    async clearOverride() {
+      const { sym } = this.editModal;
+      await this.post('/api/position/tp', { symbol: sym, tp: null });
+      await this.post('/api/position/sl', { symbol: sym, sl: null });
+      this.editModal.show = false;
+      await this.refresh();
+    },
+
+    saveToken() {
+      localStorage.setItem('dash_token', this.tokenInput);
+      this.showTokenModal = false;
+      this.refresh();
+    },
+
+    // ── Chart ──
+    drawChart(h) {
+      const sells = (h.trades || []).filter(t => t.side === 'sell' && t.pnl != null);
+      const canvas = document.getElementById('pnlChart');
+      if (!canvas || !sells.length) return;
+      if (this.chart) this.chart.destroy();
+      const last = sells.at(-1)?.running_pnl ?? 0;
+      const color = last >= 0 ? '#4ade80' : '#f87171';
+      this.chart = new Chart(canvas, {
+        type: 'line',
+        data: {
+          labels: sells.map(t => t.ts?.slice(0, 10)),
+          datasets: [{ label: 'Cumulative PnL ($)',
+            data: sells.map(t => t.running_pnl ?? 0),
+            borderColor: color, backgroundColor: color + '18',
+            tension: 0.3, fill: true,
+            pointRadius: sells.length < 40 ? 3 : 0,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#4b5563', maxTicksLimit: 10 }, grid: { color: '#1f2937' } },
+            y: { ticks: { color: '#4b5563', callback: v => '$' + v.toFixed(0) }, grid: { color: '#1f2937' } },
+          },
+        },
+      });
+    },
+
+    // ── Formatters ──
+    fmt(v)  { return v == null ? '—' : Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
+    fmtP(v) { if (!v) return '—'; return v < 0.0001 ? v.toExponential(3) : v < 1 ? v.toPrecision(4) : v.toLocaleString('en-US', { maximumFractionDigits: 4 }); },
+    fmtU(v) { if (!v) return '0'; return v >= 10000 ? v.toLocaleString('en-US', { maximumFractionDigits: 0 }) : v.toPrecision(4); },
+    fmtTp(v) {
+      if (!v) return '—';
+      const arr = Array.isArray(v) ? v : [v];
+      return arr.map(x => '+' + (x * 100).toFixed(0) + '%').join(', ');
+    },
+    fmtSl(v) { return v != null ? '-' + (v * 100).toFixed(0) + '%' : '—'; },
+    heatCls(h) {
+      return { alt_season: 'text-green-400', neutral: 'text-blue-400', btc_season: 'text-yellow-400', btc_max: 'text-red-400' }[h] ?? 'text-gray-500';
+    },
+  };
+}
+</script>
+</body>
+</html>

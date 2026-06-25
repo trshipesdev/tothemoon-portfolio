@@ -1,0 +1,13 @@
+services:
+  cryptobot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Persist state between container restarts
+      - ./data:/app/data
+    # Flask status endpoint — remove or restrict if exposed publicly
+    ports:
+      - "127.0.0.1:8787:8787"

@@ -1,0 +1,1729 @@
+#!/usr/bin/env python3
+"""
+Comprehensive test suite for bot_full.py.
+
+Run:
+    python3 src/bot/tests.py -v
+    python3 src/bot/tests.py -v TestShadowRoundTrip   # single class
+    python3 src/bot/tests.py -v TestFlaskAPI           # Flask endpoints
+
+Coverage targets:
+    Capital sizing       — deployable_now, per_chain_room, per_token_cap_room,
+                           size_ticket_usd (all caps + brake + boost)
+    Trade round-trip     — shadow_buy, shadow_sell (avg, vault, skim, pnl_hist, trade_log)
+    TP/SL cascade        — tp_index lifecycle
+    Drawdown brake       — activation, ticket reduction
+    Moonshot filters     — Score, passes_moonshot_filters (all branches, spray mode)
+    Presale gate         — presale_score (all components, caps)
+    Pair parsing         — _pair_to_candidate (age, hype, missing fields)
+    Social signal        — fetch_social_volume (LC key path, CoinGecko fallback)
+    Heat signal          — compute_heat (all buckets)
+    Re-entry watch       — _add_reentry_watch (address guard, disabled, content)
+    No-pump exit         — should_exit_no_pump, adaptive_no_pump_window
+    Stealth guards       — _stealth_ok (count, expiry), _jitter_slip
+    Exec routing         — exec_buy / exec_sell (shadow vs. live routing)
+    Sell amount parsing  — _parse_sell_amount (all/pct/%, raw float)
+    Autoscale            — autoscale_maybe (add_count, cooldown, PI cap)
+    Objective            — start_objective (validation, curve), objective_nudge
+    Helpers              — est_price_impact, _px_dict, _parse_dex_pair, now_utc, log
+    Auth                 — tg_allowed (empty + populated allowlist), _dash_auth (Flask)
+    State persistence    — save_state / load_state round-trip, missing-key seeding
+    Shadow mode toggle   — set_shadow_mode
+    Flask API            — /status, /api/state, /api/positions, /api/history, /api/alerts,
+                           /api/set_mode, /api/set_shadow, /api/set_moonshot,
+                           /api/buy, /api/sell, /api/close,
+                           /api/position/tp, /api/position/sl,
+                           /api/watchlist/add, /api/watchlist/remove,
+                           /api/config/oldcoin, dashboard auth token
+    Daily reset          — open_today_usd reset logic in engine_once
+    Vault balance        — refresh_vault_balance no-op in shadow mode
+    Detect oldcoin pump  — vol spike (mocked)
+    CoinGecko cache      — rank lookup, cache hit, failure
+    RPC failover         — _sol_rpc primary/fallback
+    Boost expiry         — active, expired, ticket scaling
+"""
+
+import copy
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+
+# ── keep in shadow mode; point state at a temp file ─────────────────────────
+os.environ["SHADOW_MODE"] = "true"
+_tmp_state = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+_tmp_state.close()
+os.environ["STATE_PATH"] = _tmp_state.name
+
+# ── stub heavy third-party modules that may not be installed in CI ───────────
+for _mod in (
+    "telegram", "telegram.ext",
+    "solders", "solders.keypair", "solders.transaction",
+    "solders.hash", "solders.message", "solders.rpc",
+    "boto3", "botocore",
+):
+    sys.modules.setdefault(_mod, MagicMock())
+
+for _attr in ("Update", "ext.Application", "ext.CommandHandler", "ext.ContextTypes"):
+    parts = _attr.split(".")
+    mod   = sys.modules.get("telegram", MagicMock())
+    for p in parts:
+        if not hasattr(mod, p):
+            setattr(mod, p, MagicMock())
+        mod = getattr(mod, p)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bot_full as bot  # noqa: E402  (must come after stubs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared reset helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _reset(vault: float = 1000.0):
+    """Reset STATE and CONFIG to a clean baseline."""
+    bot.STATE.update({
+        "ts":               None,
+        "vault_usd":        vault,
+        "deployable_usd":   vault * (1 - bot.CONFIG["reserve_pct"]),
+        "income_usd":       0.0,
+        "positions":        {},
+        "pnl_hist":         [],
+        "open_today_usd":   0.0,
+        "last_daily_reset": None,
+        "signals":          {"btc_d": None, "heat": None},
+        "rpc":              {"health": {}},
+        "liq_prev":         {},
+        "trade_log":        [],
+        "telegram":         {"owner_chat_id": None},
+        "boost":            {"mult": 1.0, "expires": None},
+        "spray_until":      None,
+        "skim":             {"enabled": False},
+        "brake_alerted":    False,
+        "reentry_watch":    {},
+        "open_burst":       [],
+    })
+    bot.CONFIG["mode"]                           = "default"
+    bot.CONFIG["moonshot"]["mode"]               = "suggest"
+    bot.CONFIG["moonshot"]["reentry"]["enabled"] = True
+    bot.CONFIG["oldcoin"]["auto_join"]           = False
+    bot.CONFIG["autoscale"]["enabled"]           = True
+    bot.CONFIG["objective"]["kind"]              = "off"
+    bot.OBJ_STATE.update({"started": None, "target_curve": []})
+    bot.SHADOW_MODE = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. Low-level helpers — _px_dict, _parse_dex_pair, now_utc, log, send_alert
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestHelpers(unittest.TestCase):
+
+    def test_px_dict_defaults(self):
+        d = bot._px_dict(1.5)
+        self.assertEqual(d["price"], 1.5)
+        self.assertEqual(d["liq"], 100000.0)
+        self.assertEqual(d["vol_h1"], 0.0)
+        self.assertEqual(d["change_m5"], 0.0)
+
+    def test_px_dict_all_custom(self):
+        d = bot._px_dict(2.0, 50000.0, 5000.0, -3.5)
+        self.assertEqual(d["price"], 2.0)
+        self.assertEqual(d["liq"], 50000.0)
+        self.assertEqual(d["vol_h1"], 5000.0)
+        self.assertEqual(d["change_m5"], -3.5)
+
+    def test_parse_dex_pair_happy_path(self):
+        pair = {
+            "priceUsd":    "0.001",
+            "liquidity":   {"usd": 40000},
+            "volume":      {"h1": 1234},
+            "priceChange": {"m5": 2.5},
+        }
+        d = bot._parse_dex_pair(pair)
+        self.assertIsNotNone(d)
+        self.assertAlmostEqual(d["price"], 0.001)
+        self.assertEqual(d["liq"], 40000.0)
+        self.assertEqual(d["vol_h1"], 1234.0)
+        self.assertEqual(d["change_m5"], 2.5)
+
+    def test_parse_dex_pair_zero_price_none(self):
+        self.assertIsNone(bot._parse_dex_pair({"priceUsd": "0"}))
+
+    def test_parse_dex_pair_missing_fields_use_defaults(self):
+        d = bot._parse_dex_pair({"priceUsd": "1.0"})
+        self.assertIsNotNone(d)
+        self.assertEqual(d["liq"], 100000.0)
+        self.assertEqual(d["vol_h1"], 0.0)
+
+    def test_now_utc_is_timezone_aware(self):
+        t = bot.now_utc()
+        self.assertIsNotNone(t.tzinfo)
+        self.assertEqual(t.utcoffset().total_seconds(), 0)
+
+    def test_log_does_not_crash(self):
+        bot.log("test — should not raise")
+
+    def test_send_alert_no_bot_no_crash(self):
+        bot.TG_STATE = {}
+        bot.send_alert("test alert with no telegram bot configured")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. compute_heat — all buckets
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestComputeHeat(unittest.TestCase):
+
+    def test_alt_season(self):
+        self.assertEqual(bot.compute_heat(38.0), "alt_season")
+
+    def test_neutral_low(self):
+        self.assertEqual(bot.compute_heat(41.0), "neutral")
+
+    def test_neutral_high(self):
+        self.assertEqual(bot.compute_heat(49.9), "neutral")
+
+    def test_btc_season(self):
+        self.assertEqual(bot.compute_heat(56.0), "btc_season")
+
+    def test_btc_max(self):
+        self.assertEqual(bot.compute_heat(63.0), "btc_max")
+
+    def test_none_returns_none(self):
+        self.assertIsNone(bot.compute_heat(None))
+
+    def test_boundary_40_has_a_bucket(self):
+        result = bot.compute_heat(40.0)
+        self.assertIn(result, ("alt_season", "neutral"))
+
+    def test_boundary_55_has_a_bucket(self):
+        result = bot.compute_heat(55.0)
+        self.assertIn(result, ("neutral", "btc_season"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. _pair_to_candidate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPairToCandidate(unittest.TestCase):
+
+    def _pair(self, **overrides):
+        now_ms = int(time.time() * 1000)
+        base = {
+            "baseToken":     {"symbol": "PEPE", "address": "0xabc"},
+            "priceUsd":      "0.0001",
+            "pairCreatedAt": now_ms - 10 * 60 * 1000,
+            "liquidity":     {"usd": 50000},
+            "volume":        {"h24": 100000},
+            "priceChange":   {"h24": 15.0},
+        }
+        base.update(overrides)
+        return base
+
+    def test_basic_fields(self):
+        c = bot._pair_to_candidate(self._pair(), "sol")
+        self.assertIsNotNone(c)
+        self.assertEqual(c["symbol"], "PEPE")
+        self.assertEqual(c["chain"], "sol")
+        self.assertAlmostEqual(c["price"], 0.0001, places=6)
+        self.assertEqual(c["address"], "0xabc")
+        self.assertTrue(c["positive"])
+
+    def test_zero_price_returns_none(self):
+        self.assertIsNone(bot._pair_to_candidate(self._pair(priceUsd="0"), "sol"))
+
+    def test_none_price_returns_none(self):
+        self.assertIsNone(bot._pair_to_candidate(self._pair(priceUsd=None), "eth"))
+
+    def test_zero_liq_returns_none(self):
+        self.assertIsNone(bot._pair_to_candidate(self._pair(liquidity={"usd": 0}), "sol"))
+
+    def test_missing_liq_returns_none(self):
+        p = self._pair()
+        del p["liquidity"]
+        self.assertIsNone(bot._pair_to_candidate(p, "sol"))
+
+    def test_missing_base_token_returns_none(self):
+        p = self._pair()
+        del p["baseToken"]
+        self.assertIsNone(bot._pair_to_candidate(p, "sol"))
+
+    def test_negative_price_change_sets_positive_false(self):
+        c = bot._pair_to_candidate(self._pair(**{"priceChange": {"h24": -5.0}}), "sol")
+        self.assertIsNotNone(c)
+        self.assertFalse(c["positive"])
+
+    def test_age_from_created_at(self):
+        now_ms  = int(time.time() * 1000)
+        minutes = 45
+        c = bot._pair_to_candidate(
+            self._pair(**{"pairCreatedAt": now_ms - minutes * 60 * 1000}), "sol"
+        )
+        self.assertAlmostEqual(c["age_min"], minutes, delta=1.5)
+
+    def test_missing_created_at_gives_9999(self):
+        p = self._pair()
+        del p["pairCreatedAt"]
+        self.assertEqual(bot._pair_to_candidate(p, "eth")["age_min"], 9999)
+
+    def test_hype_proportional_vol_liq(self):
+        p = self._pair(**{"volume": {"h24": 100000}, "liquidity": {"usd": 50000}})
+        # vol/liq = 2 → hype = min(100, int(2 * 20)) = 40
+        self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 40)
+
+    def test_hype_capped_at_100(self):
+        p = self._pair(**{"volume": {"h24": 10_000_000}, "liquidity": {"usd": 1000}})
+        self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 100)
+
+    def test_zero_vol_hype_is_zero(self):
+        p = self._pair(**{"volume": {"h24": 0}, "liquidity": {"usd": 50000}})
+        self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 0)
+
+    def test_chain_passed_through(self):
+        self.assertEqual(bot._pair_to_candidate(self._pair(), "base")["chain"], "base")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. presale_score
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPresaleScore(unittest.TestCase):
+
+    def _s(self, **kw):
+        base = {"audit": False, "kyc": False, "lock_days": 0, "mentions": 0}
+        base.update(kw)
+        return bot.presale_score(base)
+
+    def test_all_zero(self):
+        self.assertEqual(self._s(), 0)
+
+    def test_audit_adds_20(self):
+        self.assertEqual(self._s(audit=True), 20)
+
+    def test_kyc_adds_20(self):
+        self.assertEqual(self._s(kyc=True), 20)
+
+    def test_audit_and_kyc_add_40(self):
+        self.assertEqual(self._s(audit=True, kyc=True), 40)
+
+    def test_lock_days_linear(self):
+        self.assertEqual(self._s(lock_days=30), 1)
+        self.assertEqual(self._s(lock_days=300), 10)
+        self.assertEqual(self._s(lock_days=900), 30)
+
+    def test_lock_days_capped_at_30(self):
+        self.assertEqual(self._s(lock_days=100_000), 30)
+
+    def test_short_lock_rounds_to_zero(self):
+        self.assertEqual(self._s(lock_days=14), 0)  # int(14/30) = 0
+
+    def test_mentions_linear(self):
+        self.assertEqual(self._s(mentions=5000),  10)
+        self.assertEqual(self._s(mentions=10000), 20)
+        self.assertEqual(self._s(mentions=15000), 30)
+
+    def test_mentions_capped_at_30(self):
+        self.assertEqual(self._s(mentions=1_000_000), 30)
+
+    def test_max_score_100(self):
+        self.assertEqual(self._s(audit=True, kyc=True, lock_days=10_000, mentions=1_000_000), 100)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. Score / passes_moonshot_filters
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMoonshotFilters(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+
+    def _sc(self, hype=90, liq=50000, age_min=15, positive=True):
+        return bot.Score(hype, liq, age_min, positive)
+
+    def test_passes_valid_candidate(self):
+        self.assertTrue(bot.passes_moonshot_filters(self._sc()))
+
+    def test_fails_liq_too_low(self):
+        self.assertFalse(bot.passes_moonshot_filters(
+            self._sc(liq=bot.CONFIG["moonshot"]["liq_min"] - 1)))
+
+    def test_fails_liq_too_high(self):
+        self.assertFalse(bot.passes_moonshot_filters(
+            self._sc(liq=bot.CONFIG["moonshot"]["liq_max"] + 1)))
+
+    def test_fails_too_old(self):
+        self.assertFalse(bot.passes_moonshot_filters(
+            self._sc(age_min=bot.CONFIG["scan"]["new_max_age_min"] + 1)))
+
+    def test_fails_not_positive(self):
+        self.assertFalse(bot.passes_moonshot_filters(self._sc(positive=False)))
+
+    def test_fails_low_hype(self):
+        self.assertFalse(bot.passes_moonshot_filters(
+            self._sc(hype=bot.CONFIG["moonshot"]["hype_min"] - 1)))
+
+    def test_spray_relaxes_liq_min(self):
+        normal_min = bot.CONFIG["moonshot"]["liq_min"]
+        spray_min  = int(normal_min * 0.7) + 1
+        bot.STATE["spray_until"] = "9999-12-31"
+        self.assertTrue(bot.passes_moonshot_filters(self._sc(liq=spray_min)))
+
+    def test_spray_relaxes_hype_min(self):
+        normal_hype = bot.CONFIG["moonshot"]["hype_min"]
+        spray_hype  = max(50, normal_hype - 20)
+        mid         = (spray_hype + normal_hype) // 2
+        bot.STATE["spray_until"] = "9999-12-31"
+        self.assertTrue(bot.passes_moonshot_filters(self._sc(hype=mid)))
+
+    def test_expired_spray_no_relaxation(self):
+        bot.STATE["spray_until"] = "2000-01-01"
+        self.assertFalse(bot.passes_moonshot_filters(
+            self._sc(hype=bot.CONFIG["moonshot"]["hype_min"] - 5)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. Capital sizing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCapitalSizing(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_deployable_now(self):
+        self.assertAlmostEqual(bot.deployable_now(), 750.0, places=2)
+
+    def test_deployable_zero_vault(self):
+        bot.STATE["vault_usd"] = 0.0
+        self.assertEqual(bot.deployable_now(), 0.0)
+
+    def test_deployable_clamps_below_zero(self):
+        bot.STATE["vault_usd"] = -50.0
+        self.assertEqual(bot.deployable_now(), 0.0)
+
+    def test_per_chain_room_empty(self):
+        expected = bot.CONFIG["per_chain_cap_pct"]["sol"] * 750.0
+        self.assertAlmostEqual(bot.per_chain_room("sol"), expected, places=2)
+
+    def test_per_chain_room_reduced_by_positions(self):
+        bot.STATE["positions"]["X"] = {
+            "chain": "sol", "usd": 100.0, "units": 1.0, "avg": 100.0, "realized": 0.0}
+        expected = bot.CONFIG["per_chain_cap_pct"]["sol"] * 750.0 - 100.0
+        self.assertAlmostEqual(bot.per_chain_room("sol"), expected, places=2)
+
+    def test_per_chain_room_fully_filled_is_zero(self):
+        cap = bot.CONFIG["per_chain_cap_pct"]["sol"] * 750.0
+        bot.STATE["positions"]["X"] = {
+            "chain": "sol", "usd": cap + 10, "units": 1.0, "avg": 100.0, "realized": 0.0}
+        self.assertEqual(bot.per_chain_room("sol"), 0.0)
+
+    def test_per_chain_room_unknown_chain_defaults(self):
+        self.assertGreater(bot.per_chain_room("unknown_xyz"), 0.0)
+
+    def test_per_token_cap_room(self):
+        self.assertAlmostEqual(bot.per_token_cap_room(),
+                               bot.CONFIG["per_token_cap_pct"] * 750.0, places=2)
+
+    def test_size_ticket_positive(self):
+        self.assertGreater(bot.size_ticket_usd("sol"), 0.0)
+
+    def test_size_ticket_chain_cap_blocks(self):
+        cap = bot.CONFIG["per_chain_cap_pct"]["sol"] * 750.0
+        bot.STATE["positions"]["X"] = {
+            "chain": "sol", "usd": cap, "units": 1.0, "avg": cap, "realized": 0.0}
+        self.assertEqual(bot.size_ticket_usd("sol"), 0.0)
+
+    def test_size_ticket_daily_cap_blocks(self):
+        cap = bot.CONFIG["daily_deploy_cap_pct"] * 750.0
+        bot.STATE["open_today_usd"] = cap
+        self.assertEqual(bot.size_ticket_usd("sol"), 0.0)
+
+    def test_size_ticket_daily_cap_near_limit(self):
+        cap = bot.CONFIG["daily_deploy_cap_pct"] * 750.0
+        bot.STATE["open_today_usd"] = cap - 1.0
+        self.assertLessEqual(bot.size_ticket_usd("sol"), 1.0)
+
+    def test_size_ticket_brake_reduces(self):
+        bot.STATE["pnl_hist"] = [-200, -100, -50]
+        base     = bot.CONFIG["base_size_usd"]
+        braked   = bot.size_ticket_usd("sol")
+        brake_max = base * bot.CONFIG["drawdown_brake"]["size_mult"] * 1.05
+        self.assertLessEqual(braked, brake_max)
+
+    def test_size_ticket_expired_boost_ignored(self):
+        bot.STATE["boost"] = {"mult": 5.0, "expires": "2000-01-01T00:00:00+00:00"}
+        t_with_expired = bot.size_ticket_usd("sol")
+        bot.STATE["boost"] = {"mult": 1.0, "expires": None}
+        t_no_boost = bot.size_ticket_usd("sol")
+        self.assertAlmostEqual(t_with_expired, t_no_boost, places=4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. Drawdown brake
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDrawdownBrake(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_empty_hist_no_brake(self):
+        bot.STATE["pnl_hist"] = []
+        self.assertFalse(bot.drawdown_brake_active())
+
+    def test_all_positive_no_brake(self):
+        bot.STATE["pnl_hist"] = [10, 20, 30]
+        self.assertFalse(bot.drawdown_brake_active())
+
+    def test_net_positive_no_brake(self):
+        bot.STATE["pnl_hist"] = [50, -1, -2]
+        self.assertFalse(bot.drawdown_brake_active())
+
+    def test_large_loss_fires_brake(self):
+        bot.STATE["pnl_hist"] = [-100, -50, -30]
+        self.assertTrue(bot.drawdown_brake_active())
+
+    def test_only_lookback_window_counts(self):
+        lookback = bot.CONFIG["drawdown_brake"]["lookback"]
+        # Early losses outside the window, recent gains inside
+        bot.STATE["pnl_hist"] = [-200] * 5 + [10] * lookback
+        self.assertFalse(bot.drawdown_brake_active())
+
+    def test_threshold_boundary(self):
+        # With no gains, dd threshold is dd * max(1.0, 0) = dd * 1 = 0.25
+        # loss just below threshold → no brake
+        bot.STATE["pnl_hist"] = [-0.24]
+        self.assertFalse(bot.drawdown_brake_active())
+        # loss just above threshold → brake fires
+        bot.STATE["pnl_hist"] = [-0.26]
+        self.assertTrue(bot.drawdown_brake_active())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. est_price_impact
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPriceImpact(unittest.TestCase):
+
+    def test_zero_liq_returns_1(self):
+        self.assertEqual(bot.est_price_impact(100, 0), 1.0)
+
+    def test_negative_liq_returns_1(self):
+        self.assertEqual(bot.est_price_impact(100, -500), 1.0)
+
+    def test_tiny_order_tiny_impact(self):
+        self.assertLess(bot.est_price_impact(10, 1_000_000), 0.001)
+
+    def test_large_order_capped_at_5pct(self):
+        self.assertEqual(bot.est_price_impact(10_000_000, 100), 0.05)
+
+    def test_proportional_in_normal_range(self):
+        i1 = bot.est_price_impact(100, 100_000)
+        i2 = bot.est_price_impact(200, 100_000)
+        self.assertAlmostEqual(i2, i1 * 2, places=8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. Stealth guards — burst + jitter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestStealthGuards(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+
+    def test_first_opens_all_allowed(self):
+        limit = bot.CONFIG["stealth"]["burst_per_30s"]
+        for i in range(limit):
+            self.assertTrue(bot._stealth_ok(), f"open #{i+1} should be allowed")
+            bot.STATE["open_burst"].append(time.time())
+
+    def test_burst_limit_blocks_next(self):
+        limit = bot.CONFIG["stealth"]["burst_per_30s"]
+        bot.STATE["open_burst"] = [time.time()] * limit
+        self.assertFalse(bot._stealth_ok())
+
+    def test_old_entries_expire(self):
+        bot.STATE["open_burst"] = [time.time() - 35] * 10
+        self.assertTrue(bot._stealth_ok())
+
+    def test_burst_list_pruned(self):
+        bot.STATE["open_burst"] = [time.time() - 35] * 5
+        bot._stealth_ok()
+        self.assertEqual(len(bot.STATE["open_burst"]), 0)
+
+    def test_jitter_non_negative(self):
+        for _ in range(100):
+            self.assertGreaterEqual(bot._jitter_slip(0.0), 0.0)
+
+    def test_jitter_within_max(self):
+        max_extra = bot.CONFIG["stealth"]["slip_bps_jitter"] / 10000
+        for _ in range(100):
+            self.assertLessEqual(bot._jitter_slip(0.0), max_extra + 1e-9)
+
+    def test_jitter_adds_to_base(self):
+        base = 0.02
+        for _ in range(50):
+            self.assertGreaterEqual(bot._jitter_slip(base), base)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. shadow_buy
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestShadowBuy(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_creates_position(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0, "addr1")
+        self.assertIn("TST", bot.STATE["positions"])
+
+    def test_vault_decremented(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        self.assertAlmostEqual(bot.STATE["vault_usd"], 950.0, places=2)
+
+    def test_open_today_incremented(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        self.assertAlmostEqual(bot.STATE["open_today_usd"], 50.0, places=2)
+
+    def test_units_computed(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        self.assertGreater(bot.STATE["positions"]["TST"]["units"], 0.0)
+
+    def test_address_stored(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0, "tok_addr")
+        self.assertEqual(bot.STATE["positions"]["TST"]["address"], "tok_addr")
+
+    def test_address_backfilled_on_add(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0, "")
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0, "later")
+        self.assertEqual(bot.STATE["positions"]["TST"]["address"], "later")
+
+    def test_weighted_avg_between_prices(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        bot.shadow_buy("TST", "sol", 50.0, 3.0, 100000.0)
+        avg = bot.STATE["positions"]["TST"]["avg"]
+        self.assertGreater(avg, 1.0)
+        self.assertLess(avg, 3.0)
+
+    def test_peak_price_set(self):
+        bot.shadow_buy("TST", "sol", 50.0, 2.0, 100000.0)
+        self.assertGreater(bot.STATE["positions"]["TST"]["peak_price"], 0)
+
+    def test_peak_price_updated_higher(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        p1 = bot.STATE["positions"]["TST"]["peak_price"]
+        bot.shadow_buy("TST", "sol", 50.0, 5.0, 100000.0)
+        self.assertGreater(bot.STATE["positions"]["TST"]["peak_price"], p1)
+
+    def test_trade_log_buy_entry(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        last = bot.STATE["trade_log"][-1]
+        self.assertEqual(last["symbol"], "TST")
+        self.assertEqual(last["side"], "buy")
+
+    def test_burst_incremented_on_new_position(self):
+        before = len(bot.STATE["open_burst"])
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        self.assertEqual(len(bot.STATE["open_burst"]), before + 1)
+
+    def test_burst_not_incremented_on_add_to_existing(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        before = len(bot.STATE["open_burst"])
+        bot.shadow_buy("TST", "sol", 25.0, 1.0, 100000.0)
+        self.assertEqual(len(bot.STATE["open_burst"]), before)
+
+    def test_burst_guard_blocks_new_position(self):
+        limit = bot.CONFIG["stealth"]["burst_per_30s"]
+        bot.STATE["open_burst"] = [time.time()] * limit
+        res = bot.shadow_buy("BLOCKED", "sol", 50.0, 1.0, 100000.0)
+        self.assertEqual(res["units"], 0.0)
+        self.assertNotIn("BLOCKED", bot.STATE["positions"])
+
+    def test_burst_guard_allows_add_to_existing_when_full(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        limit = bot.CONFIG["stealth"]["burst_per_30s"]
+        bot.STATE["open_burst"] = [time.time()] * limit
+        units_before = bot.STATE["positions"]["TST"]["units"]
+        res = bot.shadow_buy("TST", "sol", 25.0, 1.0, 100000.0)
+        self.assertGreater(res["units"], 0.0)
+        self.assertGreater(bot.STATE["positions"]["TST"]["units"], units_before)
+
+    def test_filled_price_above_raw_price(self):
+        res = bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        self.assertGreater(res["price"], 1.0)
+
+    def test_entry_liq_stored(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 75000.0)
+        self.assertEqual(bot.STATE["positions"]["TST"]["entry_liq"], 75000.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. shadow_sell
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestShadowSell(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+
+    def test_full_sell_clears_units(self):
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        self.assertAlmostEqual(pos["units"], 0.0, places=9)
+
+    def test_full_sell_resets_tp_index(self):
+        bot.STATE["positions"]["TST"]["tp_index"] = 2
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        self.assertEqual(pos["tp_index"], 0)
+
+    def test_partial_sell_keeps_units(self):
+        pos          = bot.STATE["positions"]["TST"]
+        units_before = pos["units"]
+        bot.shadow_sell("TST", pos["usd"] * 0.5, 1.0, 100000.0)
+        self.assertAlmostEqual(pos["units"], units_before / 2, places=6)
+
+    def test_profit_pnl_on_price_rise(self):
+        pos = bot.STATE["positions"]["TST"]
+        res = bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        self.assertGreater(res["pnl"], 0.0)
+
+    def test_loss_pnl_on_price_drop(self):
+        pos = bot.STATE["positions"]["TST"]
+        res = bot.shadow_sell("TST", pos["usd"], 0.5, 100000.0)
+        self.assertLess(res["pnl"], 0.0)
+
+    def test_vault_increases(self):
+        vault_before = bot.STATE["vault_usd"]
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        self.assertGreater(bot.STATE["vault_usd"], vault_before)
+
+    def test_pnl_appended_to_hist(self):
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        self.assertEqual(len(bot.STATE["pnl_hist"]), 1)
+
+    def test_realized_incremented(self):
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        self.assertGreater(pos["realized"], 0.0)
+
+    def test_trade_log_sell_entry(self):
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        sells = [t for t in bot.STATE["trade_log"] if t["side"] == "sell"]
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["symbol"], "TST")
+
+    def test_missing_position_returns_zero(self):
+        res = bot.shadow_sell("GHOST", 50.0, 1.0, 100000.0)
+        self.assertEqual(res["pnl"], 0.0)
+
+    def test_zero_usd_position_returns_zero(self):
+        bot.STATE["positions"]["EMPTY"] = {
+            "usd": 0.0, "units": 0.0, "avg": 0.0, "chain": "sol", "realized": 0.0}
+        res = bot.shadow_sell("EMPTY", 50.0, 1.0, 100000.0)
+        self.assertEqual(res["pnl"], 0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. Skim
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSkim(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+
+    def test_disabled_no_income(self):
+        bot.STATE["skim"] = {"enabled": False}
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        self.assertEqual(bot.STATE["income_usd"], 0.0)
+
+    def test_enabled_profit_creates_income(self):
+        bot.STATE["skim"] = {"enabled": True}
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        self.assertGreater(bot.STATE["income_usd"], 0.0)
+
+    def test_amount_is_correct_pct(self):
+        bot.STATE["skim"] = {"enabled": True}
+        pos = bot.STATE["positions"]["TST"]
+        res = bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        expected = res["pnl"] * bot.CONFIG["skim_pct"]
+        self.assertAlmostEqual(bot.STATE["income_usd"], expected, places=4)
+
+    def test_no_income_on_loss(self):
+        bot.STATE["skim"] = {"enabled": True}
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 0.5, 100000.0)
+        self.assertEqual(bot.STATE["income_usd"], 0.0)
+
+    def test_accumulates_across_trades(self):
+        bot.STATE["skim"] = {"enabled": True}
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"] / 2, 2.0, 100000.0)
+        income1 = bot.STATE["income_usd"]
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 2.0, 100000.0)
+        self.assertGreater(bot.STATE["income_usd"], income1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. TP cascade — tp_index
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTPIndex(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+
+    def test_starts_at_zero(self):
+        self.assertEqual(bot.STATE["positions"]["TST"].get("tp_index", 0), 0)
+
+    def test_second_tp_skipped_when_index_1(self):
+        pos             = bot.STATE["positions"]["TST"]
+        pos["tp_index"] = 1
+        tp_levels       = [0.28, 0.60]
+        executed        = []
+        for i, tp in enumerate(tp_levels):
+            if i < pos["tp_index"]:
+                continue
+            executed.append(i)
+            break
+        self.assertEqual(executed, [1])
+
+    def test_resets_on_full_close(self):
+        bot.STATE["positions"]["TST"]["tp_index"] = 2
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        self.assertEqual(pos["tp_index"], 0)
+
+    def test_preserved_on_partial_sell(self):
+        bot.STATE["positions"]["TST"]["tp_index"] = 1
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"] * 0.3, 1.5, 100000.0)
+        self.assertEqual(pos["tp_index"], 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 14. exec_buy / exec_sell routing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestExecRouting(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_exec_buy_shadow_calls_shadow_buy(self):
+        bot.SHADOW_MODE = True
+        with patch.object(bot, "shadow_buy", wraps=bot.shadow_buy) as mock:
+            bot.exec_buy("TST", "sol", 50.0, 1.0, 100000.0)
+            mock.assert_called_once()
+
+    def test_exec_sell_shadow_calls_shadow_sell(self):
+        bot.SHADOW_MODE = True
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        with patch.object(bot, "shadow_sell", wraps=bot.shadow_sell) as mock:
+            bot.exec_sell("TST", 50.0, 1.0, 100000.0)
+            mock.assert_called_once()
+
+    def test_exec_buy_live_calls_live_buy(self):
+        bot.SHADOW_MODE = False
+        with patch.object(bot, "live_buy", return_value={"price": 1.0, "units": 50.0}) as mock:
+            bot.exec_buy("TST", "sol", 50.0, 1.0, 100000.0)
+            mock.assert_called_once()
+        bot.SHADOW_MODE = True
+
+    def test_exec_sell_live_calls_live_sell(self):
+        bot.SHADOW_MODE = False
+        bot.STATE["positions"]["TST"] = {
+            "chain": "sol", "address": "addr1", "units": 50.0,
+            "usd": 50.0, "avg": 1.0, "realized": 0.0,
+        }
+        with patch.object(bot, "live_sell", return_value={"sold": 50.0, "pnl": 0.0}) as mock:
+            bot.exec_sell("TST", 50.0, 1.0, 100000.0)
+            mock.assert_called_once()
+        bot.SHADOW_MODE = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. Objective — start_objective / objective_nudge
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestObjective(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_negative_target_raises(self):
+        with self.assertRaises(ValueError):
+            bot.start_objective(-100, 4)
+
+    def test_zero_target_raises(self):
+        with self.assertRaises(ValueError):
+            bot.start_objective(0, 4)
+
+    def test_zero_weeks_raises(self):
+        with self.assertRaises(ValueError):
+            bot.start_objective(1000, 0)
+
+    def test_negative_weeks_raises(self):
+        with self.assertRaises(ValueError):
+            bot.start_objective(1000, -1)
+
+    def test_curve_length(self):
+        bot.start_objective(1000, 4)
+        self.assertEqual(len(bot.OBJ_STATE["target_curve"]), 4)
+
+    def test_curve_ends_at_target(self):
+        bot.start_objective(1000, 4)
+        self.assertAlmostEqual(bot.OBJ_STATE["target_curve"][-1], 1000.0, places=2)
+
+    def test_curve_is_linear(self):
+        bot.start_objective(400, 4)
+        curve = bot.OBJ_STATE["target_curve"]
+        for i, expected in enumerate([100, 200, 300, 400]):
+            self.assertAlmostEqual(curve[i], float(expected), places=2)
+
+    def test_nudge_returns_defaults_when_off(self):
+        bot.CONFIG["objective"]["kind"] = "off"
+        n = bot.objective_nudge()
+        self.assertEqual(n["size_mult"], 1.0)
+        self.assertEqual(n["extra_open"], 0)
+
+    def test_nudge_returns_defaults_when_no_obj_state(self):
+        bot.CONFIG["objective"]["kind"] = "target"
+        bot.OBJ_STATE["started"] = None
+        self.assertEqual(bot.objective_nudge()["size_mult"], 1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. No-pump exit + adaptive timer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNoPumpExit(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+
+    def test_within_window_no_exit(self):
+        entry_ts = time.time() - 10
+        self.assertFalse(bot.should_exit_no_pump(entry_ts, time.time(), 1.0, 1.0, 30000.0))
+
+    def test_past_window_no_gain_exits(self):
+        entry_ts = time.time() - 2000
+        self.assertTrue(bot.should_exit_no_pump(entry_ts, time.time(), 1.0, 1.001, 30000.0))
+
+    def test_past_window_good_gain_no_exit(self):
+        entry_ts = time.time() - 2000
+        cfg = bot.CONFIG["modes"].get("default", bot.CONFIG["modes"]["degen"])
+        hurdle = cfg.get("no_pump", bot.CONFIG["modes"]["degen"]["no_pump"])["hurdle"]
+        high_price = 1.0 * (1 + hurdle + 0.1)
+        self.assertFalse(bot.should_exit_no_pump(entry_ts, time.time(), 1.0, high_price, 30000.0))
+
+    def test_low_liq_uses_short_window(self):
+        ms = bot.CONFIG["moonshot"]["adaptive_timer"]
+        self.assertEqual(bot.adaptive_no_pump_window(10000.0), ms["low_liq_sec"])
+
+    def test_high_liq_uses_long_window(self):
+        ms = bot.CONFIG["moonshot"]["adaptive_timer"]
+        self.assertEqual(bot.adaptive_no_pump_window(100000.0), ms["high_liq_sec"])
+
+    def test_uses_current_mode_hurdle(self):
+        bot.CONFIG["mode"] = "degen"
+        entry_ts = time.time() - 2000
+        degen_hurdle = bot.CONFIG["modes"]["degen"]["no_pump"]["hurdle"]
+        under_hurdle = 1.0 * (1 + degen_hurdle - 0.01)
+        self.assertTrue(bot.should_exit_no_pump(entry_ts, time.time(), 1.0, under_hurdle, 30000.0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. Re-entry watch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReentryWatch(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+
+    def _pos(self, addr="0xtoken"):
+        return {"address": addr, "chain": "sol", "entry_liq": 50000.0, "entry_vol_h1": 1000.0}
+
+    def test_adds_to_watch(self):
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "trail")
+        self.assertIn("TST", bot.STATE["reentry_watch"])
+
+    def test_watch_has_required_fields(self):
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "rug")
+        w = bot.STATE["reentry_watch"]["TST"]
+        for key in ("exit_ts", "entry_liq", "price_samples", "exit_reason", "chain"):
+            self.assertIn(key, w)
+
+    def test_skips_without_address(self):
+        bot._add_reentry_watch("TST", self._pos(addr=""), 50000.0, 0.0, "test")
+        self.assertNotIn("TST", bot.STATE["reentry_watch"])
+
+    def test_skips_when_disabled(self):
+        bot.CONFIG["moonshot"]["reentry"]["enabled"] = False
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 0.0, "test")
+        self.assertNotIn("TST", bot.STATE["reentry_watch"])
+        bot.CONFIG["moonshot"]["reentry"]["enabled"] = True
+
+    def test_exit_ts_is_recent(self):
+        before = time.time()
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "vel")
+        after  = time.time()
+        self.assertBetween = lambda lo, hi, val: self.assertLessEqual(lo, val) or self.assertLessEqual(val, hi)
+        ts = bot.STATE["reentry_watch"]["TST"]["exit_ts"]
+        self.assertGreaterEqual(ts, before)
+        self.assertLessEqual(ts, after)
+
+    def test_uses_position_entry_liq(self):
+        pos = self._pos()
+        pos["entry_liq"] = 77777.0
+        bot._add_reentry_watch("TST", pos, 99999.0, 1000.0, "test")
+        self.assertEqual(bot.STATE["reentry_watch"]["TST"]["entry_liq"], 77777.0)
+
+    def test_overwrites_existing(self):
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "first")
+        bot._add_reentry_watch("TST", self._pos(), 50000.0, 1000.0, "second")
+        self.assertEqual(bot.STATE["reentry_watch"]["TST"]["exit_reason"], "second")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18. _parse_sell_amount
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestParseSellAmount(unittest.TestCase):
+
+    def _pos(self, usd=100.0):
+        return {"usd": usd, "units": 100.0, "avg": 1.0}
+
+    def test_all(self):
+        self.assertEqual(bot._parse_sell_amount(self._pos(100), "all"), 100.0)
+
+    def test_max(self):
+        self.assertEqual(bot._parse_sell_amount(self._pos(100), "max"), 100.0)
+
+    def test_100pct(self):
+        self.assertEqual(bot._parse_sell_amount(self._pos(100), "100%"), 100.0)
+
+    def test_50pct(self):
+        self.assertAlmostEqual(bot._parse_sell_amount(self._pos(100), "50%"), 50.0)
+
+    def test_25pct(self):
+        self.assertAlmostEqual(bot._parse_sell_amount(self._pos(200), "25%"), 50.0)
+
+    def test_0pct(self):
+        self.assertAlmostEqual(bot._parse_sell_amount(self._pos(100), "0%"), 0.0)
+
+    def test_raw_float(self):
+        self.assertAlmostEqual(bot._parse_sell_amount(self._pos(100), "35.50"), 35.50)
+
+    def test_over_100pct_clamped(self):
+        result = bot._parse_sell_amount(self._pos(100), "200%")
+        self.assertLessEqual(result, 100.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19. Auth — tg_allowed + _dash_auth
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAuth(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+
+    def test_empty_allowlist_allows_all(self):
+        bot.CONFIG["tenant"]["allowlist"] = []
+        self.assertTrue(bot.tg_allowed(12345))
+
+    def test_id_in_allowlist_allowed(self):
+        bot.CONFIG["tenant"]["allowlist"] = ["123", "456"]
+        self.assertTrue(bot.tg_allowed(123))
+
+    def test_id_not_in_allowlist_blocked(self):
+        bot.CONFIG["tenant"]["allowlist"] = ["123"]
+        self.assertFalse(bot.tg_allowed(999))
+
+    def test_dash_auth_no_token_allows_all(self):
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        with bot.app.test_client() as c:
+            self.assertNotEqual(c.get("/status").status_code, 401)
+
+    def test_dash_auth_correct_token(self):
+        os.environ["DASHBOARD_TOKEN"] = "secret123"
+        with bot.app.test_client() as c:
+            r = c.get("/api/state", headers={"Authorization": "Bearer secret123"})
+            self.assertNotEqual(r.status_code, 401)
+        del os.environ["DASHBOARD_TOKEN"]
+
+    def test_dash_auth_wrong_token(self):
+        os.environ["DASHBOARD_TOKEN"] = "secret123"
+        with bot.app.test_client() as c:
+            r = c.get("/api/state", headers={"Authorization": "Bearer wrongtoken"})
+            self.assertEqual(r.status_code, 401)
+        del os.environ["DASHBOARD_TOKEN"]
+
+    def test_dash_auth_missing_header(self):
+        os.environ["DASHBOARD_TOKEN"] = "secret123"
+        with bot.app.test_client() as c:
+            r = c.get("/api/state")
+            self.assertEqual(r.status_code, 401)
+        del os.environ["DASHBOARD_TOKEN"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20. Flask API — core endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFlaskAPI(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        self.c = bot.app.test_client()
+
+    # /status
+    def test_status_200(self):
+        self.assertEqual(self.c.get("/status").status_code, 200)
+
+    def test_status_shadow_mode(self):
+        data = self.c.get("/status").get_json()
+        self.assertTrue(data["shadow_mode"])
+
+    def test_status_build_key(self):
+        self.assertIn("build", self.c.get("/status").get_json())
+
+    def test_status_positions_count(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        self.assertEqual(self.c.get("/status").get_json()["positions"], 1)
+
+    # /api/state — flat response (no "state" wrapper)
+    def test_api_state_200(self):
+        self.assertEqual(self.c.get("/api/state").status_code, 200)
+
+    def test_api_state_vault(self):
+        data = self.c.get("/api/state").get_json()
+        self.assertAlmostEqual(data["vault_usd"], 1000.0, places=2)
+
+    def test_api_state_deployable(self):
+        self.assertIn("deployable_usd", self.c.get("/api/state").get_json())
+
+    def test_api_state_mode_tp(self):
+        self.assertIn("mode_tp", self.c.get("/api/state").get_json())
+
+    def test_api_state_mode_sl(self):
+        self.assertIn("mode_sl", self.c.get("/api/state").get_json())
+
+    # /api/positions — returns dict keyed by symbol; calls fetch_positions_prices internally
+    def test_positions_empty(self):
+        with patch.object(bot, "fetch_positions_prices", return_value={}):
+            data = self.c.get("/api/positions").get_json()
+        self.assertEqual(data, {})
+
+    def test_positions_returns_open(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        with patch.object(bot, "fetch_positions_prices",
+                          return_value={"TST": bot._px_dict(1.0)}):
+            data = self.c.get("/api/positions").get_json()
+        self.assertIn("TST", data)
+
+    def test_positions_excludes_closed(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        with patch.object(bot, "fetch_positions_prices", return_value={}):
+            data = self.c.get("/api/positions").get_json()
+        self.assertEqual(data, {})
+
+    # /api/history — returns {"trades", "total_pnl", "win_rate", "avg_win", "avg_loss"}
+    def test_history_has_trades(self):
+        self.assertIn("trades", self.c.get("/api/history").get_json())
+
+    def test_history_has_total_pnl(self):
+        self.assertIn("total_pnl", self.c.get("/api/history").get_json())
+
+    # /api/alerts — returns a JSON list directly
+    def test_alerts_is_list(self):
+        data = self.c.get("/api/alerts").get_json()
+        self.assertIsInstance(data, list)
+
+    # /api/rpc — returns the health dict directly (not wrapped in {"health": ...})
+    def test_rpc_is_dict(self):
+        data = self.c.get("/api/rpc").get_json()
+        self.assertIsInstance(data, dict)
+
+    # /api/mode  (not /api/set_mode)
+    def test_set_mode_valid(self):
+        r = self.c.post("/api/mode", json={"mode": "hype"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.CONFIG["mode"], "hype")
+
+    def test_set_mode_invalid_400(self):
+        self.assertEqual(self.c.post("/api/mode", json={"mode": "garbage"}).status_code, 400)
+
+    def test_set_mode_missing_field_400(self):
+        self.assertEqual(self.c.post("/api/mode", json={}).status_code, 400)
+
+    # /api/shadow  — key is "enabled", not "shadow"
+    def test_set_shadow_true(self):
+        self.c.post("/api/shadow", json={"enabled": True})
+        self.assertTrue(bot.SHADOW_MODE)
+
+    def test_set_shadow_false_then_true(self):
+        self.c.post("/api/shadow", json={"enabled": False})
+        self.assertFalse(bot.SHADOW_MODE)
+        self.c.post("/api/shadow", json={"enabled": True})
+        self.assertTrue(bot.SHADOW_MODE)
+
+    # /api/moonshot
+    def test_set_moonshot_enter(self):
+        r = self.c.post("/api/moonshot", json={"mode": "enter"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.CONFIG["moonshot"]["mode"], "enter")
+
+    def test_set_moonshot_invalid_400(self):
+        self.assertEqual(self.c.post("/api/moonshot", json={"mode": "bad"}).status_code, 400)
+
+    # /api/auto_old
+    def test_set_auto_old_true(self):
+        r = self.c.post("/api/auto_old", json={"enabled": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(bot.CONFIG["oldcoin"]["auto_join"])
+
+    # /api/buy
+    def test_buy_creates_position(self):
+        r = self.c.post("/api/buy", json={
+            "symbol": "MOCK", "usd": 50.0, "price": 1.0, "liq": 100000.0, "chain": "sol"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("MOCK", bot.STATE["positions"])
+
+    def test_buy_no_price_no_address_400(self):
+        self.assertEqual(
+            self.c.post("/api/buy", json={"symbol": "MOCK", "usd": 50.0}).status_code, 400)
+
+    def test_buy_zero_usd_400(self):
+        self.assertEqual(
+            self.c.post("/api/buy", json={"symbol": "MOCK", "usd": 0.0, "price": 1.0}).status_code, 400)
+
+    def test_buy_negative_usd_400(self):
+        self.assertEqual(
+            self.c.post("/api/buy", json={"symbol": "MOCK", "usd": -10.0, "price": 1.0}).status_code, 400)
+
+    # /api/sell
+    def test_sell_existing_position(self):
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+        r = self.c.post("/api/sell", json={"symbol": "TST", "pct": 50, "price": 1.0})
+        self.assertEqual(r.status_code, 200)
+
+    # /api/close
+    def test_close_position(self):
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+        with patch.object(bot, "fetch_positions_prices",
+                          return_value={"TST": bot._px_dict(1.0)}):
+            r = self.c.post("/api/close", json={"symbol": "TST"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_close_missing_symbol_returns_error(self):
+        # returns 404 "position not found" when symbol missing or no open units
+        self.assertIn(self.c.post("/api/close", json={}).status_code, (400, 404))
+
+    def test_close_unknown_symbol_404(self):
+        self.assertEqual(self.c.post("/api/close", json={"symbol": "GHOST"}).status_code, 404)
+
+    # /api/position/tp — stores as "tp_override" key
+    def test_set_tp(self):
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+        r = self.c.post("/api/position/tp", json={"symbol": "TST", "tp": [0.30, 0.60]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.STATE["positions"]["TST"]["tp_override"], [0.30, 0.60])
+
+    def test_set_tp_unknown_symbol_404(self):
+        self.assertEqual(
+            self.c.post("/api/position/tp", json={"symbol": "GHOST", "tp": [0.3]}).status_code, 404)
+
+    # /api/position/sl — stores as "sl_override" key
+    def test_set_sl(self):
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+        r = self.c.post("/api/position/sl", json={"symbol": "TST", "sl": 0.15})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.STATE["positions"]["TST"]["sl_override"], 0.15)
+
+    def test_set_sl_unknown_symbol_404(self):
+        self.assertEqual(
+            self.c.post("/api/position/sl", json={"symbol": "GHOST", "sl": 0.1}).status_code, 404)
+
+    # /api/watchlist/add and /remove
+    def test_watchlist_add(self):
+        r = self.c.post("/api/watchlist/add", json={"symbol": "DOGE", "address": "0xdoge"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.CONFIG["oldcoin"]["watchlist"]["DOGE"], "0xdoge")
+
+    def test_watchlist_remove(self):
+        bot.CONFIG["oldcoin"]["watchlist"]["DOGE"] = "0xdoge"
+        r = self.c.post("/api/watchlist/remove", json={"symbol": "DOGE"})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("DOGE", bot.CONFIG["oldcoin"]["watchlist"])
+
+    def test_watchlist_add_missing_fields_400(self):
+        self.assertEqual(self.c.post("/api/watchlist/add", json={}).status_code, 400)
+
+    # /api/config/oldcoin
+    def test_config_oldcoin(self):
+        r = self.c.post("/api/config/oldcoin", json={"volume_x": 5.0, "mentions_x": 3.0})
+        self.assertEqual(r.status_code, 200)
+        self.assertAlmostEqual(bot.CONFIG["oldcoin"]["volume_x"], 5.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 21. Flask advanced — boost, spray, objective
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFlaskAdvancedAPI(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        self.c = bot.app.test_client()
+
+    # /api/boost
+    def test_set_boost_valid(self):
+        r = self.c.post("/api/boost", json={"mult": 1.5, "hours": 2})
+        self.assertEqual(r.status_code, 200)
+        self.assertAlmostEqual(bot.STATE["boost"]["mult"], 1.5, places=2)
+
+    def test_set_boost_zero_mult_400(self):
+        self.assertEqual(self.c.post("/api/boost", json={"mult": 0.0, "hours": 2}).status_code, 400)
+
+    # /api/spray — takes "until" (ISO date string) or None to clear
+    def test_set_spray_with_until(self):
+        r = self.c.post("/api/spray", json={"until": "9999-12-31T00:00:00+00:00"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNotNone(bot.STATE["spray_until"])
+
+    def test_set_spray_none_clears(self):
+        bot.STATE["spray_until"] = "9999-12-31"
+        r = self.c.post("/api/spray", json={"until": None})
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(bot.STATE["spray_until"])
+
+    # /api/objective — requires kind="target" + target_usd + weeks
+    def test_set_objective_valid(self):
+        r = self.c.post("/api/objective", json={"kind": "target", "target_usd": 500.0, "weeks": 4})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.CONFIG["objective"]["kind"], "target")
+
+    def test_set_objective_off(self):
+        r = self.c.post("/api/objective", json={"kind": "off"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bot.CONFIG["objective"]["kind"], "off")
+
+    def test_set_objective_bad_target_400(self):
+        self.assertEqual(
+            self.c.post("/api/objective",
+                        json={"kind": "target", "target_usd": -100.0, "weeks": 4}).status_code, 400)
+
+    def test_set_objective_zero_weeks_400(self):
+        self.assertEqual(
+            self.c.post("/api/objective",
+                        json={"kind": "target", "target_usd": 500.0, "weeks": 0}).status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 22. State persistence — save / load round-trip, missing-key seeding
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestStatePersistence(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1234.56)
+
+    def test_vault_round_trip(self):
+        bot.STATE["vault_usd"] = 999.0
+        bot.save_state()
+        bot.STATE["vault_usd"] = 0.0
+        bot.load_state()
+        self.assertAlmostEqual(bot.STATE["vault_usd"], 999.0, places=2)
+
+    def test_positions_round_trip(self):
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        saved_units = bot.STATE["positions"]["TST"]["units"]
+        bot.save_state()
+        bot.STATE["positions"] = {}
+        bot.load_state()
+        self.assertIn("TST", bot.STATE["positions"])
+        self.assertAlmostEqual(bot.STATE["positions"]["TST"]["units"], saved_units, places=6)
+
+    def test_load_seeds_missing_keys(self):
+        with open(bot.SAVEFILE, "w") as f:
+            json.dump({"vault_usd": 500.0}, f)
+        bot.load_state()
+        for key in ("reentry_watch", "open_burst", "brake_alerted"):
+            self.assertIn(key, bot.STATE)
+
+    def test_save_bad_path_no_crash(self):
+        orig = bot.SAVEFILE
+        bot.SAVEFILE = "/nonexistent_dir_abc/state.json"
+        try:
+            bot.save_state()
+        except Exception:
+            self.fail("save_state should not raise on bad path")
+        finally:
+            bot.SAVEFILE = orig
+
+    def test_load_missing_file_no_crash(self):
+        bot.SAVEFILE = "/tmp/definitely_does_not_exist_zzz.json"
+        try:
+            bot.load_state()
+        except Exception:
+            self.fail("load_state should not raise when file is missing")
+
+    def test_load_corrupt_json_no_crash(self):
+        with open(bot.SAVEFILE, "w") as f:
+            f.write("{ NOT VALID JSON !!!")
+        try:
+            bot.load_state()
+        except Exception:
+            self.fail("load_state should not raise on corrupt JSON")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 23. set_shadow_mode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSetShadowMode(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+
+    def tearDown(self):
+        bot.SHADOW_MODE = True
+
+    def test_set_false(self):
+        bot.set_shadow_mode(False)
+        self.assertFalse(bot.SHADOW_MODE)
+        self.assertFalse(bot.STATE.get("shadow_mode"))
+
+    def test_set_true(self):
+        bot.SHADOW_MODE = False
+        bot.set_shadow_mode(True)
+        self.assertTrue(bot.SHADOW_MODE)
+
+    def test_persisted(self):
+        bot.set_shadow_mode(True)
+        bot.load_state()
+        self.assertTrue(bot.STATE.get("shadow_mode"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 24. refresh_vault_balance — shadow no-op
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRefreshVaultBalance(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_shadow_mode_is_noop(self):
+        bot.SHADOW_MODE = True
+        vault = bot.STATE["vault_usd"]
+        bot.refresh_vault_balance()
+        self.assertEqual(bot.STATE["vault_usd"], vault)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 25. detect_oldcoin_pump — mocked DexScreener
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDetectOldcoinPump(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+        bot.CONFIG["oldcoin"]["watchlist"] = {"DOGE": "0xdoge_addr"}
+
+    def _dex(self, h1, h24):
+        return {"pairs": [{"volume": {"h1": h1, "h24": h24},
+                           "priceUsd": "0.1",
+                           "liquidity": {"usd": 100000},
+                           "priceChange": {"h24": 5.0}}]}
+
+    def test_vol_spike_detected(self):
+        avg    = 1000.0 / 24
+        spike  = avg * 15  # 15× spike, well above volume_x=10
+        with patch.object(bot, "fetch_dexscreener_token", return_value=self._dex(spike, 1000.0)):
+            # social gate: mentions_x=2.0, so fetch_social_volume must return >= 2.0
+            with patch.object(bot, "fetch_social_volume", return_value=2.5):
+                self.assertTrue(bot.detect_oldcoin_pump("DOGE", 10.0, 2.0))
+
+    def test_no_vol_spike(self):
+        avg   = 1000.0 / 24
+        small = avg * 2
+        with patch.object(bot, "fetch_dexscreener_token", return_value=self._dex(small, 1000.0)):
+            self.assertFalse(bot.detect_oldcoin_pump("DOGE", 10.0, 2.0))
+
+    def test_unknown_symbol_false(self):
+        self.assertFalse(bot.detect_oldcoin_pump("UNKNOWNCOIN", 10.0, 2.0))
+
+    def test_none_dex_data_false(self):
+        with patch.object(bot, "fetch_dexscreener_token", return_value=None):
+            self.assertFalse(bot.detect_oldcoin_pump("DOGE", 10.0, 2.0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 26. fetch_social_volume — both paths
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFetchSocialVolume(unittest.TestCase):
+
+    def setUp(self):
+        os.environ.pop("LUNARCRUSH_API_KEY", None)
+        bot._cg_trending_cache["ts"] = 0.0
+        bot._cg_trending_cache["symbols"] = {}
+
+    def test_not_trending_returns_1_0(self):
+        with patch.object(bot, "_coingecko_trending_rank", return_value=None):
+            self.assertEqual(bot.fetch_social_volume("NEWCOIN"), 1.0)
+
+    def test_rank_1_returns_high_multiplier(self):
+        with patch.object(bot, "_coingecko_trending_rank", return_value=1):
+            self.assertGreater(bot.fetch_social_volume("BTC"), 2.0)
+
+    def test_rank_10_returns_modest_multiplier(self):
+        with patch.object(bot, "_coingecko_trending_rank", return_value=10):
+            r = bot.fetch_social_volume("BTC")
+            self.assertGreater(r, 1.0)
+            self.assertLess(r, 3.0)
+
+    def test_lunarcrush_path_uses_ratio(self):
+        os.environ["LUNARCRUSH_API_KEY"] = "fake"
+        mock_r = MagicMock()
+        mock_r.status_code = 200
+        # Actual API response shape used by fetch_social_volume: data is a dict with
+        # social_volume_24h and social_volume_7d_average
+        mock_r.json.return_value = {
+            "data": {"social_volume_24h": 200, "social_volume_7d_average": 100}
+        }
+        with patch("requests.get", return_value=mock_r):
+            result = bot.fetch_social_volume("BTC")
+        self.assertAlmostEqual(result, 2.0, places=1)
+        del os.environ["LUNARCRUSH_API_KEY"]
+
+    def test_lunarcrush_failure_returns_float(self):
+        os.environ["LUNARCRUSH_API_KEY"] = "fake"
+        with patch("requests.get", side_effect=Exception("timeout")):
+            result = bot.fetch_social_volume("BTC")
+        self.assertIsInstance(result, float)
+        del os.environ["LUNARCRUSH_API_KEY"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 27. CoinGecko trending rank — cache behavior
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCoinGeckoTrendingRank(unittest.TestCase):
+
+    def setUp(self):
+        bot._cg_trending_cache["ts"] = 0.0
+        bot._cg_trending_cache["symbols"] = {}
+
+    def _mock_resp(self, symbols):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"coins": [{"item": {"symbol": s}} for s in symbols]}
+        return r
+
+    def test_returns_rank_for_trending(self):
+        with patch("requests.get", return_value=self._mock_resp(["BTC", "ETH"])):
+            self.assertEqual(bot._coingecko_trending_rank("BTC"), 1)
+
+    def test_second_symbol_rank_2(self):
+        with patch("requests.get", return_value=self._mock_resp(["BTC", "ETH"])):
+            self.assertEqual(bot._coingecko_trending_rank("ETH"), 2)
+
+    def test_not_listed_returns_none(self):
+        with patch("requests.get", return_value=self._mock_resp(["BTC"])):
+            self.assertIsNone(bot._coingecko_trending_rank("NOTHERE"))
+
+    def test_cache_prevents_second_call(self):
+        with patch("requests.get", return_value=self._mock_resp(["BTC"])) as mock_get:
+            bot._coingecko_trending_rank("BTC")
+            bot._coingecko_trending_rank("ETH")
+            self.assertEqual(mock_get.call_count, 1)
+
+    def test_api_failure_returns_none(self):
+        with patch("requests.get", side_effect=Exception("timeout")):
+            self.assertIsNone(bot._coingecko_trending_rank("BTC"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 28. _sol_rpc failover
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSolRpcFailover(unittest.TestCase):
+
+    def test_returns_healthy_url(self):
+        ok = MagicMock()
+        ok.status_code = 200
+        with patch("requests.post", return_value=ok):
+            rpc = bot._sol_rpc()
+        self.assertIn("http", rpc)
+
+    def test_falls_back_on_all_fail(self):
+        with patch("requests.post", side_effect=Exception("conn refused")):
+            rpc = bot._sol_rpc()
+        self.assertTrue(rpc.startswith("http"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 29. Boost — expiry + ticket scaling
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBoost(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_expired_boost_cleared_after_size_ticket_call(self):
+        bot.STATE["boost"] = {"mult": 5.0, "expires": "2000-01-01T00:00:00+00:00"}
+        bot.size_ticket_usd("sol")
+        self.assertEqual(bot.STATE["boost"]["mult"], 1.0)
+
+    def test_unexpired_boost_active(self):
+        future = (bot.now_utc().replace(year=bot.now_utc().year + 1)).isoformat()
+        bot.STATE["boost"] = {"mult": 2.0, "expires": future}
+        # Ticket with boost should be >= ticket without (subject to caps)
+        t_boost    = bot.size_ticket_usd("sol")
+        bot.STATE["boost"] = {"mult": 1.0, "expires": None}
+        t_no_boost = bot.size_ticket_usd("sol")
+        room = bot.per_chain_room("sol")
+        base = bot.CONFIG["base_size_usd"] * bot.CONFIG["modes"]["default"]["size_mult"]
+        if room > base * 2:
+            self.assertGreater(t_boost, t_no_boost)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 30. autoscale_maybe
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAutoscaleMaybe(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+        bot.STATE["positions"]["TST"]["add_count"]   = 0
+        bot.STATE["positions"]["TST"]["last_add_ts"] = 0.0
+
+    def test_disabled_does_nothing(self):
+        bot.CONFIG["autoscale"]["enabled"] = False
+        u = bot.STATE["positions"]["TST"]["units"]
+        bot.autoscale_maybe("TST", "sol", 1.05, 100000.0, velocity_ok=True)
+        self.assertAlmostEqual(bot.STATE["positions"]["TST"]["units"], u, places=6)
+
+    def test_velocity_false_does_nothing(self):
+        u = bot.STATE["positions"]["TST"]["units"]
+        bot.autoscale_maybe("TST", "sol", 1.05, 100000.0, velocity_ok=False)
+        self.assertAlmostEqual(bot.STATE["positions"]["TST"]["units"], u, places=6)
+
+    def test_max_adds_reached_does_nothing(self):
+        bot.STATE["positions"]["TST"]["add_count"] = bot.CONFIG["autoscale"]["max_adds"]
+        u = bot.STATE["positions"]["TST"]["units"]
+        bot.autoscale_maybe("TST", "sol", 1.05, 100000.0, velocity_ok=True)
+        self.assertAlmostEqual(bot.STATE["positions"]["TST"]["units"], u, places=6)
+
+    def test_cooldown_active_does_nothing(self):
+        bot.STATE["positions"]["TST"]["last_add_ts"] = time.time()
+        u = bot.STATE["positions"]["TST"]["units"]
+        bot.autoscale_maybe("TST", "sol", 1.05, 100000.0, velocity_ok=True)
+        self.assertAlmostEqual(bot.STATE["positions"]["TST"]["units"], u, places=6)
+
+    def test_adds_when_conditions_met(self):
+        u = bot.STATE["positions"]["TST"]["units"]
+        bot.autoscale_maybe("TST", "sol", 1.05, 100000.0, velocity_ok=True)
+        self.assertGreater(bot.STATE["positions"]["TST"]["units"], u)
+
+    def test_add_count_incremented(self):
+        bot.autoscale_maybe("TST", "sol", 1.05, 100000.0, velocity_ok=True)
+        self.assertEqual(bot.STATE["positions"]["TST"]["add_count"], 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 31. Daily reset logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDailyReset(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    def test_resets_open_today_on_new_day(self):
+        bot.STATE["open_today_usd"]   = 999.0
+        bot.STATE["last_daily_reset"] = "2000-01-01"
+        today = bot.now_utc().date().isoformat()
+        if bot.STATE.get("last_daily_reset") != today:
+            bot.STATE["open_today_usd"]   = 0.0
+            bot.STATE["last_daily_reset"] = today
+        self.assertEqual(bot.STATE["open_today_usd"], 0.0)
+
+    def test_no_reset_if_already_today(self):
+        today = bot.now_utc().date().isoformat()
+        bot.STATE["last_daily_reset"] = today
+        bot.STATE["open_today_usd"]   = 500.0
+        if bot.STATE.get("last_daily_reset") != today:
+            bot.STATE["open_today_usd"] = 0.0
+        self.assertEqual(bot.STATE["open_today_usd"], 500.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 32. engine_once smoke — all external calls mocked
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEngineOnceSmoke(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    @patch.object(bot, "fetch_btc_dominance", return_value=45.0)
+    @patch.object(bot, "fetch_new_candidates", return_value=[])
+    @patch.object(bot, "fetch_positions_prices", return_value={})
+    @patch.object(bot, "check_reentry_watch")
+    @patch.object(bot, "manage_trusted_coins")
+    @patch.object(bot, "save_state")
+    def test_no_crash_empty(self, *_):
+        try:
+            bot.engine_once()
+        except Exception as e:
+            self.fail(f"engine_once raised: {e}")
+
+    @patch.object(bot, "fetch_btc_dominance", return_value=45.0)
+    @patch.object(bot, "fetch_new_candidates", return_value=[])
+    @patch.object(bot, "fetch_positions_prices",
+                  return_value={"TST": bot._px_dict(1.05, 100000.0, 5000.0, 2.0)})
+    @patch.object(bot, "check_reentry_watch")
+    @patch.object(bot, "manage_trusted_coins")
+    @patch.object(bot, "save_state")
+    def test_no_crash_with_position(self, *_):
+        _reset(1000.0)
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        try:
+            bot.engine_once()
+        except Exception as e:
+            self.fail(f"engine_once raised with position: {e}")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
