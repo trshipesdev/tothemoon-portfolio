@@ -178,7 +178,7 @@
                     <td class="py-1.5 pr-3 uppercase" x-text="w.chain"></td>
                     <td class="py-1.5 pr-3 text-gray-600 truncate max-w-[180px]" x-text="w.exit_reason"></td>
                     <td class="py-1.5 pr-3 text-right" x-text="(w.price_samples ?? []).length + ' / 3'"></td>
-                    <td class="py-1.5 text-right text-gray-600" x-text="w.exit_ts ? new Date(w.exit_ts * 1000).toLocaleTimeString() : '—'"></td>
+                    <td class="py-1.5 text-right text-gray-600" x-text="w.exit_ts ? fmtTime(w.exit_ts * 1000) : '—'" :title="w.exit_ts ? fmtTimeUTC(w.exit_ts * 1000) : ''"></td>
                   </tr>
                 </template>
               </tbody>
@@ -382,7 +382,7 @@
           </template>
           <template x-for="t in (history.trades ?? []).slice().reverse().slice(0, 100)" :key="t.ts + t.symbol">
             <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
-              <td class="py-1.5 pr-3 text-gray-600" x-text="t.ts?.slice(0, 16)"></td>
+              <td class="py-1.5 pr-3 text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></td>
               <td class="py-1.5 pr-3 font-bold" x-text="t.symbol"></td>
               <td :class="t.side === 'buy' ? 'text-blue-400' : 'text-orange-400'"
                   class="py-1.5 pr-3 uppercase font-bold" x-text="t.side"></td>
@@ -414,7 +414,7 @@
                   ? 'border-l-4 border-red-500 bg-red-950/20'
                   : 'border-l-4 border-gray-800 bg-gray-900'"
                class="px-3 py-2 rounded-r-lg text-xs">
-            <span class="text-gray-600 mr-2 select-none" x-text="a.ts?.slice(0, 19).replace('T', ' ')"></span>
+            <span class="text-gray-600 mr-2 select-none" x-text="fmtTime(a.ts)" :title="fmtTimeUTC(a.ts)"></span>
             <span x-text="a.msg"></span>
           </div>
         </template>
@@ -676,6 +676,20 @@ function app() {
     },
 
     // ── Formatters ──
+    // Local time (12-hour) for display; hover shows the original UTC. Accepts an
+    // ISO string (server trade/alert ts) or epoch-ms number (re-entry exit_ts).
+    fmtTime(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts);
+      if (isNaN(d)) return ts;
+      return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+    },
+    fmtTimeUTC(ts) {
+      if (!ts) return '';
+      const d = new Date(ts);
+      if (isNaN(d)) return String(ts);
+      return d.toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+    },
     fmt(v)  { return v == null ? '—' : Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
     fmtP(v) { if (!v) return '—'; return v < 0.0001 ? v.toExponential(3) : v < 1 ? v.toPrecision(4) : v.toLocaleString('en-US', { maximumFractionDigits: 4 }); },
     fmtU(v) { if (!v) return '0'; return v >= 10000 ? v.toLocaleString('en-US', { maximumFractionDigits: 0 }) : v.toPrecision(4); },
