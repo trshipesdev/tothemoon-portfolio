@@ -171,8 +171,20 @@ CONFIG: Dict[str, Any] = {
     # Network gas/transaction fees, applied to BOTH legs of every paper trade so
     # shadow PnL reflects real on-chain costs. Approx USD per swap, per chain.
     # Solana is ~free; Ethereum mainnet is brutal on small trades.
-    "gas_sim": True,
-    "gas_usd": {"sol": 0.001, "base": 0.02, "poly": 0.02, "bsc": 0.15, "eth": 6.0},
+    "gas_sim":     True,
+    "gas_dynamic": True,   # fetch live ETH gas (eth_gasPrice × ETH price) every ~5 min
+    "gas_usd":     {"sol": 0.001, "base": 0.02, "poly": 0.02, "bsc": 0.15, "eth": 6.0},
+
+    # AI auto-pilot — Haiku reads market health + recent performance and recommends
+    # (or auto-applies) a risk mode. Needs ANTHROPIC_API_KEY. Capital caps still
+    # bound absolute trade size, so the AI only steers the risk PROFILE, never sizing.
+    "ai": {
+        "enabled":        False,   # master switch (also requires ANTHROPIC_API_KEY)
+        "auto_apply":     False,   # True = AI switches modes itself; False = advisory only
+        "model":          "claude-haiku-4-5",
+        "interval_min":   30,      # how often to consult the AI
+        "min_confidence": 0.6,     # only auto-apply at/above this confidence
+    },
 }
 
 random.seed(CONFIG["tenant"]["jitter_seed"])
@@ -202,6 +214,8 @@ STATE: Dict[str, Any] = {
     "open_burst":       [],  # timestamps of recent position opens for burst rate-limiting
     "gas_paid_usd":     0.0,  # cumulative simulated gas/fees paid across all paper trades
     "scout_log":        [],  # recent candidate evaluations: why it entered/suggested/rejected
+    "gas_live":         {},  # live per-chain gas estimates: {chain: usd, "ts": epoch}
+    "ai":               {"last_run": None, "last": None, "history": []},  # AI advisor state
 }
 
 _state_path_env = os.getenv("STATE_PATH", "")
@@ -699,10 +713,47 @@ def _jitter_slip(base_slip: float) -> float:
 
 
 def _gas_usd(chain: str) -> float:
-    """Estimated network gas/fee in USD for one swap on `chain` (0 if gas sim off)."""
+    """Estimated network gas/fee in USD for one swap on `chain` (0 if gas sim off).
+    Prefers a live estimate (see refresh_gas_estimates) and falls back to static config."""
     if not CONFIG.get("gas_sim", True):
         return 0.0
+    live = STATE.get("gas_live", {}).get(chain)
+    if live is not None:
+        return float(live)
     return float(CONFIG.get("gas_usd", {}).get(chain, 0.05))
+
+
+def _eth_gas_usd_live() -> Optional[float]:
+    """Live Ethereum swap cost in USD = gasPrice(wei) × ~150k gas × ETH price."""
+    rpcs = CONFIG["rpc"].get("eth") or []
+    if not rpcs:
+        return None
+    try:
+        r = requests.post(rpcs[0], json={"jsonrpc": "2.0", "id": 1,
+                                         "method": "eth_gasPrice", "params": []}, timeout=6)
+        gas_price_wei = int(r.json()["result"], 16)
+    except Exception:
+        return None
+    px = _get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
+    eth_usd = float((px or {}).get("ethereum", {}).get("usd") or 0)
+    if eth_usd <= 0:
+        return None
+    SWAP_GAS_UNITS = 150000
+    return gas_price_wei * SWAP_GAS_UNITS / 1e18 * eth_usd
+
+
+def refresh_gas_estimates():
+    """Periodically refresh live gas (currently ETH — the costliest). Cached ~5 min."""
+    if not (CONFIG.get("gas_sim", True) and CONFIG.get("gas_dynamic", True)):
+        return
+    cache = STATE.setdefault("gas_live", {})
+    if time.time() - cache.get("ts", 0) < 300:
+        return
+    eth = _eth_gas_usd_live()
+    if eth and eth > 0:
+        cache["eth"] = round(eth, 4)
+        cache["ts"]  = time.time()
+        log(f"Live ETH gas: ${eth:.2f}/swap")
 
 
 def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float, address: str = "") -> Dict[str, Any]:
@@ -1481,6 +1532,125 @@ def presale_score(meta: Dict[str, Any]) -> int:
     return score
 
 # ---------------------------------------------------------------------------
+# AI auto-pilot (Claude Haiku) — recommends/auto-applies a risk mode
+# ---------------------------------------------------------------------------
+ANTHROPIC_KEY_ENV = "ANTHROPIC_API_KEY"
+
+AI_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recommended_mode": {"type": "string", "enum": ["safe", "default", "hype", "degen"]},
+        "confidence":       {"type": "number"},
+        "aggressive":       {"type": "boolean"},
+        "reasoning":        {"type": "string"},
+    },
+    "required": ["recommended_mode", "confidence", "reasoning"],
+    "additionalProperties": False,
+}
+
+AI_SYSTEM = (
+    "You are the risk-mode controller for a multi-chain crypto memecoin scalping bot running in "
+    "paper-trading mode. You pick ONE risk profile for the next ~30 minutes based on market health "
+    "and recent performance.\n\n"
+    "Modes, least to most aggressive:\n"
+    "- safe:    tight targets (+15%), tight stop (-7%), needs $50k+ liquidity. Few trades, capital preservation.\n"
+    "- default: balanced (+28% / -12%), $30k+ liquidity.\n"
+    "- hype:    aggressive (+45%/+90% / -18%), $20k+ liquidity. More/newer launches.\n"
+    "- degen:   max aggression (+80%/+150% / -28%), $10k+ liquidity. Catches the wildest moonshots, more rugs.\n\n"
+    "Philosophy: be genuinely RISKY when the setup is smart and juicy — strong alt momentum, fresh launches "
+    "passing filters, recent wins — because per-trade size is already capped small (you cannot oversize). "
+    "Be CONSERVATIVE when the market is BTC-dominated/quiet, the recent win rate is poor, or the bot is "
+    "rejecting most candidates (thin/illiquid). The goal: ride safemoons, dodge rugpulls. "
+    "Position size is bounded elsewhere — you ONLY choose the risk profile. "
+    "Return strict JSON: recommended_mode, confidence (0-1), aggressive (bool), and a one-sentence reasoning."
+)
+
+
+def _scout_reason_summary(n: int = 40) -> Dict[str, int]:
+    """Tally recent scout decisions so the AI can see what the scanner is finding."""
+    out: Dict[str, int] = {"entered": 0, "suggested": 0, "rejected": 0}
+    for e in STATE.get("scout_log", [])[-n:]:
+        out[e.get("decision", "rejected")] = out.get(e.get("decision", "rejected"), 0) + 1
+    return out
+
+
+def _ai_market_context() -> Dict[str, Any]:
+    hist = STATE.get("pnl_hist", [])[-30:]
+    wins = sum(1 for x in hist if x > 0)
+    return {
+        "current_mode":   CONFIG["mode"],
+        "btc_dominance":  STATE["signals"].get("btc_d"),
+        "market_heat":    STATE["signals"].get("heat"),
+        "vault_usd":      round(STATE.get("vault_usd", 0), 2),
+        "open_positions": sum(1 for p in STATE.get("positions", {}).values() if p.get("units", 0) > 0),
+        "recent_trades":  len(hist),
+        "recent_wins":    wins,
+        "recent_win_rate": round(wins / len(hist), 2) if hist else None,
+        "recent_pnl":     round(sum(hist), 2),
+        "scout_last_40":  _scout_reason_summary(40),
+        "drawdown_brake": drawdown_brake_active(),
+    }
+
+
+def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
+    """Consult Claude Haiku for a risk-mode recommendation. Returns the decision dict or None.
+    Gated on CONFIG['ai']['enabled'] + ANTHROPIC_API_KEY; auto-applies the mode if configured."""
+    A = CONFIG["ai"]
+    if not force and not A.get("enabled"):
+        return None
+    if not os.getenv(ANTHROPIC_KEY_ENV):
+        if force:
+            log("AI: ANTHROPIC_API_KEY not set")
+        return None
+    try:
+        import anthropic  # lazy — bot runs fine without the dep installed
+    except ImportError:
+        log("AI: `anthropic` package not installed (pip install anthropic)")
+        return None
+
+    ctx = _ai_market_context()
+    try:
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model=A.get("model", "claude-haiku-4-5"),
+            max_tokens=400,
+            system=AI_SYSTEM,
+            messages=[{"role": "user", "content": json.dumps(ctx)}],
+            output_config={"format": {"type": "json_schema", "schema": AI_DECISION_SCHEMA}},
+        )
+        text = next((b.text for b in resp.content if b.type == "text"), "")
+        decision = json.loads(text)
+    except Exception as e:
+        log(f"AI advise failed: {e}")
+        return None
+
+    decision["confidence"] = max(0.0, min(1.0, float(decision.get("confidence", 0))))
+    decision["ts"] = now_utc().isoformat()
+    decision["from_mode"] = CONFIG["mode"]
+
+    aistate = STATE.setdefault("ai", {"last_run": None, "last": None, "history": []})
+    aistate["last_run"] = decision["ts"]
+    aistate["last"]     = decision
+    aistate.setdefault("history", []).append(decision)
+    if len(aistate["history"]) > 100:
+        del aistate["history"][:len(aistate["history"]) - 100]
+
+    rec = decision["recommended_mode"]
+    applied = False
+    if (A.get("auto_apply") and rec in CONFIG["modes"]
+            and rec != CONFIG["mode"] and decision["confidence"] >= A.get("min_confidence", 0.6)):
+        old = CONFIG["mode"]
+        CONFIG["mode"] = rec
+        applied = True
+        log(f"AI auto-switched mode {old} → {rec} (conf {decision['confidence']:.2f})")
+        send_alert(f"🤖 AI switched mode {old} → {rec} ({decision['confidence']:.0%}): {decision['reasoning']}", critical=True)
+    else:
+        send_alert(f"🤖 AI suggests {rec} ({decision['confidence']:.0%}): {decision['reasoning']}")
+    decision["applied"] = applied
+    save_state()
+    return decision
+
+# ---------------------------------------------------------------------------
 # Flask
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
@@ -1551,6 +1721,7 @@ def api_state():
         "config": {
             "presale_min_score": CONFIG.get("presale_min_score", 10),
             "gas_sim":           CONFIG.get("gas_sim", True),
+            "gas_dynamic":       CONFIG.get("gas_dynamic", True),
             "gas_usd":           CONFIG.get("gas_usd", {}),
             "skim_pct":          CONFIG.get("skim_pct", 0.10),
             "reentry":           CONFIG["moonshot"]["reentry"],
@@ -1559,7 +1730,9 @@ def api_state():
                 "mentions_x": CONFIG["oldcoin"]["mentions_x"],
             },
             "doge": TRUSTED.get("DOGE", {}),
+            "ai":   CONFIG["ai"],
         },
+        "ai_key_set": bool(os.getenv(ANTHROPIC_KEY_ENV)),
     })
 
 
@@ -1876,6 +2049,8 @@ def api_config():
         CONFIG["presale_min_score"] = int(data["presale_min_score"])
     if "gas_sim" in data:
         CONFIG["gas_sim"] = bool(data["gas_sim"])
+    if "gas_dynamic" in data:
+        CONFIG["gas_dynamic"] = bool(data["gas_dynamic"])
     if "skim_pct" in data:
         CONFIG["skim_pct"] = max(0.0, min(1.0, float(data["skim_pct"])))
     if isinstance(data.get("reentry"), dict):
@@ -1909,6 +2084,31 @@ def api_import():
     STATE.update(patch)
     save_state()
     return jsonify({"ok": True, "keys": list(patch.keys())})
+
+
+@app.route("/api/ai", methods=["POST"])
+@_dash_auth
+def api_ai_config():
+    """Configure the AI auto-pilot: enabled, auto_apply, interval_min, min_confidence."""
+    data = flask_request.get_json() or {}
+    for k in ("enabled", "auto_apply"):
+        if k in data:
+            CONFIG["ai"][k] = bool(data[k])
+    if "interval_min" in data:
+        CONFIG["ai"]["interval_min"] = max(1, int(data["interval_min"]))
+    if "min_confidence" in data:
+        CONFIG["ai"]["min_confidence"] = max(0.0, min(1.0, float(data["min_confidence"])))
+    return jsonify({"ok": True, "ai": CONFIG["ai"], "key_set": bool(os.getenv(ANTHROPIC_KEY_ENV))})
+
+
+@app.route("/api/ai/run", methods=["POST"])
+@_dash_auth
+def api_ai_run():
+    """Consult the AI right now (advisory or auto-apply per config). Returns the decision."""
+    decision = ai_advise(force=True)
+    if decision is None:
+        return jsonify({"error": "AI unavailable — check ANTHROPIC_API_KEY and that `anthropic` is installed"}), 400
+    return jsonify({"ok": True, "decision": decision})
 
 
 @app.route("/api/restart", methods=["POST"])
@@ -2548,6 +2748,8 @@ def engine_once():
 def engine_loop():
     last_rpc_check    = 0.0
     last_vault_refresh = 0.0
+    last_gas_refresh  = 0.0
+    last_ai_run       = 0.0
     digest_date       = None
     digest_hour       = int(CONFIG["telegram"]["daily_digest_utc"].split(":")[0])
     _crash_count  = 0
@@ -2580,6 +2782,18 @@ def engine_loop():
             except Exception:
                 pass
             last_vault_refresh = time.time()
+        if time.time() - last_gas_refresh > 300:
+            try:
+                refresh_gas_estimates()
+            except Exception:
+                pass
+            last_gas_refresh = time.time()
+        if CONFIG["ai"].get("enabled") and time.time() - last_ai_run > CONFIG["ai"].get("interval_min", 30) * 60:
+            try:
+                ai_advise()
+            except Exception:
+                pass
+            last_ai_run = time.time()
         time.sleep(CONFIG["scan"]["dexscreener_poll_sec"])
 
 # ---------------------------------------------------------------------------

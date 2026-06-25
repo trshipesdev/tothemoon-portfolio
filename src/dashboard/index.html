@@ -519,6 +519,51 @@
     <!-- SETTINGS -->
     <div x-show="tab === 'Settings'" class="grid md:grid-cols-2 gap-4">
 
+      <!-- AI auto-pilot -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3 md:col-span-2 border border-indigo-900/40">
+        <div class="flex items-center justify-between">
+          <h3 class="text-indigo-400 text-xs uppercase tracking-wider">🤖 AI auto-pilot (Claude Haiku)</h3>
+          <span class="text-xs" :class="state.ai_key_set ? 'text-green-400' : 'text-red-400'"
+                x-text="state.ai_key_set ? 'API key set' : 'no ANTHROPIC_API_KEY'"></span>
+        </div>
+        <p class="text-gray-500 text-xs">Reads market health + recent performance and recommends a risk mode.
+          It only steers the risk profile — your position-size caps stay hard.</p>
+        <div class="grid grid-cols-2 gap-3">
+          <div class="flex items-center justify-between">
+            <span class="text-sm">AI enabled</span>
+            <button @click="toggleAI('enabled')"
+                    :class="state.config?.ai?.enabled ? 'bg-green-600' : 'bg-gray-700'"
+                    class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+              <span :class="state.config?.ai?.enabled ? 'translate-x-6' : 'translate-x-1'"
+                    class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+            </button>
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-sm">Auto-apply
+              <span class="text-gray-600 text-xs block">let it switch modes itself</span>
+            </span>
+            <button @click="toggleAI('auto_apply')"
+                    :class="state.config?.ai?.auto_apply ? 'bg-green-600' : 'bg-gray-700'"
+                    class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+              <span :class="state.config?.ai?.auto_apply ? 'translate-x-6' : 'translate-x-1'"
+                    class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+            </button>
+          </div>
+        </div>
+        <button @click="runAI()"
+                class="w-full bg-indigo-700 hover:bg-indigo-600 rounded-lg py-2 text-xs font-bold">Ask the AI now</button>
+        <template x-if="state.ai?.last">
+          <div class="bg-gray-800 rounded-lg p-3 text-xs space-y-1">
+            <div class="flex items-center justify-between">
+              <span class="font-bold uppercase text-indigo-300" x-text="'→ ' + state.ai.last.recommended_mode"></span>
+              <span class="text-gray-500" x-text="((state.ai.last.confidence ?? 0)*100).toFixed(0) + '% conf · ' + (state.ai.last.applied ? 'applied' : 'advisory')"></span>
+            </div>
+            <div class="text-gray-400" x-text="state.ai.last.reasoning"></div>
+            <div class="text-gray-600" x-text="fmtTime(state.ai.last.ts)" :title="fmtTimeUTC(state.ai.last.ts)"></div>
+          </div>
+        </template>
+      </div>
+
       <!-- Strategy tuning -->
       <div class="bg-gray-900 rounded-xl p-4 space-y-3">
         <h3 class="text-gray-500 text-xs uppercase tracking-wider">Strategy tuning</h3>
@@ -544,7 +589,21 @@
                   class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
           </button>
         </div>
-        <div class="text-gray-600 text-xs" x-text="'gas paid so far (paper): $' + fmt(state.gas_paid_usd ?? 0)"></div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Live ETH gas
+            <span class="text-gray-600 text-xs block">fetch real-time Ethereum gas every ~5 min</span>
+          </span>
+          <button @click="post('/api/config', {gas_dynamic: !state.config?.gas_dynamic}).then(refresh)"
+                  :class="state.config?.gas_dynamic ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.gas_dynamic ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <div class="text-gray-600 text-xs">
+          <span x-text="'gas paid so far (paper): $' + fmt(state.gas_paid_usd ?? 0)"></span>
+          <span x-show="state.gas_live?.eth" x-text="' · live ETH: $' + fmt(state.gas_live?.eth) + '/swap'"></span>
+        </div>
       </div>
 
       <!-- Re-entry rules -->
@@ -807,6 +866,20 @@ function app() {
     async toggleShadow()  { await this.post('/api/shadow', { enabled: !this.state.shadow_mode }); await this.refresh(); },
     async toggleAutoOld() { await this.post('/api/auto_old', { enabled: !this.state.auto_old }); await this.refresh(); },
     async toggleSkim()    { await this.post('/api/skim', { enabled: !this.state.skim_enabled }); await this.refresh(); },
+
+    async toggleAI(field) {
+      const cur = this.state.config?.ai?.[field];
+      await this.post('/api/ai', { [field]: !cur });
+      await this.refresh();
+    },
+    async runAI() {
+      const r = await this.post('/api/ai/run', {});
+      if (r && r.decision) {
+        this.toast = { show: true, msg: 'AI: ' + r.decision.recommended_mode + ' (' + Math.round((r.decision.confidence||0)*100) + '%)', ok: true };
+        setTimeout(() => this.toast.show = false, 4000);
+      }
+      await this.refresh();
+    },
 
     async saveDoge() {
       const body = {};

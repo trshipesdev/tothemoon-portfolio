@@ -105,6 +105,10 @@ def _reset(vault: float = 1000.0):
         "brake_alerted":    False,
         "reentry_watch":    {},
         "open_burst":       [],
+        "gas_paid_usd":     0.0,
+        "scout_log":        [],
+        "gas_live":         {},
+        "ai":               {"last_run": None, "last": None, "history": []},
     })
     bot.CONFIG["mode"]                           = "default"
     bot.CONFIG["moonshot"]["mode"]               = "suggest"
@@ -1996,6 +2000,170 @@ class TestScoutLogEndpoint(unittest.TestCase):
         bot._scout("A", "sol", "entered", "x")
         d = self.c.get("/api/state").get_json()
         self.assertNotIn("scout_log", d)   # served via its own endpoint
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 37. AI auto-pilot (gating, context, endpoints) — no real API calls
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAIAdvisor(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        bot.CONFIG["ai"]["enabled"] = True
+        bot.CONFIG["ai"]["auto_apply"] = False
+
+    def test_advise_none_without_key(self):
+        self.assertIsNone(bot.ai_advise(force=True))
+
+    def test_advise_none_when_disabled_and_not_forced(self):
+        bot.CONFIG["ai"]["enabled"] = False
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        try:
+            self.assertIsNone(bot.ai_advise(force=False))
+        finally:
+            del os.environ["ANTHROPIC_API_KEY"]
+
+    def test_market_context_shape(self):
+        bot.STATE["pnl_hist"] = [10, -5, 8]
+        ctx = bot._ai_market_context()
+        self.assertEqual(ctx["recent_trades"], 3)
+        self.assertEqual(ctx["recent_wins"], 2)
+        self.assertIn("scout_last_40", ctx)
+        self.assertIn("current_mode", ctx)
+
+    def test_scout_reason_summary(self):
+        bot.STATE["scout_log"] = []
+        bot._scout("A", "sol", "entered", "x")
+        bot._scout("B", "sol", "rejected", "y")
+        s = bot._scout_reason_summary(40)
+        self.assertEqual(s["entered"], 1)
+        self.assertEqual(s["rejected"], 1)
+
+    def test_advise_applies_mode_when_auto_and_confident(self):
+        # Mock the anthropic SDK so no real call happens
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        bot.CONFIG["ai"]["auto_apply"] = True
+        bot.CONFIG["ai"]["min_confidence"] = 0.6
+        bot.CONFIG["mode"] = "default"
+        fake_block = MagicMock(); fake_block.type = "text"
+        fake_block.text = json.dumps({"recommended_mode": "hype", "confidence": 0.9,
+                                      "aggressive": True, "reasoning": "alt season"})
+        fake_resp = MagicMock(); fake_resp.content = [fake_block]
+        fake_client = MagicMock(); fake_client.messages.create.return_value = fake_resp
+        fake_anthropic = MagicMock(); fake_anthropic.Anthropic.return_value = fake_client
+        with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
+            d = bot.ai_advise(force=True)
+        self.assertIsNotNone(d)
+        self.assertEqual(d["recommended_mode"], "hype")
+        self.assertTrue(d["applied"])
+        self.assertEqual(bot.CONFIG["mode"], "hype")
+        del os.environ["ANTHROPIC_API_KEY"]
+
+    def test_advise_advisory_only_when_not_auto(self):
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        bot.CONFIG["ai"]["auto_apply"] = False
+        bot.CONFIG["mode"] = "default"
+        fake_block = MagicMock(); fake_block.type = "text"
+        fake_block.text = json.dumps({"recommended_mode": "degen", "confidence": 0.95, "reasoning": "x"})
+        fake_resp = MagicMock(); fake_resp.content = [fake_block]
+        fake_client = MagicMock(); fake_client.messages.create.return_value = fake_resp
+        fake_anthropic = MagicMock(); fake_anthropic.Anthropic.return_value = fake_client
+        with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
+            d = bot.ai_advise(force=True)
+        self.assertFalse(d["applied"])
+        self.assertEqual(bot.CONFIG["mode"], "default")   # unchanged
+        del os.environ["ANTHROPIC_API_KEY"]
+
+    def test_advise_confidence_clamped(self):
+        os.environ["ANTHROPIC_API_KEY"] = "fake"
+        fake_block = MagicMock(); fake_block.type = "text"
+        fake_block.text = json.dumps({"recommended_mode": "safe", "confidence": 5.0, "reasoning": "x"})
+        fake_resp = MagicMock(); fake_resp.content = [fake_block]
+        fake_client = MagicMock(); fake_client.messages.create.return_value = fake_resp
+        fake_anthropic = MagicMock(); fake_anthropic.Anthropic.return_value = fake_client
+        with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
+            d = bot.ai_advise(force=True)
+        self.assertLessEqual(d["confidence"], 1.0)
+        del os.environ["ANTHROPIC_API_KEY"]
+
+
+class TestAIEndpoints(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        self.c = bot.app.test_client()
+
+    def test_ai_config_toggle(self):
+        r = self.c.post("/api/ai", json={"enabled": True, "auto_apply": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(bot.CONFIG["ai"]["enabled"])
+        self.assertTrue(bot.CONFIG["ai"]["auto_apply"])
+
+    def test_ai_config_interval_clamped(self):
+        self.c.post("/api/ai", json={"interval_min": 0})
+        self.assertGreaterEqual(bot.CONFIG["ai"]["interval_min"], 1)
+
+    def test_ai_run_without_key_400(self):
+        r = self.c.post("/api/ai/run", json={})
+        self.assertEqual(r.status_code, 400)
+
+    def test_state_exposes_ai_config(self):
+        d = self.c.get("/api/state").get_json()
+        self.assertIn("ai", d["config"])
+        self.assertIn("ai_key_set", d)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 38. Dynamic gas
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDynamicGas(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.CONFIG["gas_sim"] = True
+        bot.CONFIG["gas_dynamic"] = True
+        bot.STATE["gas_live"] = {}
+
+    def test_live_gas_overrides_static(self):
+        bot.STATE["gas_live"] = {"eth": 12.5, "ts": time.time()}
+        self.assertEqual(bot._gas_usd("eth"), 12.5)
+
+    def test_falls_back_to_static_without_live(self):
+        bot.STATE["gas_live"] = {}
+        self.assertEqual(bot._gas_usd("eth"), bot.CONFIG["gas_usd"]["eth"])
+
+    def test_refresh_respects_cache_window(self):
+        bot.STATE["gas_live"] = {"eth": 9.0, "ts": time.time()}  # fresh
+        with patch.object(bot, "_eth_gas_usd_live", return_value=99.0) as mock:
+            bot.refresh_gas_estimates()
+            mock.assert_not_called()   # cached, shouldn't refetch
+
+    def test_refresh_updates_when_stale(self):
+        bot.STATE["gas_live"] = {"eth": 9.0, "ts": 0.0}  # stale
+        with patch.object(bot, "_eth_gas_usd_live", return_value=15.0):
+            bot.refresh_gas_estimates()
+        self.assertEqual(bot.STATE["gas_live"]["eth"], 15.0)
+
+    def test_refresh_noop_when_dynamic_off(self):
+        bot.CONFIG["gas_dynamic"] = False
+        bot.STATE["gas_live"] = {"eth": 9.0, "ts": 0.0}
+        with patch.object(bot, "_eth_gas_usd_live", return_value=15.0) as mock:
+            bot.refresh_gas_estimates()
+            mock.assert_not_called()
+
+    def test_eth_gas_live_computes_usd(self):
+        # gasPrice 30 gwei, ETH $3000 → 30e9 * 150000 / 1e18 * 3000 = $13.5
+        mock_rpc = MagicMock()
+        mock_rpc.json.return_value = {"result": hex(30 * 10**9)}
+        with patch("requests.post", return_value=mock_rpc):
+            with patch.object(bot, "_get", return_value={"ethereum": {"usd": 3000}}):
+                usd = bot._eth_gas_usd_live()
+        self.assertAlmostEqual(usd, 13.5, places=2)
 
 
 if __name__ == "__main__":
