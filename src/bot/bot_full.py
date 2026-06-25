@@ -2403,7 +2403,12 @@ def engine_loop():
 # Startup
 # ---------------------------------------------------------------------------
 def start_flask():
-    threading.Thread(target=lambda: app.run(host="127.0.0.1", port=8787), daemon=True).start()
+    # Default to loopback for safety. In Docker set DASHBOARD_HOST=0.0.0.0 so the
+    # host port-forward can reach Flask; docker-compose still binds the published
+    # port to 127.0.0.1 on the host, so it is not exposed to the network.
+    host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+    port = int(os.getenv("DASHBOARD_PORT", "8787"))
+    threading.Thread(target=lambda: app.run(host=host, port=port), daemon=True).start()
 
 
 def start_telegram():
@@ -2453,6 +2458,17 @@ def main():
     else:
         STATE["shadow_mode"] = SHADOW_MODE
         save_state()
+
+    # Optional env overrides so runtime settings survive restarts.
+    env_mode = os.getenv("BOT_MODE", "").strip().lower()
+    if env_mode:
+        if env_mode in CONFIG["modes"]:
+            CONFIG["mode"] = env_mode
+        else:
+            log(f"WARN BOT_MODE='{env_mode}' invalid — keeping '{CONFIG['mode']}'")
+    env_moon = os.getenv("MOONSHOT_MODE", "").strip().lower()
+    if env_moon in ("enter", "suggest"):
+        CONFIG["moonshot"]["mode"] = env_moon
 
     # Validate CONFIG mode is defined
     if CONFIG["mode"] not in CONFIG["modes"]:
