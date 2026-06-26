@@ -115,8 +115,10 @@ CONFIG: Dict[str, Any] = {
     "reserve_pct":          0.25,   # keep 25% of vault untouched
     "per_token_cap_pct":    0.12,   # max 12% of deployable per token  ← real risk cap
     # Stop churning the same hyper-volatile token: cap fresh entries per symbol per day.
-    # The bot was re-buying PENISPUMP / 𝕏GIFT ~6x each as they chopped, bleeding out.
-    "max_entries_per_token_day": 2,
+    # Raised 2→4: a cap of 2 strangled the bot once it cycled the few liquid tokens
+    # (everything else is below the liq floor), leaving nothing to trade. 4 keeps
+    # anti-churn protection while letting it stay active. Per-mode override supported.
+    "max_entries_per_token_day": 4,
     "per_chain_cap_pct":    {"sol": 0.40, "eth": 0.35, "base": 0.25, "bsc": 0.30, "poly": 0.25},  # ← real risk cap
     # Far-off sanity backstop only (5x deployable/day). The REAL, robust risk controls
     # are the reserve + per-chain + per-token caps + drawdown brake, which compute from
@@ -656,7 +658,11 @@ def moonshot_reject_reason(sc: Score) -> Optional[str]:
     ms = CONFIG["moonshot"]
     spray = STATE.get("spray_until")
     spraying = spray and now_utc().date().isoformat() <= spray
-    liq_min  = ms["liq_min"] * (0.7 if spraying else 1.0)
+    # Use the ACTIVE MODE's liquidity floor so modes actually change aggressiveness
+    # (degen $10k → more candidates, safe $50k → fewer/safer). Falls back to the
+    # moonshot floor if a mode doesn't set one.
+    mode_liq = CONFIG["modes"].get(CONFIG["mode"], {}).get("liq_min", ms["liq_min"])
+    liq_min  = mode_liq * (0.7 if spraying else 1.0)
     hype_min = max(50, ms["hype_min"] - (20 if spraying else 0))
     if sc.liq < liq_min:
         return f"liquidity ${sc.liq:,.0f} below min ${liq_min:,.0f}"

@@ -7,6 +7,8 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
   <style>
     [x-cloak] { display: none !important; }
     body { background: #030712; }
@@ -456,6 +458,10 @@
         </div>
       </div>
       <div class="mb-4 bg-gray-900 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-gray-500 text-xs">Cumulative PnL — scroll/drag to zoom, drag to pan</span>
+          <button @click="resetZoom()" class="text-gray-500 hover:text-white text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700">reset zoom</button>
+        </div>
         <canvas id="pnlChart" height="100"></canvas>
       </div>
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
@@ -997,7 +1003,11 @@ function app() {
       // Restore the last-selected tab across page refreshes
       const savedTab = localStorage.getItem('dash_tab');
       if (savedTab && this.tabs.includes(savedTab)) this.tab = savedTab;
-      this.$watch('tab', v => localStorage.setItem('dash_tab', v));
+      this.$watch('tab', v => {
+        localStorage.setItem('dash_tab', v);
+        // Redraw the chart when History becomes visible (Chart.js can't size a hidden canvas)
+        if (v === 'History') this.$nextTick(() => this.drawChart());
+      });
       await this.refresh();
       setInterval(() => this.refresh(), 20000);
     },
@@ -1183,33 +1193,48 @@ function app() {
 
     // ── Chart ──
     drawChart(h) {
-      const sells = (h.trades || []).filter(t => t.side === 'sell' && t.pnl != null);
-      const canvas = document.getElementById('pnlChart');
-      if (!canvas || !sells.length) return;
-      if (this.chart) this.chart.destroy();
-      const last = sells.at(-1)?.running_pnl ?? 0;
-      const color = last >= 0 ? '#4ade80' : '#f87171';
-      this.chart = new Chart(canvas, {
-        type: 'line',
-        data: {
-          labels: sells.map(t => t.ts?.slice(0, 10)),
-          datasets: [{ label: 'Cumulative PnL ($)',
-            data: sells.map(t => t.running_pnl ?? 0),
-            borderColor: color, backgroundColor: color + '18',
-            tension: 0.3, fill: true,
-            pointRadius: sells.length < 40 ? 3 : 0,
-          }],
-        },
-        options: {
-          responsive: true, maintainAspectRatio: true,
-          plugins: { legend: { display: false } },
-          scales: {
-            x: { ticks: { color: '#4b5563', maxTicksLimit: 10 }, grid: { color: '#1f2937' } },
-            y: { ticks: { color: '#4b5563', callback: v => '$' + v.toFixed(0) }, grid: { color: '#1f2937' } },
+      try {
+        if (h) this._lastHist = h;
+        h = h || this._lastHist;
+        if (!h) return;
+        const canvas = document.getElementById('pnlChart');
+        // Skip if the canvas is hidden (inactive tab) — Chart.js can't size a 0×0 canvas,
+        // which is what made the graph render broken when History wasn't the active tab.
+        if (!canvas || canvas.offsetParent === null) return;
+        const sells = (h.trades || []).filter(t => t.side === 'sell' && t.pnl != null);
+        if (!sells.length) return;
+        if (this.chart) this.chart.destroy();
+        const last = sells.at(-1)?.running_pnl ?? 0;
+        const color = last >= 0 ? '#4ade80' : '#f87171';
+        this.chart = new Chart(canvas, {
+          type: 'line',
+          data: {
+            labels: sells.map(t => this.fmtTime(t.ts)),
+            datasets: [{ label: 'Cumulative PnL ($)',
+              data: sells.map(t => t.running_pnl ?? 0),
+              borderColor: color, backgroundColor: color + '18',
+              tension: 0.3, fill: true,
+              pointRadius: sells.length < 40 ? 3 : 0,
+            }],
           },
-        },
-      });
+          options: {
+            responsive: true, maintainAspectRatio: true,
+            plugins: {
+              legend: { display: false },
+              zoom: {
+                pan:  { enabled: true, mode: 'x' },
+                zoom: { wheel: { enabled: true }, pinch: { enabled: true }, drag: { enabled: true }, mode: 'x' },
+              },
+            },
+            scales: {
+              x: { ticks: { color: '#4b5563', maxTicksLimit: 10 }, grid: { color: '#1f2937' } },
+              y: { ticks: { color: '#4b5563', callback: v => '$' + v.toFixed(0) }, grid: { color: '#1f2937' } },
+            },
+          },
+        });
+      } catch (e) { /* never let a chart error break the dashboard */ }
     },
+    resetZoom() { try { this.chart?.resetZoom(); } catch {} },
 
     // ── Formatters ──
     // Local time (12-hour) for display; hover shows the original UTC. Accepts an

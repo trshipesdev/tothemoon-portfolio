@@ -374,10 +374,20 @@ class TestMoonshotFilters(unittest.TestCase):
             self._sc(hype=bot.CONFIG["moonshot"]["hype_min"] - 1)))
 
     def test_spray_relaxes_liq_min(self):
-        normal_min = bot.CONFIG["moonshot"]["liq_min"]
+        # liquidity floor is now the active mode's liq_min (default mode here)
+        normal_min = bot.CONFIG["modes"][bot.CONFIG["mode"]]["liq_min"]
         spray_min  = int(normal_min * 0.7) + 1
         bot.STATE["spray_until"] = "9999-12-31"
         self.assertTrue(bot.passes_moonshot_filters(self._sc(liq=spray_min)))
+
+    def test_mode_liq_floor_applies(self):
+        # degen ($10k) accepts a $12k token that default ($30k) would reject
+        sc12k = self._sc(liq=12000)
+        bot.CONFIG["mode"] = "default"
+        self.assertIsNotNone(bot.moonshot_reject_reason(sc12k))   # rejected at $30k
+        bot.CONFIG["mode"] = "degen"
+        self.assertIsNone(bot.moonshot_reject_reason(sc12k))      # passes at $10k
+        bot.CONFIG["mode"] = "default"
 
     def test_spray_relaxes_hype_min(self):
         normal_hype = bot.CONFIG["moonshot"]["hype_min"]
