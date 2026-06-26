@@ -3248,6 +3248,10 @@ def main():
         CONFIG["ai"]["enabled"] = True
     if os.getenv("AI_AUTO_APPLY", "").strip().lower() in ("1", "true", "on", "yes"):
         CONFIG["ai"]["auto_apply"] = True
+    # Scan cadence override (seconds between scans) — lower = faster entries AND exits.
+    sps = os.getenv("SCAN_POLL_SEC", "").strip()
+    if sps.isdigit() and int(sps) >= 3:
+        CONFIG["scan"]["dexscreener_poll_sec"] = int(sps)
 
     # Validate CONFIG mode is defined
     if CONFIG["mode"] not in CONFIG["modes"]:
