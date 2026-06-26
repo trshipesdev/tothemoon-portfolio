@@ -504,24 +504,35 @@
           <div class="font-bold text-yellow-400/80" x-text="'$' + fmt(state.gas_paid_usd ?? 0)"></div>
         </div>
       </div>
+      <!-- Time window + count -->
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-gray-600 text-xs" x-text="sortedTrades.length + ' trades shown'"></span>
+        <div class="flex gap-1 text-xs">
+          <template x-for="w in [['100','Last 100'],['week','Last week'],['all','All']]" :key="w[0]">
+            <button @click="histWindow = w[0]"
+                    :class="histWindow === w[0] ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'"
+                    class="px-2 py-1 rounded" x-text="w[1]"></button>
+          </template>
+        </div>
+      </div>
       <table class="w-full text-xs">
         <thead>
           <tr class="text-gray-600 border-b border-gray-800">
-            <th class="text-left py-2 pr-3 font-normal">Time</th>
-            <th class="text-left py-2 pr-3 font-normal">Symbol</th>
-            <th class="text-left py-2 pr-3 font-normal">Side</th>
-            <th class="text-left py-2 pr-3 font-normal">Mode</th>
-            <th class="text-right py-2 pr-3 font-normal">$ In / Out</th>
-            <th class="text-right py-2 pr-3 font-normal">Gas</th>
-            <th class="text-right py-2 pr-3 font-normal">PnL</th>
-            <th class="text-right py-2 font-normal">Running</th>
+            <th @click="sortBy('ts')"     class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Time <span x-show="histSort==='ts'"     x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('symbol')" class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Symbol <span x-show="histSort==='symbol'" x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('side')"   class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Side <span x-show="histSort==='side'"   x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('mode')"   class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Mode <span x-show="histSort==='mode'"   x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('usd')"    class="text-right py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">$ In / Out <span x-show="histSort==='usd'" x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('gas')"    class="text-right py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Gas <span x-show="histSort==='gas'"    x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('pnl')"    class="text-right py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">PnL <span x-show="histSort==='pnl'"    x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('running_pnl')" class="text-right py-2 font-normal cursor-pointer hover:text-gray-300 select-none">Running <span x-show="histSort==='running_pnl'" x-text="histDir==='asc'?'▲':'▼'"></span></th>
           </tr>
         </thead>
         <tbody>
           <template x-if="!(history.trades?.length)">
             <tr><td colspan="8" class="py-12 text-center text-gray-700">No trades yet</td></tr>
           </template>
-          <template x-for="t in (history.trades ?? []).slice().reverse().slice(0, 100)" :key="t.ts + t.symbol">
+          <template x-for="t in sortedTrades" :key="t.ts + t.symbol + t.side">
             <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
               <td class="py-1.5 pr-3 text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></td>
               <td class="py-1.5 pr-3 font-bold">
@@ -1020,6 +1031,9 @@ function app() {
     state:   { shadow_mode: true, mode: '…', signals: {}, objective: {}, watchlist: {} },
     pos:     {},
     history: { trades: [], total_pnl: 0, win_rate: 0, avg_win: 0, avg_loss: 0 },
+    histWindow: '100',     // '100' | 'week' | 'all'
+    histSort:   'ts',
+    histDir:    'desc',
     alerts:  [],
     rpc:     {},
     scout:        [],
@@ -1044,6 +1058,31 @@ function app() {
     chart:         null,
 
     // ── Computed ──
+    sortBy(field) {
+      if (this.histSort === field) {
+        this.histDir = this.histDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        this.histSort = field;
+        // text fields default A→Z, numbers/time default high→low
+        this.histDir = ['symbol', 'side', 'mode'].includes(field) ? 'asc' : 'desc';
+      }
+    },
+    get sortedTrades() {
+      let ts = (this.history.trades ?? []).slice();
+      if (this.histWindow === 'week') {
+        const cut = Date.now() - 7 * 864e5;
+        ts = ts.filter(t => new Date(t.ts).getTime() >= cut);
+      }
+      const f = this.histSort, dir = this.histDir === 'asc' ? 1 : -1;
+      const txt = ['symbol', 'side', 'mode'].includes(f);
+      ts.sort((a, b) => {
+        let av = a[f], bv = b[f];
+        if (f === 'ts') { av = new Date(a.ts).getTime(); bv = new Date(b.ts).getTime(); }
+        if (txt) return dir * String(av ?? '').localeCompare(String(bv ?? ''));
+        return dir * ((av ?? 0) - (bv ?? 0));
+      });
+      return this.histWindow === '100' ? ts.slice(0, 100) : ts;
+    },
     get posEntries() {
       return Object.entries(this.pos).filter(([, p]) => p.units > 0);
     },
