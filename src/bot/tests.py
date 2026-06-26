@@ -2029,10 +2029,15 @@ class TestAIAdvisor(unittest.TestCase):
             del os.environ["ANTHROPIC_API_KEY"]
 
     def test_market_context_shape(self):
-        bot.STATE["pnl_hist"] = [10, -5, 8]
+        bot.STATE["pnl_hist"] = [10, -5, 8]   # 2 wins (10, 8), 1 loss (-5)
         ctx = bot._ai_market_context()
         self.assertEqual(ctx["recent_trades"], 3)
-        self.assertEqual(ctx["recent_wins"], 2)
+        self.assertAlmostEqual(ctx["recent_win_rate"], 2 / 3, places=2)
+        self.assertAlmostEqual(ctx["avg_win"], 9.0)          # (10+8)/2
+        self.assertAlmostEqual(ctx["avg_loss"], -5.0)
+        # expectancy = 2/3*9 + 1/3*(-5) = 6 - 1.67 = +4.33 (positive)
+        self.assertGreater(ctx["expectancy_per_trade"], 0)
+        self.assertEqual(ctx["biggest_recent_win"], 10)
         self.assertIn("scout_last_40", ctx)
         self.assertIn("current_mode", ctx)
 

@@ -1815,20 +1815,25 @@ AI_DECISION_SCHEMA = {
 }
 
 AI_SYSTEM = (
-    "You are the risk-mode controller for a multi-chain crypto memecoin scalping bot running in "
-    "paper-trading mode. You pick ONE risk profile for the next ~30 minutes based on market health "
-    "and recent performance.\n\n"
-    "Modes, least to most aggressive:\n"
-    "- safe:    tight targets (+15%), tight stop (-7%), needs $50k+ liquidity. Few trades, capital preservation.\n"
-    "- default: balanced (+28% / -12%), $30k+ liquidity.\n"
-    "- hype:    aggressive (+45%/+90% / -18%), $20k+ liquidity. More/newer launches.\n"
-    "- degen:   max aggression (+80%/+150% / -28%), $10k+ liquidity. Catches the wildest moonshots, more rugs.\n\n"
-    "Philosophy: be genuinely RISKY when the setup is smart and juicy — strong alt momentum, fresh launches "
-    "passing filters, recent wins — because per-trade size is already capped small (you cannot oversize). "
-    "Be CONSERVATIVE when the market is BTC-dominated/quiet, the recent win rate is poor, or the bot is "
-    "rejecting most candidates (thin/illiquid). The goal: ride safemoons, dodge rugpulls. "
-    "Position size is bounded elsewhere — you ONLY choose the risk profile. "
-    "Return strict JSON: recommended_mode, confidence (0-1), aggressive (bool), and a one-sentence reasoning."
+    "You are the risk-mode controller for a multi-chain crypto memecoin scalping bot (paper-trading). "
+    "You pick ONE risk profile for the next ~30 minutes.\n\n"
+    "Modes, least to most aggressive (TP = take-profit targets, SL = stop-loss):\n"
+    "- safe:    TP +15%, SL -7%, needs $50k+ liquidity. CAPS winners early.\n"
+    "- default: TP +28%, SL -12%, $30k+ liquidity.\n"
+    "- hype:    TP +45%/+90%, SL -18%, $20k+ liquidity. Lets winners run further.\n"
+    "- degen:   TP +80%/+150%, SL -28%, $10k+ liquidity. Lets the wildest moonshots run; more rugs.\n\n"
+    "CRITICAL — how this strategy makes money: it is ASYMMETRIC. Most trades lose a little, a FEW win big. "
+    "A 40-55% win rate is NORMAL and HEALTHY here — do NOT turn conservative just because win rate looks 'low'. "
+    "What matters is EXPECTANCY (per-trade expected value) and whether big winners are being captured. "
+    "If avg_win is much larger than avg_loss and expectancy is positive, the strategy is working — stay in "
+    "default/hype/degen to LET WINNERS RUN.\n\n"
+    "Beware: 'safe' mode's tight +15% take-profit CAPS the big winners that this strategy depends on, which "
+    "destroys the edge. Only choose 'safe' when expectancy is genuinely NEGATIVE or the drawdown brake is active. "
+    "Otherwise prefer default (balanced) or hype/degen (when momentum is strong and fresh launches are passing). "
+    "Lean MORE aggressive when expectancy is positive and alt momentum is strong; pull back toward 'default' "
+    "(not 'safe') when the market is BTC-dominated or candidates are thin. Per-trade size is capped elsewhere — "
+    "you ONLY choose the risk profile; you cannot oversize.\n\n"
+    "Return strict JSON: recommended_mode, confidence (0-1), aggressive (bool), one-sentence reasoning."
 )
 
 
@@ -1841,20 +1846,28 @@ def _scout_reason_summary(n: int = 40) -> Dict[str, int]:
 
 
 def _ai_market_context() -> Dict[str, Any]:
-    hist = STATE.get("pnl_hist", [])[-30:]
-    wins = sum(1 for x in hist if x > 0)
+    hist     = STATE.get("pnl_hist", [])[-30:]
+    wins_l   = [x for x in hist if x > 0]
+    losses_l = [x for x in hist if x <= 0]
+    wr       = (len(wins_l) / len(hist)) if hist else 0.0
+    avg_win  = (sum(wins_l) / len(wins_l)) if wins_l else 0.0
+    avg_loss = (sum(losses_l) / len(losses_l)) if losses_l else 0.0
+    expectancy = wr * avg_win + (1 - wr) * avg_loss   # expected $ per trade
     return {
-        "current_mode":   CONFIG["mode"],
-        "btc_dominance":  STATE["signals"].get("btc_d"),
-        "market_heat":    STATE["signals"].get("heat"),
-        "vault_usd":      round(STATE.get("vault_usd", 0), 2),
-        "open_positions": sum(1 for p in STATE.get("positions", {}).values() if p.get("units", 0) > 0),
-        "recent_trades":  len(hist),
-        "recent_wins":    wins,
-        "recent_win_rate": round(wins / len(hist), 2) if hist else None,
-        "recent_pnl":     round(sum(hist), 2),
-        "scout_last_40":  _scout_reason_summary(40),
-        "drawdown_brake": drawdown_brake_active(),
+        "current_mode":     CONFIG["mode"],
+        "btc_dominance":    STATE["signals"].get("btc_d"),
+        "market_heat":      STATE["signals"].get("heat"),
+        "vault_usd":        round(STATE.get("vault_usd", 0), 2),
+        "open_positions":   sum(1 for p in STATE.get("positions", {}).values() if p.get("units", 0) > 0),
+        "recent_trades":    len(hist),
+        "recent_win_rate":  round(wr, 2),
+        "avg_win":          round(avg_win, 2),
+        "avg_loss":         round(avg_loss, 2),
+        "expectancy_per_trade": round(expectancy, 2),   # positive = profitable even at low win rate
+        "biggest_recent_win":   round(max(hist), 2) if hist else 0,
+        "recent_pnl":       round(sum(hist), 2),
+        "scout_last_40":    _scout_reason_summary(40),
+        "drawdown_brake":   drawdown_brake_active(),
     }
 
 
