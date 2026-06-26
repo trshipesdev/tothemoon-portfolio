@@ -299,7 +299,8 @@ STATE: Dict[str, Any] = {
 }
 
 _state_path_env = os.getenv("STATE_PATH", "")
-SAVEFILE = _state_path_env if _state_path_env else f"state_{CONFIG['tenant']['name']}.json"
+SAVEFILE        = _state_path_env if _state_path_env else f"state_{CONFIG['tenant']['name']}.json"
+TRADELOG_FILE   = os.path.join(os.path.dirname(SAVEFILE) or ".", "trades.jsonl")
 
 
 def now_utc() -> datetime:
@@ -388,6 +389,35 @@ def _exit_plain(reason: str) -> str:
     return reason
 
 
+def _append_trade(entry: Dict) -> None:
+    """Append one trade to the append-only JSONL file — survives restarts and state resets."""
+    try:
+        with open(TRADELOG_FILE, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as e:
+        log(f"WARN _append_trade failed: {e}")
+
+
+def _load_tradelog_file() -> List[Dict]:
+    """Read trades.jsonl and return all records, skipping corrupt lines."""
+    records: List[Dict] = []
+    try:
+        with open(TRADELOG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"WARN _load_tradelog_file failed: {e}")
+    return records
+
+
 def save_state():
     try:
         with open(SAVEFILE, "w") as f:
@@ -429,6 +459,26 @@ def load_state():
         pass
     except Exception as e:
         log(f"WARN load_state failed: {e}")
+
+    # Merge append-only trades.jsonl into in-memory trade_log.
+    # This recovers history that was wiped from state.json by a restart or deploy.
+    # Dedup by (ts, symbol, side) so a normal restart (where state.json already has
+    # the trades) doesn't produce duplicates.
+    file_trades = _load_tradelog_file()
+    if file_trades:
+        existing_keys = {
+            (t.get("ts"), t.get("symbol"), t.get("side"))
+            for t in STATE.get("trade_log", [])
+        }
+        merged = list(STATE.get("trade_log", []))
+        for t in file_trades:
+            k = (t.get("ts"), t.get("symbol"), t.get("side"))
+            if k not in existing_keys:
+                merged.append(t)
+                existing_keys.add(k)
+        merged.sort(key=lambda t: t.get("ts", ""))
+        STATE["trade_log"] = merged
+        log(f"load_state: merged trades.jsonl — {len(merged)} total trades ({len(file_trades)} on disk)")
 
 # ---------------------------------------------------------------------------
 # Data feeds
@@ -1067,12 +1117,14 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
     STATE["peak_open_count"]   = max(STATE.get("peak_open_count", 0), len(live))
     if "first_bet_usd" not in STATE:
         STATE["first_bet_usd"] = usd   # the "starting roller" — size of the very first bet
-    STATE.setdefault("trade_log", []).append({
+    _trade_entry = {
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
         "side": "buy", "usd": usd, "price": filled_price, "units": units, "gas": gas,
         "address": pos.get("address", ""), "pnl": None,
         "mode": pos.get("entry_mode", CONFIG.get("mode")),
-    })
+    }
+    STATE.setdefault("trade_log", []).append(_trade_entry)
+    _append_trade(_trade_entry)
     return {"price": filled_price, "units": units}
 
 
@@ -1156,12 +1208,14 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
     STATE["vault_usd"] += proceeds
     _wallet_goal_check()
     STATE["pnl_hist"].append(pnl)
-    STATE.setdefault("trade_log", []).append({
+    _trade_entry = {
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "?"),
         "side": "sell", "usd": proceeds, "price": price, "units": units, "gas": gas,
         "address": pos.get("address", ""), "pnl": pnl,
         "mode": pos.get("entry_mode", CONFIG.get("mode")),
-    })
+    }
+    STATE.setdefault("trade_log", []).append(_trade_entry)
+    _append_trade(_trade_entry)
     # Purge a fully-closed position so its empty shell doesn't linger in the
     # positions dict and count against the max-open-positions cap (which had jammed
     # the bot at 12 phantom "positions", blocking every new entry).

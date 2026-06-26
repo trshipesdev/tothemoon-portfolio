@@ -15,3 +15,4 @@ HANDOFF-SETUP.md
 
 # Live runtime state (per-deploy, never versioned)
 data/state.json
+data/trades.jsonl
