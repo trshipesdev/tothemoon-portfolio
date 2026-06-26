@@ -1005,6 +1005,14 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
         pos["fees_usd"] = 0.0
         pos["deployed_usd"] = 0.0
     pos["realized"]    += pnl
+    # Per-mode performance — attribute realized P&L to the mode the position was
+    # ENTERED under, so you can see which mode actually makes money.
+    mp  = STATE.setdefault("mode_perf", {})
+    rec = mp.setdefault(pos.get("entry_mode", "?"), {"pnl": 0.0, "sells": 0, "wins": 0})
+    rec["pnl"]  += pnl
+    rec["sells"] += 1
+    if pnl > 0:
+        rec["wins"] += 1
     STATE["gas_paid_usd"] = STATE.get("gas_paid_usd", 0.0) + gas
     # Return the freed capital to today's deploy budget so the daily cap tracks NET
     # new exposure, not gross turnover — lets the bot cycle into the next moonshot

@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-instance mode comparison — run every risk mode SIDE BY SIDE on the same
+# live market, each with its own paper wallet, so you can see which one actually
+# makes money. All four share the same code image and the same market data; they
+# differ ONLY in BOT_MODE. Each gets its own state file and its own dashboard port.
+#
+# Telegram is disabled here (empty token) so these don't fight the main production
+# bot for the @ToTheMoonCatcherBot token (two pollers on one token = Conflict).
+# The AI auto-pilot is OFF so each instance stays locked in its mode — otherwise
+# the AI would converge them and the comparison would be meaningless.
+#
+# Usage (best run LOCALLY on your Mac, or on a box with ≥4GB RAM — the 1GB Oracle
+# free tier can't hold four at once):
+#
+#   docker compose -f docker-compose.multi.yml up -d --build
+#
+# Then open the four dashboards:
+#   safe    → http://localhost:8801/app
+#   default → http://localhost:8802/app
+#   hype    → http://localhost:8803/app
+#   degen   → http://localhost:8804/app
+#
+# Compare their "total balance" after a day. Stop with:
+#   docker compose -f docker-compose.multi.yml down
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: tothemoon:latest          # built once, reused by all four services
+  restart: unless-stopped
+  env_file: .env                   # API keys etc; the per-service block below overrides the rest
+  volumes:
+    - ./data:/app/data
+  environment: &common-env
+    SHADOW_MODE: "true"            # paper only — never put wallet keys in this file
+    MOONSHOT_MODE: "enter"         # auto paper-trade
+    DASHBOARD_HOST: "0.0.0.0"
+    DASHBOARD_PORT: "8787"
+    TELEGRAM_TOKEN: ""             # no Telegram for the ensemble (avoid token Conflict)
+    AI_ENABLED: "false"            # lock the mode so the comparison is clean
+    AI_AUTO_APPLY: "false"
+
+services:
+  bot-safe:
+    <<: *common
+    environment:
+      <<: *common-env
+      BOT_MODE: "safe"
+      STATE_PATH: "/app/data/state_safe.json"
+    ports: [ "127.0.0.1:8801:8787" ]
+
+  bot-default:
+    <<: *common
+    environment:
+      <<: *common-env
+      BOT_MODE: "default"
+      STATE_PATH: "/app/data/state_default.json"
+    ports: [ "127.0.0.1:8802:8787" ]
+
+  bot-hype:
+    <<: *common
+    environment:
+      <<: *common-env
+      BOT_MODE: "hype"
+      STATE_PATH: "/app/data/state_hype.json"
+    ports: [ "127.0.0.1:8803:8787" ]
+
+  bot-degen:
+    <<: *common
+    environment:
+      <<: *common-env
+      BOT_MODE: "degen"
+      STATE_PATH: "/app/data/state_degen.json"
+    ports: [ "127.0.0.1:8804:8787" ]

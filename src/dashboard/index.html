@@ -457,6 +457,22 @@
           <div class="text-gray-600 text-xs mt-1" x-text="'+ open positions: ' + (total_pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(total_pnl)) + ' unrealized'"></div>
         </div>
       </div>
+      <!-- Per-mode performance — which mode actually makes money -->
+      <div class="mb-4 bg-gray-900 rounded-xl p-4" x-show="Object.keys(state.mode_perf || {}).length">
+        <div class="text-gray-400 text-xs uppercase tracking-wider mb-2">⚖️ Realized P&amp;L by mode</div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <template x-for="[m, r] in Object.entries(state.mode_perf || {})" :key="m">
+            <div class="bg-gray-800 rounded-lg p-3">
+              <div class="text-xs text-gray-400 uppercase" x-text="m"></div>
+              <div :class="r.pnl >= 0 ? 'text-green-400' : 'text-red-400'" class="text-lg font-bold"
+                   x-text="(r.pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(r.pnl))"></div>
+              <div class="text-gray-600 text-xs"
+                   x-text="r.sells + ' sells · ' + (r.sells ? Math.round(r.wins/r.sells*100) : 0) + '% green'"></div>
+            </div>
+          </template>
+        </div>
+      </div>
+
       <div class="mb-4 bg-gray-900 rounded-xl p-4">
         <div class="flex items-center justify-between mb-2">
           <span class="text-gray-500 text-xs">Cumulative PnL — scroll/drag to zoom, drag to pan</span>

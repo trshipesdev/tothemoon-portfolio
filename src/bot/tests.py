@@ -2633,6 +2633,17 @@ class TestMoonBagLadder(unittest.TestCase):
         bot.CONFIG["mode"] = "safe"
         self.assertEqual(bot.STATE["positions"]["PUMP"]["entry_mode"], "degen")
 
+    def test_mode_perf_attributed_to_entry_mode(self):
+        bot.CONFIG["gas_sim"] = False
+        bot.CONFIG["mode"] = "degen"
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        bot.shadow_sell("PUMP", p["usd"], 1.30, 1_000_000.0)   # close in profit
+        perf = bot.STATE["mode_perf"]["degen"]
+        self.assertEqual(perf["sells"], 1)
+        self.assertEqual(perf["wins"], 1)
+        self.assertGreater(perf["pnl"], 0)
+
     def test_exit_impact_crashes_thin_pool(self):
         bot.CONFIG["gas_sim"] = False
         bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)   # deep entry (no impact)
