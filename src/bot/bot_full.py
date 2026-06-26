@@ -443,11 +443,14 @@ def load_state():
         STATE.setdefault("recently_exited", {})
         STATE.setdefault("reject_cache",    {})
         # Set vault_start once from the loaded vault if it was never recorded
-        STATE.setdefault("vault_start", STATE.get("vault_usd", 1000.0))
-        STATE.setdefault("wallet_goal", {})
+        # Use explicit None check — setdefault won't override a saved null
+        if STATE.get("vault_start") is None:
+            STATE["vault_start"] = STATE.get("vault_usd", 1000.0)
+        if not isinstance(STATE.get("wallet_goal"), dict):
+            STATE["wallet_goal"] = {}
         wg = STATE["wallet_goal"]
-        wg.setdefault("goal_usd",       1000.0)
-        wg.setdefault("phase",          1)
+        if wg.get("goal_usd") is None:   wg["goal_usd"]   = 1000.0
+        if wg.get("phase")    is None:   wg["phase"]      = 1
         wg.setdefault("phase2_basis",   None)
         wg.setdefault("total_paid_out", 0.0)
         wg.setdefault("skim_threshold", 100.0)
