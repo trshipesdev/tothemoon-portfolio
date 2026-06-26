@@ -97,9 +97,14 @@ CONFIG: Dict[str, Any] = {
     # protects the downside. Tunable — re-evaluate each analysis.
     "base_size_usd":        30.0,   # was 50 — smaller bets spread across more tokens
     "reserve_pct":          0.25,   # keep 25% of vault untouched
-    "per_token_cap_pct":    0.12,   # max 12% of deployable per token
-    "per_chain_cap_pct":    {"sol": 0.40, "eth": 0.35, "base": 0.25, "bsc": 0.30, "poly": 0.25},
-    "daily_deploy_cap_pct": 0.40,   # was 0.20 — more daily budget to act on the opportunity flow
+    "per_token_cap_pct":    0.12,   # max 12% of deployable per token  ← real risk cap
+    "per_chain_cap_pct":    {"sol": 0.40, "eth": 0.35, "base": 0.25, "bsc": 0.30, "poly": 0.25},  # ← real risk cap
+    # Raised 0.40→1.0 after live evidence: 5/5 tokens the bot flagged as "suggested"
+    # (couldn't afford) mooned +123% to +570%. The daily cap throttles TURNOVER, not
+    # point-in-time RISK (which the reserve + per-chain + per-token caps + drawdown
+    # brake already bound), so it was costing huge gains. 1.0 = can cycle the full
+    # deployable balance once per day.
+    "daily_deploy_cap_pct": 1.0,
     "drawdown_brake":       {"lookback": 30, "dd": 0.25, "size_mult": 0.60},
 
     "vaults": {"hot_native_pct": 0.75, "hot_usdc_pct": 0.25},
