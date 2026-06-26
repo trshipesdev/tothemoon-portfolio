@@ -2305,10 +2305,60 @@ class TestSafetyGate(unittest.TestCase):
             {"result": {"value": [{"uiAmount": 60}, {"uiAmount": 30}, {"uiAmount": 10}]}},
             {"result": {"value": {"uiAmount": 100}}},
         ]
-        with patch.object(bot, "_sol_rpc", return_value="http://rpc"):
-            with patch("requests.post", return_value=rpc_resp):
-                oc = bot.fetch_onchain_safety("mint", "sol")
+        # rugcheck unavailable (score None) → falls back to the RPC holder heuristic
+        with patch.object(bot, "fetch_rugcheck", return_value={"flagged": False, "reason": "", "score": None}):
+            with patch.object(bot, "_sol_rpc", return_value="http://rpc"):
+                with patch("requests.post", return_value=rpc_resp):
+                    oc = bot.fetch_onchain_safety("mint", "sol")
         self.assertTrue(oc["flagged"])
+
+    def _rugcheck_resp(self, score, risks):
+        r = MagicMock(); r.status_code = 200
+        r.json.return_value = {"score_normalised": score, "risks": risks}
+        return r
+
+    def test_rugcheck_flags_danger_risk(self):
+        with patch("requests.get", return_value=self._rugcheck_resp(
+                30, [{"name": "Mint authority enabled", "level": "danger"}])):
+            rc = bot.fetch_rugcheck("mint")
+        self.assertTrue(rc["flagged"])
+        self.assertIn("Mint authority", rc["reason"])
+
+    def test_rugcheck_flags_high_score(self):
+        bot.CONFIG["safety"]["rugcheck_score_max"] = 70
+        with patch("requests.get", return_value=self._rugcheck_resp(85, [])):
+            rc = bot.fetch_rugcheck("mint")
+        self.assertTrue(rc["flagged"])
+        self.assertIn("85", rc["reason"])
+
+    def test_rugcheck_clears_safe_token(self):
+        with patch("requests.get", return_value=self._rugcheck_resp(
+                7, [{"name": "Mutable metadata", "level": "warn"}])):
+            rc = bot.fetch_rugcheck("mint")
+        self.assertFalse(rc["flagged"])
+        self.assertEqual(rc["score"], 7)
+
+    def test_rugcheck_http_error_no_flag(self):
+        r = MagicMock(); r.status_code = 503
+        with patch("requests.get", return_value=r):
+            rc = bot.fetch_rugcheck("mint")
+        self.assertFalse(rc["flagged"])
+        self.assertIsNone(rc["score"])
+
+    def test_onchain_sol_uses_rugcheck_first(self):
+        with patch.object(bot, "fetch_rugcheck",
+                          return_value={"flagged": True, "reason": "rugcheck flags X", "score": 90}):
+            oc = bot.fetch_onchain_safety("mint", "sol")
+        self.assertTrue(oc["flagged"])
+        self.assertIn("rugcheck", oc["reason"])
+
+    def test_onchain_sol_rugcheck_clears_skips_rpc(self):
+        # rugcheck ran and cleared (score present, not flagged) → trust it, no RPC fallback
+        with patch.object(bot, "fetch_rugcheck", return_value={"flagged": False, "reason": "", "score": 10}):
+            with patch("requests.post") as p:
+                oc = bot.fetch_onchain_safety("mint", "sol")
+        self.assertFalse(oc["flagged"])
+        p.assert_not_called()
 
     def test_onchain_evm_honeypot_flagged(self):
         with patch.object(bot, "_get", return_value={"honeypotResult": {"isHoneypot": True}}):

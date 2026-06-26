@@ -202,6 +202,7 @@ CONFIG: Dict[str, Any] = {
         "scam_chatter_max":   2,       # reject if total scam-warning mentions >= this
         "sol_holder_max_pct": 0.25,    # reject if a non-LP wallet holds > this share of supply
         "evm_sell_tax_max":   20.0,    # reject if honeypot.is reports sell tax above this %
+        "rugcheck_score_max": 70,      # reject if rugcheck.xyz normalized risk score >= this (Solana)
     },
 
     # AI auto-pilot — Haiku reads market health + recent performance and recommends
@@ -1692,12 +1693,42 @@ def fetch_x_buzz(symbol: str) -> Dict[str, Any]:
     return out
 
 
+def fetch_rugcheck(address: str) -> Dict[str, Any]:
+    """rugcheck.xyz Solana rug/scam report. Flags danger-level risks or a high risk score."""
+    out: Dict[str, Any] = {"flagged": False, "reason": "", "score": None}
+    try:
+        r = requests.get(
+            f"https://api.rugcheck.xyz/v1/tokens/{address}/report/summary",
+            headers={"User-Agent": "Mozilla/5.0 (tothemoon-bot)"}, timeout=8)
+        if r.status_code != 200:
+            return out
+        data = r.json() or {}
+        out["score"] = data.get("score_normalised")
+        dangers = [x.get("name") for x in (data.get("risks") or []) if x.get("level") == "danger"]
+        if dangers:
+            out["flagged"] = True
+            out["reason"]  = "rugcheck flags " + ", ".join(d for d in dangers[:2] if d)
+        elif out["score"] is not None and out["score"] >= CONFIG["safety"]["rugcheck_score_max"]:
+            out["flagged"] = True
+            out["reason"]  = f"rugcheck risk score {out['score']}/100 (high)"
+    except Exception:
+        pass
+    return out
+
+
 def fetch_onchain_safety(address: str, chain: str) -> Dict[str, Any]:
-    """On-chain rug checks: Solana holder concentration, EVM honeypot/sell-tax. Best-effort."""
+    """On-chain rug checks: Solana rugcheck.xyz + holder concentration, EVM honeypot/sell-tax."""
     out: Dict[str, Any] = {"flagged": False, "reason": ""}
     if not address:
         return out
     if chain == "sol":
+        # rugcheck.xyz is the primary Solana scam/rug signal (LP lock, mint authority,
+        # holder distribution, known scams). Fall back to raw holder concentration if it's down.
+        rc = fetch_rugcheck(address)
+        if rc["flagged"]:
+            return {"flagged": True, "reason": rc["reason"]}
+        if rc["score"] is not None:
+            return out   # rugcheck ran and cleared it — trust it over the rough RPC heuristic
         try:
             rpc = _sol_rpc()
             la = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1,
@@ -2304,7 +2335,7 @@ def api_config():
         for k in ("reddit_enabled", "x_enabled", "onchain_enabled"):
             if k in data["safety"]:
                 CONFIG["safety"][k] = bool(data["safety"][k])
-        for k in ("scam_chatter_max", "sol_holder_max_pct", "evm_sell_tax_max"):
+        for k in ("scam_chatter_max", "sol_holder_max_pct", "evm_sell_tax_max", "rugcheck_score_max"):
             if k in data["safety"]:
                 CONFIG["safety"][k] = float(data["safety"][k])
     return jsonify({"ok": True})
