@@ -862,20 +862,37 @@
                 </div>
               </div>
 
-              <!-- What the fixes saved -->
-              <div class="grid grid-cols-3 gap-3 mb-4 text-center text-xs">
-                <div class="bg-gray-800 rounded-lg p-3">
-                  <div class="text-gray-500 mb-1">Bad re-entries blocked</div>
-                  <div class="font-bold text-amber-300" x-text="bt.n_blocked + ' trades'"></div>
+              <!-- Fix breakdown -->
+              <div class="grid grid-cols-2 gap-3 mb-3 text-center text-xs">
+                <div class="bg-gray-900 rounded-xl p-3">
+                  <div class="text-gray-400 font-bold mb-2">30-min cooldown after losses</div>
+                  <div class="flex justify-around">
+                    <div>
+                      <div class="text-gray-500 mb-1">losses dodged</div>
+                      <div class="text-emerald-400 font-bold" x-text="'+$'+fmt(bt.losses_dodged_usd??0)"></div>
+                    </div>
+                    <div>
+                      <div class="text-gray-500 mb-1">wins missed</div>
+                      <div class="text-red-400 font-bold" x-text="'−$'+fmt(bt.wins_missed_usd??0)"></div>
+                    </div>
+                  </div>
+                  <div class="text-gray-600 mt-2" x-text="bt.n_blocked + ' re-entries blocked'"></div>
                 </div>
-                <div class="bg-gray-800 rounded-lg p-3">
-                  <div class="text-gray-500 mb-1">Losses capped by $12 stop</div>
-                  <div class="font-bold text-amber-300" x-text="bt.n_capped + ' trades'"></div>
+                <div class="bg-gray-900 rounded-xl p-3">
+                  <div class="text-gray-400 font-bold mb-2">Dollar stop ($12 / 10%)</div>
+                  <div class="text-center">
+                    <div class="text-gray-500 mb-1">losses capped</div>
+                    <div :class="(bt.saved_by_cap_usd??0)>=0?'text-emerald-400':'text-red-400'"
+                         class="font-bold"
+                         x-text="((bt.saved_by_cap_usd??0)>=0?'+$':'−$')+fmt(Math.abs(bt.saved_by_cap_usd??0))"></div>
+                  </div>
+                  <div class="text-gray-600 mt-2" x-text="bt.n_capped + ' trades capped'"></div>
                 </div>
-                <div class="bg-gray-800 rounded-lg p-3">
-                  <div class="text-gray-500 mb-1">Total damage avoided</div>
-                  <div class="font-bold text-emerald-400" x-text="'+$' + fmt(bt.saved_usd??0)"></div>
-                </div>
+              </div>
+              <div class="bg-gray-800 rounded-lg p-2 text-xs text-gray-500 mb-4">
+                💡 When blocked tokens recover and run, the cooldown costs wins. When they keep dumping, it saves losses. Today's split:
+                <span class="text-emerald-400" x-text="'+$'+fmt(bt.losses_dodged_usd??0)+' saved'"></span> vs
+                <span class="text-red-400" x-text="'−$'+fmt(bt.wins_missed_usd??0)+' missed'"></span>
               </div>
 
               <!-- Avg win/loss comparison -->

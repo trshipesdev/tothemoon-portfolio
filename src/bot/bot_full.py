@@ -2623,9 +2623,16 @@ def api_backtest():
     sim_losses = [r for r in sim_sells if r["sim_pnl"] <= 0]
     n_blocked  = sum(1 for r in revised if r.get("sim_status") == "blocked" and r.get("side") == "buy")
     n_capped   = sum(1 for r in revised if r.get("sim_status") == "capped")
-    saved      = sum(r["pnl"] - r["sim_pnl"]
-                     for r in revised
-                     if r.get("sim_status") == "capped" and r.get("pnl") is not None)
+    # Capped: how much the dollar stop saved (positive = saved money)
+    saved_by_cap = sum(r["sim_pnl"] - r["pnl"]
+                       for r in revised
+                       if r.get("sim_status") == "capped" and r.get("pnl") is not None)
+    # Cooldown: losses dodged (blocked sells with negative real pnl) vs wins missed (positive real pnl)
+    blocked_sells     = [r for r in revised if r.get("sim_status") == "blocked" and r.get("side") == "sell"
+                         and r.get("pnl") is not None]
+    losses_dodged_usd = sum(-r["pnl"] for r in blocked_sells if r["pnl"] < 0)   # positive = saved
+    wins_missed_usd   = sum(r["pnl"]  for r in blocked_sells if r["pnl"] > 0)   # positive = cost
+    saved             = round(losses_dodged_usd - wins_missed_usd + saved_by_cap, 2)
 
     real_total = sum(t["pnl"] for t in trades if t.get("side") == "sell" and t.get("pnl") is not None)
 
@@ -2639,9 +2646,12 @@ def api_backtest():
         "avg_loss":      sum(r["sim_pnl"] for r in sim_losses) / max(1, len(sim_losses)),
         "real_win_rate": len([t for t in trades if t.get("side")=="sell" and t.get("pnl",0)>0])
                          / max(1, len([t for t in trades if t.get("side")=="sell" and t.get("pnl") is not None])),
-        "n_blocked":     n_blocked,
-        "n_capped":      n_capped,
-        "saved_usd":     round(saved, 2),
+        "n_blocked":          n_blocked,
+        "n_capped":           n_capped,
+        "losses_dodged_usd":  round(losses_dodged_usd, 2),
+        "wins_missed_usd":    round(wins_missed_usd, 2),
+        "saved_by_cap_usd":   round(saved_by_cap, 2),
+        "saved_usd":          round(saved, 2),
     })
 
 
