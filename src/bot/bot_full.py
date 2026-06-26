@@ -3504,8 +3504,12 @@ def manage_positions():
         _cur_val     = p.get("units", 0) * price
         _cost        = p.get("deployed_usd", p.get("usd", 0)) or p.get("usd", 0)
         _unrealized  = _cur_val - _cost
-        if _dollar_stop > 0 and _unrealized < -_dollar_stop:
-            exit_reason = f"DOLLAR STOP -${abs(_unrealized):.2f} (limit ${_dollar_stop:.0f})"
+        # Scale the stop with position size: $12 floor, 10% ceiling.
+        # A $40 entry stops at $12 (30%); a $400 scaled position stops at $40 (10%).
+        # Flat $12 on large positions would fire on a 2-3% sneeze and kill runners.
+        _effective_stop = max(_dollar_stop, _cost * 0.10)
+        if _dollar_stop > 0 and _unrealized < -_effective_stop:
+            exit_reason = f"DOLLAR STOP -${abs(_unrealized):.2f} (limit ${_effective_stop:.0f})"
 
         # 1. Instant rug guard — liq craters in one tick
         prev_liq = STATE["liq_prev"].get(s, liq)
