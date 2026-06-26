@@ -1587,8 +1587,35 @@ SCAM_WORDS = (
     "ponzi", "avoid", "do not buy", "don't buy", "dont buy", "scammer",
     "phishing", "stay away", "exit scam", "stolen", "fake team",
 )
+REDDIT_ID_ENV     = "REDDIT_CLIENT_ID"
+REDDIT_SECRET_ENV = "REDDIT_CLIENT_SECRET"
 _reddit_cache: Dict[str, Any] = {}
 _x_cache:      Dict[str, Any] = {}
+_reddit_token: Dict[str, Any] = {"token": None, "exp": 0.0}
+
+
+def _reddit_oauth_token() -> Optional[str]:
+    """Userless Reddit OAuth token (free app credentials). Cached until expiry.
+    Reddit blocks the public .json API from datacenter IPs, so OAuth is required on a server."""
+    cid = os.getenv(REDDIT_ID_ENV, "")
+    sec = os.getenv(REDDIT_SECRET_ENV, "")
+    if not cid:
+        return None
+    if _reddit_token["token"] and time.time() < _reddit_token["exp"]:
+        return _reddit_token["token"]
+    try:
+        r = requests.post("https://www.reddit.com/api/v1/access_token",
+                          auth=(cid, sec),
+                          data={"grant_type": "client_credentials"},
+                          headers={"User-Agent": "tothemoon-bot/1.0"}, timeout=8)
+        if r.status_code == 200:
+            j = r.json()
+            _reddit_token["token"] = j.get("access_token")
+            _reddit_token["exp"]   = time.time() + float(j.get("expires_in", 3600)) - 60
+            return _reddit_token["token"]
+    except Exception:
+        pass
+    return None
 
 
 def _count_scam(texts: List[str]) -> int:
@@ -1607,10 +1634,16 @@ def fetch_reddit_sentiment(symbol: str) -> Dict[str, int]:
     if c and time.time() - c["ts"] < 600:
         return c["data"]
     out = {"mentions": 0, "scam_hits": 0}
+    tok = _reddit_oauth_token()
     try:
-        url = (f"https://www.reddit.com/search.json?q={requests.utils.quote(symbol)}"
-               f"&sort=new&limit=25&t=week")
-        r = requests.get(url, headers={"User-Agent": "tothemoon-bot/1.0"}, timeout=8)
+        ua = {"User-Agent": "tothemoon-bot/1.0"}
+        q  = requests.utils.quote(symbol)
+        if tok:   # OAuth path — works from datacenter IPs
+            url = f"https://oauth.reddit.com/search?q={q}&sort=new&limit=25&t=week"
+            r = requests.get(url, headers={**ua, "Authorization": f"bearer {tok}"}, timeout=8)
+        else:     # public path — works locally, 403s from cloud servers (returns 0 gracefully)
+            url = f"https://www.reddit.com/search.json?q={q}&sort=new&limit=25&t=week"
+            r = requests.get(url, headers=ua, timeout=8)
         if r.status_code == 200:
             posts = r.json().get("data", {}).get("children", [])
             out["mentions"] = len(posts)
@@ -1926,8 +1959,9 @@ def api_state():
             "ai":     CONFIG["ai"],
             "safety": CONFIG["safety"],
         },
-        "ai_key_set":  bool(os.getenv(ANTHROPIC_KEY_ENV)),
-        "x_key_set":   bool(os.getenv(X_BEARER_ENV)),
+        "ai_key_set":      bool(os.getenv(ANTHROPIC_KEY_ENV)),
+        "x_key_set":       bool(os.getenv(X_BEARER_ENV)),
+        "reddit_key_set":  bool(os.getenv(REDDIT_ID_ENV)),
     })
 
 
