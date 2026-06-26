@@ -261,6 +261,7 @@ random.seed(CONFIG["tenant"]["jitter_seed"])
 STATE: Dict[str, Any] = {
     "ts":               None,
     "vault_usd":        1000.0,
+    "vault_start":      1000.0,
     "deployable_usd":   750.0,
     "income_usd":       0.0,
     "positions":        {},
@@ -395,6 +396,8 @@ def load_state():
         STATE.setdefault("gas_paid_usd",  0.0)
         STATE.setdefault("scout_log",     [])
         STATE.setdefault("entries_today", {})
+        # Set vault_start once from the loaded vault if it was never recorded
+        STATE.setdefault("vault_start", STATE.get("vault_usd", 1000.0))
         # Drop any fully-closed position shells (units<=0) left from before the purge
         # fix — otherwise they keep counting against the max-open-positions cap.
         STATE["positions"] = {s: p for s, p in STATE.get("positions", {}).items()
@@ -2242,6 +2245,7 @@ def api_state():
             "base_size_usd": CONFIG.get("base_size_usd", 30.0),
             "blacklist":   CONFIG.get("blacklist", []),
         },
+        "vault_start":     STATE.get("vault_start", 1000.0),
         "ai_key_set":      bool(os.getenv(ANTHROPIC_KEY_ENV)),
         "x_key_set":       bool(os.getenv(X_BEARER_ENV)),
         "reddit_key_set":  bool(os.getenv(REDDIT_ID_ENV)),
