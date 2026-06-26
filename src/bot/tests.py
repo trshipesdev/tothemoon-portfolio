@@ -2532,5 +2532,66 @@ class TestEntryChurnCap(unittest.TestCase):
         self.assertNotIn("PUMP", bot.STATE["positions"])
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 43. TP ladder + moon bag (catch the +500% runners)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMoonBagLadder(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.CONFIG["mode"] = "degen"
+        bot.STATE["liq_prev"] = {}
+
+    def _tick(self, price, liq=100000.0):
+        # change_m5 positive so the velocity exit doesn't fire — isolate ladder/trailing
+        with patch.object(bot, "fetch_positions_prices",
+                          return_value={"PUMP": bot._px_dict(price, liq, 5000.0, 1.0)}):
+            with patch.object(bot, "save_state"):
+                bot.manage_positions()
+
+    def test_deployed_usd_tracked(self):
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
+        self.assertAlmostEqual(bot.STATE["positions"]["PUMP"]["deployed_usd"], 100.0, places=2)
+
+    def test_ladder_scalps_and_keeps_moonbag(self):
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        avg, dep = p["avg"], p["deployed_usd"]
+        self._tick(avg * 1.31)   # +31% → rung 1
+        self.assertEqual(p["tp_index"], 1)
+        self._tick(avg * 1.81)   # +81% → rung 2
+        self.assertEqual(p["tp_index"], 2)
+        self._tick(avg * 2.51)   # +151% → rung 3
+        self.assertEqual(p["tp_index"], 3)
+        # ~30% moon bag remains
+        self.assertGreater(p["units"], 0)
+        self.assertLess(p["usd"], 0.40 * dep)
+        self.assertGreater(p["usd"], 0.20 * dep)
+
+    def test_moonbag_rides_wide_trailing(self):
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        avg = p["avg"]
+        for mult in (1.31, 1.81, 2.51):
+            self._tick(avg * mult)
+        self.assertEqual(p["tp_index"], 3)         # ladder done → moon-bag mode
+        self._tick(avg * 4.0)                       # new peak +300%
+        peak = p["peak_price"]
+        self._tick(peak * 0.80)                     # -20% from peak: normal 15% would exit
+        self.assertGreater(p["units"], 0, "wide moon-bag leash should hold through a -20% dip")
+        self._tick(peak * 0.50)                     # -50% from peak: beyond the 45% leash → exit
+        self.assertEqual(p["units"], 0)
+
+    def test_non_degen_mode_keeps_simple_tp(self):
+        # default mode has no tp_ladder → falls back to 50%-per-rung, no moon bag
+        bot.CONFIG["mode"] = "default"
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        self._tick(p["avg"] * 1.30)   # default tp is +28% → fires, sells ~half
+        self.assertEqual(p["tp_index"], 1)
+        self.assertGreater(p["units"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

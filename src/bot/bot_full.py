@@ -85,7 +85,12 @@ CONFIG: Dict[str, Any] = {
         "default": {"tp": [0.28],      "sl": 0.12, "slip_bps": 100, "liq_min": 30000, "age_min": 10, "size_mult": 1.0},
         "hype":    {"tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000, "age_min": 5,  "size_mult": 1.3},
         "degen":   {"tp": [0.80, 1.5], "sl": 0.28, "slip_bps": 220, "liq_min": 10000, "age_min": 0,  "size_mult": 1.6,
-                    "no_pump": {"hurdle": 0.03, "min_sec": 240, "max_sec": 900}},
+                    "no_pump": {"hurdle": 0.03, "min_sec": 240, "max_sec": 900},
+                    # Scalp-ladder + moon-bag: sell [fraction] of the original position at each
+                    # [gain]. Fractions sum to 0.70 → the remaining 0.30 is the MOON BAG, which
+                    # has no TP cap and rides a wide trailing stop to catch the rare +500% runners.
+                    "tp_ladder": [[0.30, 0.20], [0.80, 0.25], [1.50, 0.25]],
+                    "moonbag_trail_pct": 0.45},   # wide leash on the moon bag (vs 0.15 normal)
     },
     "mode": "default",
 
@@ -855,7 +860,7 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         "avg": 0.0, "realized": 0.0, "time": now_utc().isoformat(),
         "address": address, "add_count": 0, "last_add_ts": 0.0,
         "peak_price": filled_price, "entry_vol_h1": 0.0,
-        "entry_liq": liq_usd, "liq_ticks": [], "fees_usd": 0.0,
+        "entry_liq": liq_usd, "liq_ticks": [], "fees_usd": 0.0, "deployed_usd": 0.0,
     })
     if address and not pos.get("address"):
         pos["address"] = address
@@ -869,6 +874,7 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
     pos["usd"]      += usd
     pos["units"]     = new_total_units
     pos["fees_usd"]  = pos.get("fees_usd", 0.0) + gas
+    pos["deployed_usd"] = pos.get("deployed_usd", 0.0) + usd   # total ever put in (for TP-ladder fractions)
     STATE["vault_usd"]      -= (usd + gas)
     STATE["open_today_usd"] += usd
     STATE["gas_paid_usd"]    = STATE.get("gas_paid_usd", 0.0) + gas
@@ -898,6 +904,7 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
         pos["avg"]      = 0.0
         pos["tp_index"] = 0   # reset for potential re-entry into same symbol
         pos["fees_usd"] = 0.0
+        pos["deployed_usd"] = 0.0
     pos["realized"]    += pnl
     STATE["gas_paid_usd"] = STATE.get("gas_paid_usd", 0.0) + gas
     # Return the freed capital to today's deploy budget so the daily cap tracks NET
@@ -3043,6 +3050,19 @@ def manage_positions():
         if vol_h1 > 0 and not p.get("entry_vol_h1"):
             p["entry_vol_h1"] = vol_h1
 
+        # Build the take-profit ladder for the active mode. A per-position override (list of
+        # thresholds) keeps the old 50%-per-rung behavior; a mode tp_ladder ([gain, fraction])
+        # adds a moon bag = the unsold remainder, which rides a wide trailing stop.
+        mode_cfg = CONFIG["modes"][CONFIG["mode"]]
+        if p.get("tp_override"):
+            ladder = [[t, 0.5] for t in p["tp_override"]]
+        else:
+            ladder = mode_cfg.get("tp_ladder") or [[t, 0.5] for t in mode_cfg.get("tp", MS["tp"])]
+        moonbag_frac = max(0.0, 1.0 - sum(f for _, f in ladder))
+        in_moonbag   = p.get("tp_index", 0) >= len(ladder) and moonbag_frac > 0
+        trail_pct    = (mode_cfg.get("moonbag_trail_pct", MS["trailing_stop_pct"])
+                        if in_moonbag else MS["trailing_stop_pct"])
+
         # ── EXIT PRIORITY ORDER ────────────────────────────────────────────
         exit_reason: Optional[str] = None
 
@@ -3056,10 +3076,12 @@ def manage_positions():
         if exit_reason is None and change_m5 < -(MS["velocity_exit_pct"] * 100):
             exit_reason = f"VELOCITY {change_m5:.1f}% in 5m"
 
-        # 3. Trailing stop — drop from peak (locks in gains, cuts reversals)
-        if exit_reason is None and price <= peak * (1 - MS["trailing_stop_pct"]):
+        # 3. Trailing stop — drop from peak (locks in gains, cuts reversals). Once the
+        #    ladder is done, the moon bag rides a WIDE trailing stop to catch +500% runners.
+        if exit_reason is None and price <= peak * (1 - trail_pct):
             pct = ((price / peak) - 1) * 100
-            exit_reason = f"TRAIL STOP {pct:.1f}% from peak {peak:.6f}"
+            tag = "MOONBAG TRAIL" if in_moonbag else "TRAIL STOP"
+            exit_reason = f"{tag} {pct:.1f}% from peak {peak:.6f}"
 
         # 4. Slow liq drain — consecutive ticks all declining
         if (exit_reason is None
@@ -3087,24 +3109,30 @@ def manage_positions():
                 f"⚠️ {s} is going quiet — trading volume dropped to ${vol_h1:,.0f} (was ${entry_vol:,.0f} "
                 f"when you bought in). Interest is fading; the bot is watching but not selling yet.")
 
-        # 6. TP levels — partial sells on the way up (each level fires only once)
-        tp_hit    = False
-        tp_levels = p.get("tp_override") or MS["tp"]
-        tp_index  = p.get("tp_index", 0)   # next TP level index to execute
-        sl_level  = p.get("sl_override") or CONFIG["modes"][CONFIG["mode"]]["sl"]
-        for i, tp in enumerate(tp_levels):
+        # 6. TP ladder — scalp a chunk at each rung, but never sell into the moon bag
+        tp_hit        = False
+        tp_index      = p.get("tp_index", 0)
+        sl_level      = p.get("sl_override") or mode_cfg["sl"]
+        deployed      = p.get("deployed_usd", p["usd"]) or p["usd"]
+        moonbag_floor = moonbag_frac * deployed
+        for i, (gain, frac) in enumerate(ladder):
             if i < tp_index:
-                continue  # already executed this TP level
-            if price >= p["avg"] * (1 + tp):
-                sell_usd = 0.5 * p["usd"]
-                res      = exec_sell(s, sell_usd, price, liq)
-                pnl      = res.get("pnl", 0.0)
+                continue  # already executed this rung
+            if price >= p["avg"] * (1 + gain):
+                sellable = max(0.0, p["usd"] - moonbag_floor)   # keep the moon bag intact
+                sell_usd = min(frac * deployed, sellable)
                 p["tp_index"] = i + 1
-                log(f"TP {s} level {i+1}/{len(tp_levels)} +{tp*100:.0f}%: sold ${sell_usd:.2f} pnl ${pnl:.2f}")
-                send_alert(
-                    f"✅ TOOK PROFIT on {s} (+{tp*100:.0f}%) — it climbed, so the bot sold half the "
-                    f"position for ${pnl:+.2f} and is letting the rest ride higher. (Target #{i+1}.)")
-                tp_hit = True
+                if sell_usd > 0.01:
+                    res = exec_sell(s, sell_usd, price, liq)
+                    pnl = res.get("pnl", 0.0)
+                    log(f"TP {s} rung {i+1}/{len(ladder)} +{gain*100:.0f}%: sold ${sell_usd:.2f} pnl ${pnl:.2f}")
+                    last = (i + 1 >= len(ladder)) and moonbag_frac > 0
+                    tail = (f" Keeping a {moonbag_frac*100:.0f}% moon bag riding for a bigger run."
+                            if last else " Letting the rest ride higher.")
+                    send_alert(
+                        f"✅ TOOK PROFIT on {s} (+{gain*100:.0f}%) — banked ${pnl:+.2f} on {frac*100:.0f}% "
+                        f"of the position.{tail} (Rung #{i+1}.)")
+                    tp_hit = True
                 save_state()
                 break
 
