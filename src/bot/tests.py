@@ -2721,5 +2721,51 @@ class TestMoonBagLadder(unittest.TestCase):
         self.assertGreater(p["units"], 0)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 44. Backtester — replay through the real strategy (synthetic ticks, no network)
+# ═══════════════════════════════════════════════════════════════════════════════
+import backtest as bt   # noqa: E402
+
+
+class TestBacktest(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+
+    @staticmethod
+    def _ticks(prices, liq=100000.0, step_sec=300):
+        return [{"ts": 1_700_000_000.0 + i * step_sec, "price": p,
+                 "liq": liq, "vol_h1": 50000.0} for i, p in enumerate(prices)]
+
+    def test_replay_winner_is_profitable(self):
+        # steady climb to +300% then flat → should bank a gain and leave globals intact
+        ticks = self._ticks([1.0] + [1.0 + 0.2 * i for i in range(1, 20)])
+        r = bt.replay_episode("PUMP", "sol", "0xpump", ticks, "degen")
+        self.assertIsNotNone(r)
+        self.assertGreater(r["pnl"], 0)
+        self.assertTrue(r["win"])
+        # globals must be restored after the run
+        self.assertEqual(bot.CONFIG["mode"], "default")
+
+    def test_replay_rug_is_a_loss(self):
+        # pumps then liquidity craters → rug/trailing exit → a loss, position closed
+        ticks = self._ticks([1.0, 1.2, 1.3], liq=100000.0)
+        ticks += [{"ts": ticks[-1]["ts"] + 300, "price": 0.2, "liq": 1000.0, "vol_h1": 100.0}]
+        r = bt.replay_episode("PUMP", "sol", "0xpump", ticks, "degen")
+        self.assertIsNotNone(r)
+        self.assertLess(r["pnl"], 0)
+
+    def test_replay_skips_too_thin_for_mode(self):
+        # $20k pool is below safe mode's $50k floor → no entry under safe
+        ticks = self._ticks([1.0, 1.1, 1.2], liq=20000.0)
+        self.assertIsNone(bt.replay_episode("PUMP", "sol", "0xpump", ticks, "safe"))
+
+    def test_replay_restores_state_object(self):
+        before = bot.STATE
+        ticks = self._ticks([1.0, 1.5, 2.0])
+        bt.replay_episode("PUMP", "sol", "0xpump", ticks, "hype")
+        self.assertIs(bot.STATE, before, "replay must not leak its isolated STATE")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
