@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy source
 COPY src/bot/bot_full.py .
+COPY src/bot/backtest.py .
 COPY src/dashboard/ ./dashboard/
 
 # State directory — mount ./data:/app/data in docker-compose to persist
