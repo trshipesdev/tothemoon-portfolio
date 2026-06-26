@@ -1746,6 +1746,30 @@ class TestEngineOnceSmoke(unittest.TestCase):
         except Exception as e:
             self.fail(f"engine_once raised with position: {e}")
 
+    @patch.object(bot, "fetch_positions_prices",
+                  return_value={"TST": bot._px_dict(2.0, 100000.0, 5000.0, 3.0)})
+    @patch.object(bot, "save_state")
+    def test_manage_positions_standalone(self, *_):
+        # Fast loop must run on its own (no candidate scan) and act on a position
+        _reset(1000.0)
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        try:
+            bot.manage_positions()
+        except Exception as e:
+            self.fail(f"manage_positions raised: {e}")
+
+    @patch.object(bot, "fetch_btc_dominance", return_value=45.0)
+    @patch.object(bot, "fetch_new_candidates", return_value=[])
+    @patch.object(bot, "check_reentry_watch")
+    @patch.object(bot, "manage_trusted_coins")
+    @patch.object(bot, "save_state")
+    def test_scan_candidates_standalone(self, *_):
+        _reset(1000.0)
+        try:
+            bot.scan_candidates()
+        except Exception as e:
+            self.fail(f"scan_candidates raised: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 33. Gas / fee simulation in paper trades

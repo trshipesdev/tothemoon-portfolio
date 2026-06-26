@@ -65,7 +65,8 @@ CONFIG: Dict[str, Any] = {
     "scan": {
         "new_max_age_min":      120,  # pairs ≤ this age treated as NEW
         "hype_window_min":      240,
-        "dexscreener_poll_sec":  20,
+        "dexscreener_poll_sec":  20,  # how often to scan for NEW candidates
+        "position_poll_sec":      3,  # how often to check OPEN positions (fast — catch quick pumps/dips)
     },
     "presale_min_score": 10,  # min presale_score to enter/suggest a new token (0=disabled, 10=social buzz only)
 
@@ -2855,7 +2856,8 @@ async def cmd_sell(update, context):
 ENGINE_STOP = False
 
 
-def engine_once():
+def scan_candidates():
+    """Slow loop: find new tokens, apply filters/safety, enter. Plus re-entry watch + trusted coins."""
     # Daily reset at the top of the first tick after midnight
     today = now_utc().date().isoformat()
     if STATE.get("last_daily_reset") != today:
@@ -2995,6 +2997,15 @@ def engine_once():
             send_alert(
                 f"⚡ PUMP: {sym} (your watchlist) — a sudden volume spike. Alerting you, not buying.\n{_dex_link('sol', addr)}")
 
+    # Re-entry watch + trusted-coin management run on the slow cadence (not time-critical)
+    check_reentry_watch()
+    manage_trusted_coins()
+
+
+def manage_positions():
+    """Fast loop: live prices, rug guard, velocity/trailing exits, TP/SL, autoscale.
+    Run every few seconds so the bot can actually SEE and react to quick pumps/dips
+    instead of being blind between candidate scans."""
     # Position management — live prices, rug guard, TP/SL, no-pump, autoscale
     brake_now = drawdown_brake_active()
     if brake_now and not STATE.get("brake_alerted"):
@@ -3118,8 +3129,11 @@ def engine_once():
         if p.get("units", 0) > 0 and time.time() - entry_ts >= CONFIG["autoscale"]["grace_sec"]:
             autoscale_maybe(s, p["chain"], price, liq, velocity_ok=(price > p["avg"]))
 
-    check_reentry_watch()
-    manage_trusted_coins()
+
+def engine_once():
+    """One full cycle: scan for new tokens, then manage open positions. Used by tests."""
+    scan_candidates()
+    manage_positions()
 
 
 def engine_loop():
@@ -3129,19 +3143,27 @@ def engine_loop():
     last_ai_run       = 0.0
     digest_date       = None
     digest_hour       = int(CONFIG["telegram"]["daily_digest_utc"].split(":")[0])
+    last_scan         = 0.0
     _crash_count  = 0
     _last_crash_alert = 0.0
     while not ENGINE_STOP:
+        # FAST: manage open positions every cycle so we catch quick pumps/dips
         try:
-            engine_once()
+            manage_positions()
             _crash_count = 0
         except Exception:
             traceback.print_exc()
             _crash_count += 1
-            # Alert on first crash and every 10th after, but throttle to once per 5 min
             if _crash_count == 1 or (_crash_count % 10 == 0 and time.time() - _last_crash_alert > 300):
-                send_alert(f"⚠️ engine_once crashed (×{_crash_count}) — check logs", critical=True)
+                send_alert(f"⚠️ manage_positions crashed (×{_crash_count}) — check logs", critical=True)
                 _last_crash_alert = time.time()
+        # SLOWER: scan for new candidates on its own cadence
+        if time.time() - last_scan >= CONFIG["scan"]["dexscreener_poll_sec"]:
+            try:
+                scan_candidates()
+            except Exception:
+                traceback.print_exc()
+            last_scan = time.time()
         now = now_utc()
         if now.hour == digest_hour and now.date() != digest_date:
             send_digest()
@@ -3171,7 +3193,7 @@ def engine_loop():
             except Exception:
                 pass
             last_ai_run = time.time()
-        time.sleep(CONFIG["scan"]["dexscreener_poll_sec"])
+        time.sleep(CONFIG["scan"].get("position_poll_sec", 3))
 
 # ---------------------------------------------------------------------------
 # Startup
@@ -3248,10 +3270,14 @@ def main():
         CONFIG["ai"]["enabled"] = True
     if os.getenv("AI_AUTO_APPLY", "").strip().lower() in ("1", "true", "on", "yes"):
         CONFIG["ai"]["auto_apply"] = True
-    # Scan cadence override (seconds between scans) — lower = faster entries AND exits.
+    # Scan cadence override (seconds between NEW-candidate scans).
     sps = os.getenv("SCAN_POLL_SEC", "").strip()
     if sps.isdigit() and int(sps) >= 3:
         CONFIG["scan"]["dexscreener_poll_sec"] = int(sps)
+    # Position-monitoring cadence override (seconds) — lower = faster exit reaction.
+    pps = os.getenv("POSITION_POLL_SEC", "").strip()
+    if pps.isdigit() and int(pps) >= 1:
+        CONFIG["scan"]["position_poll_sec"] = int(pps)
 
     # Validate CONFIG mode is defined
     if CONFIG["mode"] not in CONFIG["modes"]:
