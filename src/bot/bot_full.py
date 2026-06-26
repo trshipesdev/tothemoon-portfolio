@@ -140,6 +140,7 @@ CONFIG: Dict[str, Any] = {
         "liq_min":          15000,
         "liq_max":          250000,
         "hype_min":         80,         # 0–100
+        "buy_ratio_min":    0.45,       # reject if <45% of recent (h1) trades are buys (being dumped)
         "price_impact_max": 0.02,
         "min_ticket_usd":   15.0,
         "adaptive_timer":   {"low_liq_sec": 300, "high_liq_sec": 1200},
@@ -541,13 +542,24 @@ def _pair_to_candidate(pair: Dict[str, Any], our_chain: str) -> Optional[Dict[st
         age_min    = ((time.time() * 1000 - created_at) / 60000) if created_at else 9999
         price_usd  = float(pair.get("priceUsd") or 0)
         liq        = float((pair.get("liquidity") or {}).get("usd") or 0)
-        vol_h24    = float((pair.get("volume")    or {}).get("h24") or 0)
+        vol        = pair.get("volume") or {}
+        vol_h24    = float(vol.get("h24") or 0)
+        vol_h1     = float(vol.get("h1") or 0)
         if price_usd <= 0 or liq <= 0:
             return None
-        hype      = min(100, int(vol_h24 / max(liq, 1) * 20) + _degen_hype_bonus(symbol))
-        price_chg = float((pair.get("priceChange") or {}).get("h24") or 0)
+        # Hype from RECENT momentum (h1 volume velocity) rather than a 24h average —
+        # a token exploding right now should outscore one with steady all-day volume.
+        vol_signal = vol_h1 if vol_h1 > 0 else (vol_h24 / 24.0)
+        hype       = min(100, int(vol_signal / max(liq, 1) * 40) + _degen_hype_bonus(symbol))
+        # Buyer/seller pressure (h1) — a token that's mostly sells is being dumped.
+        tx_h1      = (pair.get("txns") or {}).get("h1") or {}
+        buys       = float(tx_h1.get("buys") or 0)
+        sells      = float(tx_h1.get("sells") or 0)
+        buy_ratio  = (buys / (buys + sells)) if (buys + sells) > 0 else None
+        price_chg  = float((pair.get("priceChange") or {}).get("h24") or 0)
         return {"symbol": symbol, "chain": our_chain, "price": price_usd,
                 "liq": liq, "age_min": age_min, "hype": hype, "positive": price_chg > 0,
+                "vol_h1": vol_h1, "buy_ratio": buy_ratio,
                 "address": (pair.get("baseToken") or {}).get("address", "")}
     except Exception:
         return None
@@ -646,11 +658,13 @@ def fetch_positions_prices() -> Dict[str, Dict]:
 # Scoring
 # ---------------------------------------------------------------------------
 class Score:
-    def __init__(self, hype: int, liq: float, age_min: float, positive: bool):
-        self.hype     = hype
-        self.liq      = liq
-        self.age_min  = age_min
-        self.positive = positive
+    def __init__(self, hype: int, liq: float, age_min: float, positive: bool,
+                 buy_ratio: Optional[float] = None):
+        self.hype      = hype
+        self.liq       = liq
+        self.age_min   = age_min
+        self.positive  = positive
+        self.buy_ratio = buy_ratio   # h1 buys/(buys+sells); None if unknown
 
 
 def moonshot_reject_reason(sc: Score) -> Optional[str]:
@@ -674,6 +688,10 @@ def moonshot_reject_reason(sc: Score) -> Optional[str]:
         return "price trend is negative (24h)"
     if sc.hype < hype_min:
         return f"hype {sc.hype} below min {hype_min}"
+    # Buyer/seller pressure — skip tokens being actively dumped (more sells than buys).
+    br_min = ms.get("buy_ratio_min", 0.45)
+    if sc.buy_ratio is not None and sc.buy_ratio < br_min:
+        return f"selling pressure — only {sc.buy_ratio*100:.0f}% of trades are buys"
     return None
 
 
@@ -867,6 +885,9 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         "address": address, "add_count": 0, "last_add_ts": 0.0,
         "peak_price": filled_price, "entry_vol_h1": 0.0,
         "entry_liq": liq_usd, "liq_ticks": [], "fees_usd": 0.0, "deployed_usd": 0.0,
+        # Lock the risk profile to the mode at ENTRY. Otherwise an AI mode-switch
+        # mid-trade would retroactively change this position's stop-loss/TP.
+        "entry_mode": CONFIG["mode"],
     })
     if address and not pos.get("address"):
         pos["address"] = address
@@ -900,7 +921,13 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
     units    = pos["units"] * portion
     gas      = _gas_usd(pos.get("chain", "sol"))           # exit network fee
     fee_share = pos.get("fees_usd", 0.0) * portion          # proportional entry gas
-    proceeds = units * price * (1 - 0.002) - gas            # exit fee out of proceeds
+    # Exit price impact — SELLING crashes the fill in thin pools. Uncapped at the 5%
+    # entry ceiling because dumping a big bag into a shallow pool craters far more
+    # than a sizing nudge (a sell worth the whole pool ≈ −25%). This is what kept the
+    # moon-bag math honest: you can't dump a +500% bag at the top in a $15k pool.
+    order_val   = units * price
+    exit_impact = min(0.30, order_val / max(liq_usd, 1.0) / 4.0)
+    proceeds = units * price * (1 - 0.002) * (1 - exit_impact) - gas   # fee + impact out of proceeds
     cost     = units * pos["avg"]
     pnl      = proceeds - cost - fee_share                  # entry gas folded into PnL
     pos["units"]       -= units
@@ -2893,7 +2920,8 @@ def scan_candidates():
         chain  = c["chain"]
         price  = c["price"]
         liq    = c["liq"]
-        sc     = Score(c.get("hype", 0), liq, c["age_min"], c.get("positive", True))
+        sc     = Score(c.get("hype", 0), liq, c["age_min"], c.get("positive", True),
+                       buy_ratio=c.get("buy_ratio"))
         is_new = c["age_min"] <= CONFIG["scan"]["new_max_age_min"]
 
         addr = c.get("address", "")
@@ -3059,7 +3087,10 @@ def manage_positions():
         # Build the take-profit ladder for the active mode. A per-position override (list of
         # thresholds) keeps the old 50%-per-rung behavior; a mode tp_ladder ([gain, fraction])
         # adds a moon bag = the unsold remainder, which rides a wide trailing stop.
-        mode_cfg = CONFIG["modes"][CONFIG["mode"]]
+        # Use the mode this position was ENTERED under (locked at buy), so an AI
+        # mode-switch mid-trade can't retroactively change its stop-loss/TP.
+        entry_mode = p.get("entry_mode", CONFIG["mode"])
+        mode_cfg = CONFIG["modes"].get(entry_mode, CONFIG["modes"][CONFIG["mode"]])
         if p.get("tp_override"):
             ladder = [[t, 0.5] for t in p["tp_override"]]
         else:
@@ -3068,6 +3099,13 @@ def manage_positions():
         in_moonbag   = p.get("tp_index", 0) >= len(ladder) and moonbag_frac > 0
         trail_pct    = (mode_cfg.get("moonbag_trail_pct", MS["trailing_stop_pct"])
                         if in_moonbag else MS["trailing_stop_pct"])
+        # Adaptive trailing stop: tighten as unrealized gain grows so we keep more of
+        # the big runners (a flat 45% trail gives back 45% of a +500% move).
+        gain_now = (price / max(p.get("avg", 0) or 1e-9, 1e-9)) - 1
+        if   gain_now >= 8.0:                    trail_pct = min(trail_pct, 0.22)
+        elif gain_now >= 3.0:                    trail_pct = min(trail_pct, 0.28)
+        elif gain_now >= 1.0 and not in_moonbag: trail_pct = min(trail_pct, 0.10)
+        elif gain_now >= 0.5 and not in_moonbag: trail_pct = min(trail_pct, 0.12)
 
         # ── EXIT PRIORITY ORDER ────────────────────────────────────────────
         exit_reason: Optional[str] = None

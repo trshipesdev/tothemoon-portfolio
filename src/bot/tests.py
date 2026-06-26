@@ -276,18 +276,29 @@ class TestPairToCandidate(unittest.TestCase):
         del p["pairCreatedAt"]
         self.assertEqual(bot._pair_to_candidate(p, "eth")["age_min"], 9999)
 
-    def test_hype_proportional_vol_liq(self):
+    def test_hype_from_h1_velocity(self):
+        # hype now uses RECENT (h1) volume velocity: vol_h1/liq*40
+        p = self._pair(**{"volume": {"h1": 100000, "h24": 999}, "liquidity": {"usd": 50000}})
+        # 100000/50000 = 2 → hype = min(100, int(2 * 40)) = 80
+        self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 80)
+
+    def test_hype_falls_back_to_h24(self):
+        # no h1 data → fall back to h24/24 as an hourly proxy
         p = self._pair(**{"volume": {"h24": 100000}, "liquidity": {"usd": 50000}})
-        # vol/liq = 2 → hype = min(100, int(2 * 20)) = 40
-        self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 40)
+        # (100000/24)/50000*40 = 3.33 → 3
+        self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 3)
 
     def test_hype_capped_at_100(self):
-        p = self._pair(**{"volume": {"h24": 10_000_000}, "liquidity": {"usd": 1000}})
+        p = self._pair(**{"volume": {"h1": 10_000_000}, "liquidity": {"usd": 1000}})
         self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 100)
 
     def test_zero_vol_hype_is_zero(self):
         p = self._pair(**{"volume": {"h24": 0}, "liquidity": {"usd": 50000}})
         self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 0)
+
+    def test_buy_ratio_computed(self):
+        p = self._pair(**{"txns": {"h1": {"buys": 70, "sells": 30}}})
+        self.assertAlmostEqual(bot._pair_to_candidate(p, "sol")["buy_ratio"], 0.70)
 
     def test_chain_passed_through(self):
         self.assertEqual(bot._pair_to_candidate(self._pair(), "base")["chain"], "base")
@@ -348,11 +359,22 @@ class TestMoonshotFilters(unittest.TestCase):
     def setUp(self):
         _reset()
 
-    def _sc(self, hype=90, liq=50000, age_min=15, positive=True):
-        return bot.Score(hype, liq, age_min, positive)
+    def _sc(self, hype=90, liq=50000, age_min=15, positive=True, buy_ratio=None):
+        return bot.Score(hype, liq, age_min, positive, buy_ratio=buy_ratio)
 
     def test_passes_valid_candidate(self):
         self.assertTrue(bot.passes_moonshot_filters(self._sc()))
+
+    def test_rejects_selling_pressure(self):
+        # 30% buys / 70% sells → being dumped → rejected
+        self.assertIsNotNone(bot.moonshot_reject_reason(self._sc(buy_ratio=0.30)))
+
+    def test_accepts_buying_pressure(self):
+        self.assertIsNone(bot.moonshot_reject_reason(self._sc(buy_ratio=0.70)))
+
+    def test_unknown_buy_ratio_does_not_block(self):
+        # None (no txn data) must not reject — degrade gracefully
+        self.assertIsNone(bot.moonshot_reject_reason(self._sc(buy_ratio=None)))
 
     def test_fails_liq_too_low(self):
         self.assertFalse(bot.passes_moonshot_filters(
@@ -2563,6 +2585,27 @@ class TestMoonBagLadder(unittest.TestCase):
     def test_deployed_usd_tracked(self):
         bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
         self.assertAlmostEqual(bot.STATE["positions"]["PUMP"]["deployed_usd"], 100.0, places=2)
+
+    def test_entry_mode_locked_on_position(self):
+        # A mid-trade mode switch must NOT change the position's locked risk profile
+        bot.CONFIG["mode"] = "degen"
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
+        bot.CONFIG["mode"] = "safe"
+        self.assertEqual(bot.STATE["positions"]["PUMP"]["entry_mode"], "degen")
+
+    def test_exit_impact_crashes_thin_pool(self):
+        bot.CONFIG["gas_sim"] = False
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)   # deep entry (no impact)
+        p = bot.STATE["positions"]["PUMP"]
+        res = bot.shadow_sell("PUMP", p["usd"], 1.0, 100.0)       # dump into a $100 pool
+        self.assertLess(res["sold"], 85.0, "dumping into a thin pool must crater the fill")
+
+    def test_exit_impact_negligible_in_deep_pool(self):
+        bot.CONFIG["gas_sim"] = False
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        res = bot.shadow_sell("PUMP", p["usd"], 1.0, 1_000_000.0)  # deep exit
+        self.assertGreater(res["sold"], 99.0, "deep pool → only the swap fee, no real impact")
 
     def test_ladder_scalps_and_keeps_moonbag(self):
         bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
