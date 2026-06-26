@@ -618,6 +618,44 @@
         </div>
       </div>
 
+      <!-- Scam / rug safety -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-rose-400 text-xs uppercase tracking-wider">🛡️ Scam / rug safety gate</h3>
+        <p class="text-gray-500 text-xs">Before buying, checks Reddit + X for "this is a scam" chatter and
+          checks the blockchain for rug traps (whale wallets, honeypots). Blocks the buy if it smells bad.</p>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Reddit scam-check</span>
+          <button @click="toggleSafety('reddit_enabled')"
+                  :class="state.config?.safety?.reddit_enabled ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.safety?.reddit_enabled ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">X / Twitter scam-check
+            <span class="text-gray-600 text-xs block" x-text="state.x_key_set ? 'API key set' : 'needs X_BEARER_TOKEN (paid)'"></span>
+          </span>
+          <button @click="toggleSafety('x_enabled')"
+                  :class="state.config?.safety?.x_enabled ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.safety?.x_enabled ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-sm">On-chain rug-check
+            <span class="text-gray-600 text-xs block">whale wallets (SOL) · honeypots (EVM)</span>
+          </span>
+          <button @click="toggleSafety('onchain_enabled')"
+                  :class="state.config?.safety?.onchain_enabled ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.safety?.onchain_enabled ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+      </div>
+
       <!-- Re-entry rules -->
       <div class="bg-gray-900 rounded-xl p-4 space-y-3">
         <h3 class="text-gray-500 text-xs uppercase tracking-wider">Re-entry rules</h3>
@@ -882,6 +920,11 @@ function app() {
     async toggleAI(field) {
       const cur = this.state.config?.ai?.[field];
       await this.post('/api/ai', { [field]: !cur });
+      await this.refresh();
+    },
+    async toggleSafety(field) {
+      const cur = this.state.config?.safety?.[field];
+      await this.post('/api/config', { safety: { [field]: !cur } });
       await this.refresh();
     },
     async runAI() {

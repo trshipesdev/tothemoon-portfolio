@@ -2226,5 +2226,109 @@ class TestExitPlain(unittest.TestCase):
         self.assertEqual(bot._exit_plain("something weird"), "something weird")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 40. Scam / rug safety gate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSafetyGate(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+        bot._reddit_cache.clear()
+        bot._x_cache.clear()
+        os.environ.pop("X_BEARER_TOKEN", None)
+        bot.CONFIG["safety"].update({
+            "reddit_enabled": True, "x_enabled": True, "onchain_enabled": True,
+            "scam_chatter_max": 2, "sol_holder_max_pct": 0.25, "evm_sell_tax_max": 20.0})
+
+    def _reddit_resp(self, titles):
+        r = MagicMock(); r.status_code = 200
+        r.json.return_value = {"data": {"children": [{"data": {"title": t, "selftext": ""}} for t in titles]}}
+        return r
+
+    def test_count_scam(self):
+        self.assertEqual(bot._count_scam(["this is a rug", "great coin", "total scam honeypot"]), 2)
+
+    def test_reddit_counts_scam_posts(self):
+        with patch("requests.get", return_value=self._reddit_resp(["X is a scam", "X mooning", "avoid X rug"])):
+            rd = bot.fetch_reddit_sentiment("X")
+        self.assertEqual(rd["mentions"], 3)
+        self.assertEqual(rd["scam_hits"], 2)
+
+    def test_reddit_cached(self):
+        with patch("requests.get", return_value=self._reddit_resp(["a"])) as g:
+            bot.fetch_reddit_sentiment("CACHED")
+            bot.fetch_reddit_sentiment("CACHED")
+            self.assertEqual(g.call_count, 1)
+
+    def test_x_disabled_without_token(self):
+        self.assertFalse(bot.fetch_x_buzz("X")["enabled"])
+
+    def test_x_with_token(self):
+        os.environ["X_BEARER_TOKEN"] = "fake"
+        r = MagicMock(); r.status_code = 200
+        r.json.return_value = {"data": [{"text": "X is a rugpull"}, {"text": "love X"}]}
+        with patch("requests.get", return_value=r):
+            xb = bot.fetch_x_buzz("X")
+        self.assertTrue(xb["enabled"])
+        self.assertEqual(xb["scam_hits"], 1)
+        del os.environ["X_BEARER_TOKEN"]
+
+    def test_gate_blocks_on_scam_chatter(self):
+        with patch.object(bot, "fetch_reddit_sentiment", return_value={"mentions": 5, "scam_hits": 3}):
+            with patch.object(bot, "fetch_onchain_safety", return_value={"flagged": False, "reason": ""}):
+                ok, why = bot.safety_gate("SCAMCOIN", "addr", "sol")
+        self.assertFalse(ok)
+        self.assertIn("scam", why.lower())
+
+    def test_gate_passes_clean_token(self):
+        with patch.object(bot, "fetch_reddit_sentiment", return_value={"mentions": 4, "scam_hits": 0}):
+            with patch.object(bot, "fetch_onchain_safety", return_value={"flagged": False, "reason": ""}):
+                ok, why = bot.safety_gate("CLEAN", "addr", "sol")
+        self.assertTrue(ok)
+
+    def test_gate_blocks_on_onchain_flag(self):
+        with patch.object(bot, "fetch_reddit_sentiment", return_value={"mentions": 1, "scam_hits": 0}):
+            with patch.object(bot, "fetch_onchain_safety",
+                              return_value={"flagged": True, "reason": "one wallet holds 60% of supply"}):
+                ok, why = bot.safety_gate("WHALE", "addr", "sol")
+        self.assertFalse(ok)
+        self.assertIn("on-chain", why.lower())
+
+    def test_onchain_sol_whale_flagged(self):
+        rpc_resp = MagicMock()
+        # largest = LP (60), next = whale (30), total supply 100 → whale 30% > 25%
+        rpc_resp.json.side_effect = [
+            {"result": {"value": [{"uiAmount": 60}, {"uiAmount": 30}, {"uiAmount": 10}]}},
+            {"result": {"value": {"uiAmount": 100}}},
+        ]
+        with patch.object(bot, "_sol_rpc", return_value="http://rpc"):
+            with patch("requests.post", return_value=rpc_resp):
+                oc = bot.fetch_onchain_safety("mint", "sol")
+        self.assertTrue(oc["flagged"])
+
+    def test_onchain_evm_honeypot_flagged(self):
+        with patch.object(bot, "_get", return_value={"honeypotResult": {"isHoneypot": True}}):
+            oc = bot.fetch_onchain_safety("0xabc", "eth")
+        self.assertTrue(oc["flagged"])
+        self.assertIn("honeypot", oc["reason"].lower())
+
+    def test_onchain_no_address(self):
+        self.assertFalse(bot.fetch_onchain_safety("", "sol")["flagged"])
+
+    def test_config_endpoint_sets_safety(self):
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        c = bot.app.test_client()
+        c.post("/api/config", json={"safety": {"reddit_enabled": False}})
+        self.assertFalse(bot.CONFIG["safety"]["reddit_enabled"])
+        bot.CONFIG["safety"]["reddit_enabled"] = True
+
+    def test_state_exposes_safety(self):
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        d = bot.app.test_client().get("/api/state").get_json()
+        self.assertIn("safety", d["config"])
+        self.assertIn("x_key_set", d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

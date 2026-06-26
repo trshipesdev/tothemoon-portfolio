@@ -179,6 +179,18 @@ CONFIG: Dict[str, Any] = {
     "gas_dynamic": True,   # fetch live ETH gas (eth_gasPrice × ETH price) every ~5 min
     "gas_usd":     {"sol": 0.001, "base": 0.02, "poly": 0.02, "bsc": 0.15, "eth": 6.0},
 
+    # Scam / rug safety gate — checked on tokens the bot is about to buy.
+    # Reddit (free) + X/Twitter (needs X_BEARER_TOKEN) scan for scam chatter;
+    # on-chain checks holder concentration (Solana) and honeypots (EVM).
+    "safety": {
+        "reddit_enabled":     True,
+        "x_enabled":          True,    # only active if X_BEARER_TOKEN is set
+        "onchain_enabled":    True,
+        "scam_chatter_max":   2,       # reject if total scam-warning mentions >= this
+        "sol_holder_max_pct": 0.25,    # reject if a non-LP wallet holds > this share of supply
+        "evm_sell_tax_max":   20.0,    # reject if honeypot.is reports sell tax above this %
+    },
+
     # AI auto-pilot — Haiku reads market health + recent performance and recommends
     # (or auto-applies) a risk mode. Needs ANTHROPIC_API_KEY. Capital caps still
     # bound absolute trade size, so the AI only steers the risk PROFILE, never sizing.
@@ -1565,6 +1577,142 @@ def check_reentry_watch():
 # ---------------------------------------------------------------------------
 # Presale assistant
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Scam / rug safety gate — Reddit + X chatter + on-chain checks
+# ---------------------------------------------------------------------------
+X_BEARER_ENV = "X_BEARER_TOKEN"
+HONEYPOT_CHAIN_ID = {"eth": 1, "base": 8453, "bsc": 56, "poly": 137}
+SCAM_WORDS = (
+    "scam", "rug", "rugged", "rugpull", "rug pull", "honeypot", "honey pot",
+    "ponzi", "avoid", "do not buy", "don't buy", "dont buy", "scammer",
+    "phishing", "stay away", "exit scam", "stolen", "fake team",
+)
+_reddit_cache: Dict[str, Any] = {}
+_x_cache:      Dict[str, Any] = {}
+
+
+def _count_scam(texts: List[str]) -> int:
+    n = 0
+    for t in texts:
+        low = (t or "").lower()
+        if any(w in low for w in SCAM_WORDS):
+            n += 1
+    return n
+
+
+def fetch_reddit_sentiment(symbol: str) -> Dict[str, int]:
+    """Recent Reddit posts mentioning the token + how many sound like scam warnings. Cached 10 min."""
+    key = symbol.upper()
+    c = _reddit_cache.get(key)
+    if c and time.time() - c["ts"] < 600:
+        return c["data"]
+    out = {"mentions": 0, "scam_hits": 0}
+    try:
+        url = (f"https://www.reddit.com/search.json?q={requests.utils.quote(symbol)}"
+               f"&sort=new&limit=25&t=week")
+        r = requests.get(url, headers={"User-Agent": "tothemoon-bot/1.0"}, timeout=8)
+        if r.status_code == 200:
+            posts = r.json().get("data", {}).get("children", [])
+            out["mentions"] = len(posts)
+            out["scam_hits"] = _count_scam(
+                [f"{p.get('data', {}).get('title', '')} {p.get('data', {}).get('selftext', '')}" for p in posts])
+    except Exception:
+        pass
+    _reddit_cache[key] = {"ts": time.time(), "data": out}
+    return out
+
+
+def fetch_x_buzz(symbol: str) -> Dict[str, Any]:
+    """Recent X/Twitter mentions + scam mentions. Needs X_BEARER_TOKEN (paid API); no-op otherwise."""
+    tok = os.getenv(X_BEARER_ENV, "")
+    if not tok:
+        return {"mentions": 0, "scam_hits": 0, "enabled": False}
+    key = symbol.upper()
+    c = _x_cache.get(key)
+    if c and time.time() - c["ts"] < 600:
+        return c["data"]
+    out = {"mentions": 0, "scam_hits": 0, "enabled": True}
+    try:
+        q = requests.utils.quote(f"{symbol} -is:retweet lang:en")
+        url = f"https://api.twitter.com/2/tweets/search/recent?query={q}&max_results=50&tweet.fields=text"
+        r = requests.get(url, headers={"Authorization": f"Bearer {tok}"}, timeout=8)
+        if r.status_code == 200:
+            tweets = r.json().get("data", [])
+            out["mentions"]  = len(tweets)
+            out["scam_hits"] = _count_scam([t.get("text", "") for t in tweets])
+    except Exception:
+        pass
+    _x_cache[key] = {"ts": time.time(), "data": out}
+    return out
+
+
+def fetch_onchain_safety(address: str, chain: str) -> Dict[str, Any]:
+    """On-chain rug checks: Solana holder concentration, EVM honeypot/sell-tax. Best-effort."""
+    out: Dict[str, Any] = {"flagged": False, "reason": ""}
+    if not address:
+        return out
+    if chain == "sol":
+        try:
+            rpc = _sol_rpc()
+            la = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1,
+                "method": "getTokenLargestAccounts", "params": [address]}, timeout=8).json()
+            sup = requests.post(rpc, json={"jsonrpc": "2.0", "id": 1,
+                "method": "getTokenSupply", "params": [address]}, timeout=8).json()
+            total = float(sup["result"]["value"]["uiAmount"] or 0)
+            vals  = sorted((float(a.get("uiAmount") or 0) for a in la["result"]["value"]), reverse=True)
+            # Assume the single largest holder is the liquidity pool; flag the next-largest
+            # real wallet if it controls a dangerous share of supply.
+            non_lp = vals[1:]
+            if total > 0 and non_lp:
+                share = non_lp[0] / total
+                if share > CONFIG["safety"]["sol_holder_max_pct"]:
+                    out["flagged"] = True
+                    out["reason"]  = f"one wallet holds {share*100:.0f}% of supply (whale can dump on you)"
+        except Exception:
+            pass
+    elif chain in HONEYPOT_CHAIN_ID:
+        try:
+            cid = HONEYPOT_CHAIN_ID[chain]
+            r = _get(f"https://api.honeypot.is/v2/IsHoneypot?address={address}&chainID={cid}")
+            if r:
+                if r.get("honeypotResult", {}).get("isHoneypot"):
+                    out["flagged"] = True
+                    out["reason"]  = "flagged as a honeypot — you could buy but not sell"
+                else:
+                    tax = float((r.get("simulationResult", {}) or {}).get("sellTax", 0) or 0)
+                    if tax > CONFIG["safety"]["evm_sell_tax_max"]:
+                        out["flagged"] = True
+                        out["reason"]  = f"sell tax {tax:.0f}% — scammy tokenomics"
+        except Exception:
+            pass
+    return out
+
+
+def safety_gate(symbol: str, address: str, chain: str) -> "tuple[bool, str]":
+    """Combined scam/rug check for a token the bot is about to buy. Returns (ok, reason_if_blocked)."""
+    S = CONFIG["safety"]
+    scam_hits = 0
+    parts: List[str] = []
+    if S.get("reddit_enabled"):
+        rd = fetch_reddit_sentiment(symbol)
+        scam_hits += rd["scam_hits"]
+        if rd["scam_hits"]:
+            parts.append(f"Reddit: {rd['scam_hits']} scam-warning post(s)")
+    if S.get("x_enabled"):
+        xb = fetch_x_buzz(symbol)
+        if xb.get("enabled"):
+            scam_hits += xb["scam_hits"]
+            if xb["scam_hits"]:
+                parts.append(f"X: {xb['scam_hits']} scam mention(s)")
+    if scam_hits >= S.get("scam_chatter_max", 2):
+        return False, "scam chatter online — " + "; ".join(parts)
+    if S.get("onchain_enabled"):
+        oc = fetch_onchain_safety(address, chain)
+        if oc["flagged"]:
+            return False, "on-chain risk — " + oc["reason"]
+    return True, ""
+
+
 def presale_score(meta: Dict[str, Any]) -> int:
     score  = 20 if meta.get("audit") else 0
     score += 20 if meta.get("kyc")   else 0
@@ -1774,10 +1922,12 @@ def api_state():
                 "volume_x":   CONFIG["oldcoin"]["volume_x"],
                 "mentions_x": CONFIG["oldcoin"]["mentions_x"],
             },
-            "doge": TRUSTED.get("DOGE", {}),
-            "ai":   CONFIG["ai"],
+            "doge":   TRUSTED.get("DOGE", {}),
+            "ai":     CONFIG["ai"],
+            "safety": CONFIG["safety"],
         },
-        "ai_key_set": bool(os.getenv(ANTHROPIC_KEY_ENV)),
+        "ai_key_set":  bool(os.getenv(ANTHROPIC_KEY_ENV)),
+        "x_key_set":   bool(os.getenv(X_BEARER_ENV)),
     })
 
 
@@ -2103,6 +2253,13 @@ def api_config():
                   "liq_floor_pct", "vol_min_h1", "skip_hard_exits", "max_per_day"):
             if k in data["reentry"]:
                 CONFIG["moonshot"]["reentry"][k] = data["reentry"][k]
+    if isinstance(data.get("safety"), dict):
+        for k in ("reddit_enabled", "x_enabled", "onchain_enabled"):
+            if k in data["safety"]:
+                CONFIG["safety"][k] = bool(data["safety"][k])
+        for k in ("scam_chatter_max", "sol_holder_max_pct", "evm_sell_tax_max"):
+            if k in data["safety"]:
+                CONFIG["safety"][k] = float(data["safety"][k])
     return jsonify({"ok": True})
 
 
@@ -2620,6 +2777,15 @@ def engine_once():
                     f"⚠️ SKIPPED {symbol} ({chain}) — a brand-new token with no social buzz or "
                     f"audit yet (safety score {ps}/100). Too unproven to buy; just watching.\n{link}")
                 _scout(symbol, chain, "rejected", f"presale score {ps} < {ps_threshold} (no social/audit signal)", sc, addr)
+                continue
+            # Scam / rug safety gate — Reddit + X chatter + on-chain rug checks
+            safe, why = safety_gate(symbol, addr, chain)
+            if not safe:
+                log(f"SAFETY GATE {symbol}: {why}")
+                send_alert(
+                    f"🛡️ SKIPPED {symbol} ({chain}) — {why}. The bot steered clear to protect you "
+                    f"from a likely scam/rug.\n{link}")
+                _scout(symbol, chain, "rejected", f"safety: {why}", sc, addr)
                 continue
             if CONFIG["moonshot"]["mode"] == "enter":
                 usd = size_ticket_usd(chain)
