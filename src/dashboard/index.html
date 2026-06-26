@@ -714,6 +714,18 @@
           <span x-text="'gas paid so far (paper): $' + fmt(state.gas_paid_usd ?? 0)"></span>
           <span x-show="state.gas_live?.eth" x-text="' · live ETH: $' + fmt(state.gas_live?.eth) + '/swap'"></span>
         </div>
+
+        <div class="flex items-center justify-between pt-2 border-t border-gray-800">
+          <span class="text-sm">Degen-name hype boost
+            <span class="text-gray-600 text-xs block">tiny hype nudge for provocative names (they pull degen volume)</span>
+          </span>
+          <button @click="post('/api/config', {degen_terms: {enabled: !state.config?.degen_terms?.enabled}}).then(refresh)"
+                  :class="state.config?.degen_terms?.enabled ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.degen_terms?.enabled ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
       </div>
 
       <!-- Scam / rug safety -->

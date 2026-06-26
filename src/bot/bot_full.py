@@ -69,6 +69,16 @@ CONFIG: Dict[str, Any] = {
     },
     "presale_min_score": 10,  # min presale_score to enter/suggest a new token (0=disabled, 10=social buzz only)
 
+    # Degen-name hype nudge — provocative/vulgar token names reliably pull extra degen
+    # volume in memecoin culture (e.g. PENISPUMP +534%). Small, tunable hype boost; the
+    # safety gate (rugcheck) + momentum exits still apply since these are very volatile.
+    "degen_terms": {
+        "enabled": True,
+        "bonus":   12,   # hype points added (pre-100 cap) when a name matches
+        "terms":   ["cum", "sex", "penis", "dick", "cock", "tit", "boob", "milf",
+                    "daddy", "thicc", "coom", "goon", "bussy", "rizz", "69", "420"],
+    },
+
     "modes": {
         "safe":    {"tp": [0.15],      "sl": 0.07, "slip_bps": 60,  "liq_min": 50000, "age_min": 30, "size_mult": 0.7},
         "default": {"tp": [0.28],      "sl": 0.12, "slip_bps": 100, "liq_min": 30000, "age_min": 10, "size_mult": 1.0},
@@ -435,7 +445,7 @@ def fetch_birdeye_sol_candidates() -> List[Dict[str, Any]]:
             age   = float(t.get("lastTradeUnixTime") or 0)
             age_min = (time.time() - age) / 60 if age else 9999
             if sym and price > 0 and liq > 0:
-                hype = min(100, int(vol24 / max(liq, 1) * 20))
+                hype = min(100, int(vol24 / max(liq, 1) * 20) + _degen_hype_bonus(sym))
                 out.append({
                     "symbol": sym, "chain": "sol", "price": price,
                     "liq": liq, "age_min": age_min, "hype": hype,
@@ -500,6 +510,15 @@ def compute_heat(btc_d: Optional[float]) -> Optional[str]:
     return "btc_max"
 
 
+def _degen_hype_bonus(symbol: str) -> int:
+    """Small hype boost for provocative/vulgar names that reliably pull degen volume."""
+    dt = CONFIG.get("degen_terms", {})
+    if not dt.get("enabled"):
+        return 0
+    low = (symbol or "").lower()
+    return int(dt.get("bonus", 12)) if any(t in low for t in dt.get("terms", [])) else 0
+
+
 def _pair_to_candidate(pair: Dict[str, Any], our_chain: str) -> Optional[Dict[str, Any]]:
     try:
         symbol = (pair.get("baseToken") or {}).get("symbol", "").upper()
@@ -512,7 +531,7 @@ def _pair_to_candidate(pair: Dict[str, Any], our_chain: str) -> Optional[Dict[st
         vol_h24    = float((pair.get("volume")    or {}).get("h24") or 0)
         if price_usd <= 0 or liq <= 0:
             return None
-        hype      = min(100, int(vol_h24 / max(liq, 1) * 20))
+        hype      = min(100, int(vol_h24 / max(liq, 1) * 20) + _degen_hype_bonus(symbol))
         price_chg = float((pair.get("priceChange") or {}).get("h24") or 0)
         return {"symbol": symbol, "chain": our_chain, "price": price_usd,
                 "liq": liq, "age_min": age_min, "hype": hype, "positive": price_chg > 0,
@@ -2019,6 +2038,7 @@ def api_state():
             "doge":   TRUSTED.get("DOGE", {}),
             "ai":     CONFIG["ai"],
             "safety": CONFIG["safety"],
+            "degen_terms": CONFIG.get("degen_terms", {}),
         },
         "ai_key_set":      bool(os.getenv(ANTHROPIC_KEY_ENV)),
         "x_key_set":       bool(os.getenv(X_BEARER_ENV)),
@@ -2355,6 +2375,11 @@ def api_config():
         for k in ("scam_chatter_max", "sol_holder_max_pct", "evm_sell_tax_max", "rugcheck_score_max"):
             if k in data["safety"]:
                 CONFIG["safety"][k] = float(data["safety"][k])
+    if isinstance(data.get("degen_terms"), dict):
+        if "enabled" in data["degen_terms"]:
+            CONFIG["degen_terms"]["enabled"] = bool(data["degen_terms"]["enabled"])
+        if "bonus" in data["degen_terms"]:
+            CONFIG["degen_terms"]["bonus"] = max(0, int(data["degen_terms"]["bonus"]))
     return jsonify({"ok": True})
 
 

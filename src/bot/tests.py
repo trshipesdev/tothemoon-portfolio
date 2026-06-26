@@ -2404,5 +2404,58 @@ class TestSafetyGate(unittest.TestCase):
         self.assertIn("x_key_set", d)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 41. Degen-name hype boost
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDegenHypeBoost(unittest.TestCase):
+
+    def setUp(self):
+        _reset()
+        bot.CONFIG["degen_terms"]["enabled"] = True
+        bot.CONFIG["degen_terms"]["bonus"] = 12
+
+    def test_bonus_applied_to_matching_name(self):
+        self.assertEqual(bot._degen_hype_bonus("PENISPUMP"), 12)
+        self.assertEqual(bot._degen_hype_bonus("SEXCOIN"), 12)
+        self.assertEqual(bot._degen_hype_bonus("CUMROCKET"), 12)
+
+    def test_no_bonus_for_clean_name(self):
+        self.assertEqual(bot._degen_hype_bonus("BONK"), 0)
+        self.assertEqual(bot._degen_hype_bonus("WIFSTICK"), 0)
+
+    def test_disabled_no_bonus(self):
+        bot.CONFIG["degen_terms"]["enabled"] = False
+        self.assertEqual(bot._degen_hype_bonus("SEXCOIN"), 0)
+        bot.CONFIG["degen_terms"]["enabled"] = True
+
+    def test_case_insensitive(self):
+        self.assertEqual(bot._degen_hype_bonus("sexcoin"), 12)
+
+    def test_pair_candidate_gets_boost(self):
+        now_ms = int(time.time() * 1000)
+        def pair(sym):
+            return {"baseToken": {"symbol": sym, "address": "0x"}, "priceUsd": "0.001",
+                    "pairCreatedAt": now_ms - 600000, "liquidity": {"usd": 50000},
+                    "volume": {"h24": 100000}, "priceChange": {"h24": 5.0}}
+        clean = bot._pair_to_candidate(pair("CLEAN"), "sol")["hype"]
+        degen = bot._pair_to_candidate(pair("SEXCLEAN"), "sol")["hype"]
+        self.assertEqual(degen - clean, 12)
+
+    def test_hype_still_capped_at_100(self):
+        now_ms = int(time.time() * 1000)
+        p = {"baseToken": {"symbol": "SEXMAX", "address": "0x"}, "priceUsd": "0.001",
+             "pairCreatedAt": now_ms - 600000, "liquidity": {"usd": 1000},
+             "volume": {"h24": 10_000_000}, "priceChange": {"h24": 5.0}}
+        self.assertEqual(bot._pair_to_candidate(p, "sol")["hype"], 100)
+
+    def test_config_endpoint_toggles_degen(self):
+        os.environ.pop("DASHBOARD_TOKEN", None)
+        c = bot.app.test_client()
+        c.post("/api/config", json={"degen_terms": {"enabled": False}})
+        self.assertFalse(bot.CONFIG["degen_terms"]["enabled"])
+        bot.CONFIG["degen_terms"]["enabled"] = True
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
