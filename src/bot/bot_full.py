@@ -2518,6 +2518,130 @@ def api_history():
     })
 
 
+@app.route("/api/backtest")
+@_dash_auth
+def api_backtest():
+    """Replay trade history with current bot fixes applied from day one.
+
+    Fixes simulated:
+      1. Post-exit cooldown: 30-min block after a loss exit; 15-min block after
+         a profit exit (no pullback data so we conservatively block the re-entry).
+      2. Dollar stop: any sell with loss worse than max($12, 10% of deployed)
+         is capped — we can't know the exact tick, so we replace the loss with
+         the dollar-stop limit.
+
+    Returns per-trade status ('kept'/'blocked'/'capped') plus revised stats.
+    """
+    trades   = STATE.get("trade_log", [])
+    dollar_stop = CONFIG["moonshot"].get("dollar_stop_usd", 12.0)
+    cooldown_loss_sec   = 30 * 60
+    cooldown_profit_sec = 15 * 60
+
+    # ── pass 1: mark blocked buys (post-exit cooldown) ──────────────────────
+    last_exit: Dict[str, Dict] = {}   # symbol -> {ts, pnl}
+    blocked_buys: set = set()         # indices of blocked buys
+
+    for i, t in enumerate(trades):
+        sym  = t.get("symbol", "")
+        side = t.get("side")
+        try:
+            ts = float(t.get("ts_epoch", 0)) or \
+                 __import__("datetime").datetime.fromisoformat(
+                     t["ts"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = 0.0
+
+        if side == "buy":
+            ex = last_exit.get(sym)
+            if ex:
+                elapsed = ts - ex["ts"]
+                if ex["pnl"] < 0 and elapsed < cooldown_loss_sec:
+                    blocked_buys.add(i)
+                elif ex["pnl"] >= 0 and elapsed < cooldown_profit_sec:
+                    blocked_buys.add(i)
+        elif side == "sell" and t.get("pnl") is not None:
+            last_exit[sym] = {"ts": ts, "pnl": t["pnl"]}
+
+    # ── pass 2: build revised trade list ────────────────────────────────────
+    # Track which symbols have a blocked buy outstanding so we skip their sells too
+    blocked_symbols_open: Dict[str, int] = {}  # symbol -> count of blocked open lots
+
+    revised: List[Dict] = []
+    sim_vault = STATE.get("vault_start") or 1000.0
+    sim_running = 0.0
+    deployed: Dict[str, float] = {}   # symbol -> sim deployed usd
+
+    for i, t in enumerate(trades):
+        sym   = t.get("symbol", "")
+        side  = t.get("side")
+        usd   = t.get("usd", 0) or 0
+        pnl   = t.get("pnl")
+
+        if side == "buy":
+            if i in blocked_buys:
+                blocked_symbols_open[sym] = blocked_symbols_open.get(sym, 0) + 1
+                revised.append({**t, "sim_status": "blocked", "sim_pnl": 0, "sim_running": sim_running})
+                continue
+            deployed[sym] = deployed.get(sym, 0) + usd
+            sim_vault -= usd
+            revised.append({**t, "sim_status": "kept", "sim_pnl": 0, "sim_running": sim_running})
+
+        elif side == "sell" and pnl is not None:
+            # If the corresponding buy was blocked, skip this sell
+            if blocked_symbols_open.get(sym, 0) > 0:
+                blocked_symbols_open[sym] -= 1
+                if blocked_symbols_open[sym] <= 0:
+                    blocked_symbols_open.pop(sym, None)
+                revised.append({**t, "sim_status": "blocked", "sim_pnl": 0, "sim_running": sim_running})
+                continue
+
+            dep = deployed.get(sym, usd - pnl)
+            effective_stop = max(dollar_stop, dep * 0.10)
+            if pnl < -effective_stop:
+                # Dollar stop would have fired — cap the loss
+                sim_pnl = -effective_stop
+                status  = "capped"
+            else:
+                sim_pnl = pnl
+                status  = "kept"
+
+            sim_running += sim_pnl
+            sim_vault   += (usd - pnl) + sim_pnl   # return cost + capped loss
+            deployed[sym] = max(0.0, dep - (usd - pnl))
+            revised.append({**t, "sim_status": status, "sim_pnl": round(sim_pnl, 4),
+                             "sim_running": round(sim_running, 4)})
+        else:
+            revised.append({**t, "sim_status": "kept", "sim_pnl": 0, "sim_running": sim_running})
+
+    # ── summary stats ────────────────────────────────────────────────────────
+    sim_sells  = [r for r in revised if r.get("side") == "sell" and r["sim_status"] != "blocked"
+                  and r.get("sim_pnl") is not None]
+    sim_wins   = [r for r in sim_sells if r["sim_pnl"] > 0]
+    sim_losses = [r for r in sim_sells if r["sim_pnl"] <= 0]
+    n_blocked  = sum(1 for r in revised if r.get("sim_status") == "blocked" and r.get("side") == "buy")
+    n_capped   = sum(1 for r in revised if r.get("sim_status") == "capped")
+    saved      = sum(r["pnl"] - r["sim_pnl"]
+                     for r in revised
+                     if r.get("sim_status") == "capped" and r.get("pnl") is not None)
+
+    real_total = sum(t["pnl"] for t in trades if t.get("side") == "sell" and t.get("pnl") is not None)
+
+    return jsonify({
+        "trades":        revised,
+        "real_total":    round(real_total, 2),
+        "sim_total":     round(sim_running, 2),
+        "difference":    round(sim_running - real_total, 2),
+        "win_rate":      len(sim_wins)   / max(1, len(sim_sells)),
+        "avg_win":       sum(r["sim_pnl"] for r in sim_wins)   / max(1, len(sim_wins)),
+        "avg_loss":      sum(r["sim_pnl"] for r in sim_losses) / max(1, len(sim_losses)),
+        "real_win_rate": len([t for t in trades if t.get("side")=="sell" and t.get("pnl",0)>0])
+                         / max(1, len([t for t in trades if t.get("side")=="sell" and t.get("pnl") is not None])),
+        "n_blocked":     n_blocked,
+        "n_capped":      n_capped,
+        "saved_usd":     round(saved, 2),
+    })
+
+
 @app.route("/api/alerts")
 @_dash_auth
 def api_alerts():

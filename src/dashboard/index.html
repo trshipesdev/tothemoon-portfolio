@@ -805,6 +805,128 @@
       </div>
     </div>
 
+    <!-- BACKTEST — what would current logic have done from day one -->
+    <div x-show="tab === 'Backtest'" x-data="{ bt: null, btLoading: false }"
+         x-init="$watch('tab', v => { if (v === 'Backtest' && !bt) loadBt() })"
+         @load-bt.window="loadBt()">
+      <template x-if="true">
+        <div>
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="font-bold text-gray-300">What if today's fixes ran from day one?</h2>
+              <div class="text-gray-600 text-xs mt-1">Replays every trade applying: post-exit cooldown · $12 dollar stop</div>
+            </div>
+            <button @click="btLoading=true; fetch('/api/backtest', {headers:authHeader()}).then(r=>r.json()).then(d=>{bt=d;btLoading=false})"
+                    class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1.5 text-gray-300">
+              <span x-show="!btLoading">↻ run</span>
+              <span x-show="btLoading">running…</span>
+            </button>
+          </div>
+
+          <!-- Load prompt -->
+          <template x-if="!bt && !btLoading">
+            <div class="text-center py-16">
+              <div class="text-gray-500 text-sm mb-3">Click "run" to replay your trade history with the current bot version</div>
+              <button @click="btLoading=true; fetch('/api/backtest', {headers:authHeader()}).then(r=>r.json()).then(d=>{bt=d;btLoading=false})"
+                      class="bg-emerald-700 hover:bg-emerald-600 text-white rounded px-5 py-2 text-sm">Run simulation</button>
+            </div>
+          </template>
+          <template x-if="btLoading && !bt">
+            <div class="text-center py-16 text-gray-500 text-sm">Replaying trade history…</div>
+          </template>
+
+          <template x-if="bt">
+            <div>
+              <!-- Top line comparison -->
+              <div class="grid grid-cols-3 gap-3 mb-4">
+                <div class="bg-gray-900 rounded-xl p-4 text-center">
+                  <div class="text-gray-500 text-xs mb-1">Actual PnL</div>
+                  <div :class="(bt.real_total??0)>=0?'text-emerald-400':'text-red-400'"
+                       class="text-2xl font-bold"
+                       x-text="((bt.real_total??0)>=0?'+$':'−$')+fmt(Math.abs(bt.real_total??0))"></div>
+                  <div class="text-gray-600 text-xs mt-1" x-text="(bt.real_win_rate*100).toFixed(0)+'% win rate'"></div>
+                </div>
+                <div class="bg-gray-900 rounded-xl p-4 text-center border border-emerald-900">
+                  <div class="text-gray-500 text-xs mb-1">Simulated PnL</div>
+                  <div :class="(bt.sim_total??0)>=0?'text-emerald-400':'text-red-400'"
+                       class="text-2xl font-bold"
+                       x-text="((bt.sim_total??0)>=0?'+$':'−$')+fmt(Math.abs(bt.sim_total??0))"></div>
+                  <div class="text-gray-600 text-xs mt-1" x-text="(bt.win_rate*100).toFixed(0)+'% win rate'"></div>
+                </div>
+                <div class="bg-gray-900 rounded-xl p-4 text-center">
+                  <div class="text-gray-500 text-xs mb-1">Difference</div>
+                  <div :class="(bt.difference??0)>=0?'text-emerald-400':'text-red-400'"
+                       class="text-2xl font-bold"
+                       x-text="((bt.difference??0)>=0?'+$':'−$')+fmt(Math.abs(bt.difference??0))"></div>
+                  <div class="text-gray-600 text-xs mt-1">vs actual</div>
+                </div>
+              </div>
+
+              <!-- What the fixes saved -->
+              <div class="grid grid-cols-3 gap-3 mb-4 text-center text-xs">
+                <div class="bg-gray-800 rounded-lg p-3">
+                  <div class="text-gray-500 mb-1">Bad re-entries blocked</div>
+                  <div class="font-bold text-amber-300" x-text="bt.n_blocked + ' trades'"></div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-3">
+                  <div class="text-gray-500 mb-1">Losses capped by $12 stop</div>
+                  <div class="font-bold text-amber-300" x-text="bt.n_capped + ' trades'"></div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-3">
+                  <div class="text-gray-500 mb-1">Total damage avoided</div>
+                  <div class="font-bold text-emerald-400" x-text="'+$' + fmt(bt.saved_usd??0)"></div>
+                </div>
+              </div>
+
+              <!-- Avg win/loss comparison -->
+              <div class="grid grid-cols-2 gap-3 mb-5 text-center text-xs">
+                <div class="bg-gray-900 rounded-xl p-3">
+                  <div class="text-gray-500 mb-2">Avg loss: actual vs simulated</div>
+                  <div class="flex justify-around">
+                    <div><div class="text-gray-600 text-xs">actual</div>
+                      <div class="text-red-400 font-bold" x-text="'−$'+fmt(Math.abs(bt.real_win_rate??0) > 0 ? 0 : 0)"></div></div>
+                    <div class="text-gray-600">→</div>
+                    <div><div class="text-gray-600 text-xs">simulated</div>
+                      <div class="text-emerald-400 font-bold" x-text="'−$'+fmt(Math.abs(bt.avg_loss??0))"></div></div>
+                  </div>
+                </div>
+                <div class="bg-gray-900 rounded-xl p-3">
+                  <div class="text-gray-500 mb-2">Win rate: actual vs simulated</div>
+                  <div class="flex justify-around items-center">
+                    <div class="font-bold text-gray-300" x-text="(bt.real_win_rate*100).toFixed(0)+'%'"></div>
+                    <div class="text-gray-600">→</div>
+                    <div class="font-bold text-emerald-400" x-text="(bt.win_rate*100).toFixed(0)+'%'"></div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Trade-by-trade list — only show affected trades -->
+              <h3 class="text-gray-400 text-sm font-bold mb-2">Affected trades</h3>
+              <div class="space-y-1 text-xs">
+                <template x-for="t in (bt.trades||[]).filter(t=>t.sim_status!=='kept')" :key="t.ts+t.symbol+t.side">
+                  <div class="flex items-center justify-between bg-gray-900 rounded-lg px-3 py-2">
+                    <div class="flex items-center gap-2">
+                      <span :class="t.sim_status==='blocked'?'text-amber-400':'text-blue-400'"
+                            x-text="t.sim_status==='blocked'?'BLOCKED':'CAPPED'"></span>
+                      <span class="text-gray-300 font-mono" x-text="t.symbol"></span>
+                      <span class="text-gray-600" x-text="t.side"></span>
+                    </div>
+                    <div class="flex items-center gap-3">
+                      <span class="text-red-400" x-show="t.side==='sell' && t.pnl!=null"
+                            x-text="'actual: '+(t.pnl>=0?'+':'')+fmt(t.pnl??0)"></span>
+                      <span class="text-emerald-400" x-show="t.sim_status==='capped'"
+                            x-text="'→ capped: '+fmt(t.sim_pnl??0)"></span>
+                      <span class="text-gray-600" x-text="fmtTime(t.ts)"></span>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+      </template>
+    </div>
+
     <!-- SETTINGS -->
     <div x-show="tab === 'Settings'" class="grid md:grid-cols-2 gap-4">
 
@@ -1177,7 +1299,7 @@
 <script>
 function app() {
   return {
-    tabs: ['Wallet', 'Positions', 'Scout', 'Controls', 'History', 'Alerts', 'RPC', 'Settings'],
+    tabs: ['Wallet', 'Positions', 'Scout', 'Controls', 'History', 'Backtest', 'Alerts', 'RPC', 'Settings'],
     tab:  'Wallet',
 
     state:   { shadow_mode: true, mode: '…', signals: {}, objective: {}, watchlist: {} },
