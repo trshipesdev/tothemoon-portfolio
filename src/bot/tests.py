@@ -2636,6 +2636,7 @@ class TestMoonBagLadder(unittest.TestCase):
     def test_mode_perf_attributed_to_entry_mode(self):
         bot.CONFIG["gas_sim"] = False
         bot.CONFIG["mode"] = "degen"
+        bot.STATE["mode_perf"] = {}   # isolate from other sells in this class
         bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)
         p = bot.STATE["positions"]["PUMP"]
         bot.shadow_sell("PUMP", p["usd"], 1.30, 1_000_000.0)   # close in profit
