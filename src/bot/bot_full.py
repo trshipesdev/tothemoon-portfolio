@@ -2449,40 +2449,57 @@ def api_history():
         if t.get("side") == "sell" and t.get("pnl") is not None:
             running += t["pnl"]
         enriched.append({**t, "running_pnl": running})
-    # Simulate the same trades starting with a $100 vault (same bet sizes, no scaling).
-    # Walks buys/sells chronologically: buy deducts cost, sell returns proceeds.
-    # This is what actually would have happened with $100 — not a proportional estimate.
-    _r_start   = 100.0
-    _r_vault   = _r_start
-    _r_min     = _r_start
-    _r_max     = _r_start
-    _r_skipped = 0
+    # $100 runner simulation — replays every trade with a $100 starting vault.
+    # Bet sizes SCALE with the sim vault: each bet is the same % of vault as it
+    # was of the real vault at that time. Profits go straight back in — no holding.
+    # real_vault_start is the vault when the first buy happened.
+    _r_start       = 100.0
+    _r_vault       = _r_start
+    _r_min_cash    = _r_start   # lowest cash (could be fully deployed, not a loss)
+    _r_min_total   = _r_start   # lowest total assets (cash + open position value)
+    _r_max         = _r_start
+    _r_skipped     = 0
     _r_hist: List[Dict] = []
-    _r_open: Dict[str, float] = {}   # symbol -> cost basis in the runner sim
+    _r_open: Dict[str, float] = {}     # symbol -> sim cost basis
+    _r_open_real: Dict[str, float] = {} # symbol -> real cost basis (for scaling)
+    # Use STATE vault_start as the reference vault for scaling bets
+    _real_ref = STATE.get("vault_start") or 1000.0
     for t in trades:
         sym  = t.get("symbol", "")
         side = t.get("side")
         usd  = t.get("usd", 0) or 0
         pnl  = t.get("pnl", 0) or 0
         if side == "buy":
-            if _r_vault >= usd:
-                _r_vault -= usd
-                _r_open[sym] = _r_open.get(sym, 0) + usd
+            # Scale bet proportionally: if real vault was $1000 and bet was $40 (4%),
+            # sim vault at $200 means sim bet = $200 * 4% = $8. Profits compound into larger bets.
+            scale    = (_r_vault + sum(_r_open.values())) / _real_ref
+            sim_usd  = max(1.0, usd * scale)
+            if _r_vault >= sim_usd:
+                _r_vault -= sim_usd
+                _r_open[sym]      = _r_open.get(sym, 0) + sim_usd
+                _r_open_real[sym] = _r_open_real.get(sym, 0) + usd
             else:
                 _r_skipped += 1
                 continue
         elif side == "sell":
             if sym not in _r_open:
                 continue   # was a skipped buy — skip the sell too
-            proceeds = usd   # sell usd field = what we get back (cost + pnl fraction)
-            _r_vault += proceeds
-            _r_open[sym] = max(0.0, _r_open.get(sym, 0) - (usd - pnl))
-            if _r_open[sym] <= 0:
+            # Scale proceeds by same ratio as bet was scaled
+            real_cost = _r_open_real.get(sym, usd) or usd
+            scale     = _r_open.get(sym, sim_usd) / max(real_cost, 1e-9)
+            sim_proceeds = usd * scale
+            _r_vault += sim_proceeds
+            _r_open[sym]      = max(0.0, _r_open.get(sym, 0) - (sim_proceeds - pnl * scale))
+            _r_open_real[sym] = max(0.0, _r_open_real.get(sym, 0) - (usd - pnl))
+            if _r_open.get(sym, 0) <= 0:
                 _r_open.pop(sym, None)
-        _r_vault = max(0.0, _r_vault)
-        _r_min   = min(_r_min, _r_vault)
-        _r_max   = max(_r_max, _r_vault)
-        _r_hist.append({"ts": t.get("ts", ""), "vault": round(_r_vault, 2)})
+                _r_open_real.pop(sym, None)
+        _r_vault     = max(0.0, _r_vault)
+        _total_assets = _r_vault + sum(_r_open.values())
+        _r_min_cash  = min(_r_min_cash, _r_vault)
+        _r_min_total = min(_r_min_total, _total_assets)
+        _r_max       = max(_r_max, _total_assets)
+        _r_hist.append({"ts": t.get("ts", ""), "vault": round(_total_assets, 2)})
 
     return jsonify({
         "trades":    enriched,
@@ -2491,12 +2508,13 @@ def api_history():
         "avg_win":   sum(t["pnl"] for t in wins)   / max(1, len(wins)),
         "avg_loss":  sum(t["pnl"] for t in losses) / max(1, len(losses)),
         "runner_100": {
-            "start":   _r_start,
-            "end":     round(_r_vault, 2),
-            "min":     round(_r_min, 2),
-            "max":     round(_r_max, 2),
-            "skipped": _r_skipped,
-            "hist":    _r_hist,
+            "start":    _r_start,
+            "end":      round(_r_vault + sum(_r_open.values()), 2),
+            "min_cash": round(_r_min_cash, 2),
+            "min":      round(_r_min_total, 2),
+            "max":      round(_r_max, 2),
+            "skipped":  _r_skipped,
+            "hist":     _r_hist,
         },
     })
 
