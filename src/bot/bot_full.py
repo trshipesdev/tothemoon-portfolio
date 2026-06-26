@@ -285,6 +285,7 @@ STATE: Dict[str, Any] = {
     "ai":               {"last_run": None, "last": None, "history": []},  # AI advisor state
     "entries_today":    {},  # symbol → count of fresh entries today (anti-churn), reset daily
     "recently_exited":  {},  # symbol → {ts, price, pnl} — blocks scanner re-entry after full close
+    "reject_cache":     {},  # symbol → {ts, reason_type, price} — skip re-eval until price spikes
     # Wallet goal: Phase 1 = grow to $1000. Phase 2 = skim 50% of profit above $100 threshold.
     "wallet_goal": {
         "goal_usd":        1000.0,   # target vault before skim phase kicks in
@@ -439,6 +440,7 @@ def load_state():
         STATE.setdefault("scout_log",     [])
         STATE.setdefault("entries_today", {})
         STATE.setdefault("recently_exited", {})
+        STATE.setdefault("reject_cache",    {})
         # Set vault_start once from the loaded vault if it was never recorded
         STATE.setdefault("vault_start", STATE.get("vault_usd", 1000.0))
         STATE.setdefault("wallet_goal", {})
@@ -809,12 +811,13 @@ def fetch_positions_prices() -> Dict[str, Dict]:
 # ---------------------------------------------------------------------------
 class Score:
     def __init__(self, hype: int, liq: float, age_min: float, positive: bool,
-                 buy_ratio: Optional[float] = None):
+                 buy_ratio: Optional[float] = None, price: float = 0.0):
         self.hype      = hype
         self.liq       = liq
         self.age_min   = age_min
         self.positive  = positive
         self.buy_ratio = buy_ratio   # h1 buys/(buys+sells); None if unknown
+        self.price     = price
 
 
 def moonshot_reject_reason(sc: Score) -> Optional[str]:
@@ -851,6 +854,24 @@ def passes_moonshot_filters(sc: Score) -> bool:
     return moonshot_reject_reason(sc) is None
 
 
+def _reject_spike_threshold(reason: str) -> float:
+    """Return the price-spike multiplier required before re-evaluating a rejected token.
+    Higher = harder to get back on the radar. Safety flags need a bigger move than liq issues.
+    'hella spike' for safety = 3x. Liq-too-low just needs to actually grow (~50%).
+    Anti-churn / post-exit are handled by their own separate gates, not the reject cache.
+    """
+    r = reason.lower()
+    if "safety" in r or "honeypot" in r or "rug" in r or "flagged" in r:
+        return 3.0   # needs to 3x price before we look again — something dramatic changed
+    if "liquidity" in r:
+        return 1.5   # liq needs to grow substantially (price proxy) before re-checking
+    if "selling pressure" in r or "buy_ratio" in r or "buy ratio" in r:
+        return 1.4   # sentiment can shift, but needs a real move
+    if "age" in r:
+        return 1.0   # age gate clears with time alone — re-evaluate every scan
+    return 1.3       # generic gate: need a ~30% spike
+
+
 def _scout(symbol: str, chain: str, decision: str, reason: str,
            sc: Optional[Score] = None, address: str = ""):
     """Record why the scanner did (or didn't) act on a candidate, for the dashboard Scout log."""
@@ -864,6 +885,17 @@ def _scout(symbol: str, chain: str, decision: str, reason: str,
     log_list.append(entry)
     if len(log_list) > 300:                # keep the most recent 300 evaluations
         del log_list[: len(log_list) - 300]
+    # Cache this rejection so the scanner can skip the token next scan unless price spikes.
+    # Only cache actual rejections, not entries/suggestions.
+    if decision == "rejected" and sc is not None and sc.price > 0:
+        threshold = _reject_spike_threshold(reason)
+        if threshold > 1.0:   # age-gate tokens re-evaluate every scan naturally
+            STATE.setdefault("reject_cache", {})[symbol] = {
+                "ts":        time.time(),
+                "reason":    reason,
+                "threshold": threshold,
+                "price":     sc.price,
+            }
 
 # ---------------------------------------------------------------------------
 # Objectives × strategy
@@ -3199,6 +3231,7 @@ def scan_candidates():
         STATE["open_today_usd"]  = 0.0
         STATE["entries_today"]   = {}
         STATE["recently_exited"] = {}   # clear cooldowns at midnight — fresh day, fresh tokens
+        STATE["reject_cache"]    = {}   # clear reject cache — tokens get a fresh look each day
         STATE["peak_deployed_usd"] = 0.0
         STATE["peak_open_count"]   = 0
         STATE["last_daily_reset"] = today
@@ -3219,11 +3252,20 @@ def scan_candidates():
         price  = c["price"]
         liq    = c["liq"]
         sc     = Score(c.get("hype", 0), liq, c["age_min"], c.get("positive", True),
-                       buy_ratio=c.get("buy_ratio"))
+                       buy_ratio=c.get("buy_ratio"), price=price)
         is_new = c["age_min"] <= CONFIG["scan"]["new_max_age_min"]
 
         addr = c.get("address", "")
         link = _dex_link(chain, addr)
+
+        # Reject cache: skip re-evaluation unless price has spiked enough since last reject.
+        # Saves API calls and stops the scanner from asking the same question 20+ times.
+        _rc = STATE.get("reject_cache", {}).get(symbol)
+        if _rc and _rc.get("price", 0) > 0 and price > 0:
+            _needed = _rc["price"] * _rc.get("threshold", 1.3)
+            if price < _needed:
+                continue   # silent skip — no scout log spam for already-cached rejects
+
         # Manual blacklist — never buy these (by symbol or address), dashboard-editable
         bl = {str(x).lower() for x in CONFIG.get("blacklist", [])}
         if symbol.lower() in bl or (addr and addr.lower() in bl):
