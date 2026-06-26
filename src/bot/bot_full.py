@@ -182,7 +182,10 @@ CONFIG: Dict[str, Any] = {
     # Solana is ~free; Ethereum mainnet is brutal on small trades.
     "gas_sim":     True,
     "gas_dynamic": True,   # fetch live ETH gas (eth_gasPrice × ETH price) every ~5 min
-    "gas_usd":     {"sol": 0.001, "base": 0.02, "poly": 0.02, "bsc": 0.15, "eth": 6.0},
+    # Per-swap USD. Solana base fee is ~$0.001, but landing memecoin snipes needs
+    # priority fees (+ occasional token-account creation), so a realistic all-in cost
+    # is ~$0.03/swap. Base/Polygon are cheap; BSC mid; ETH fetched live.
+    "gas_usd":     {"sol": 0.03, "base": 0.03, "poly": 0.02, "bsc": 0.15, "eth": 6.0},
 
     # Scam / rug safety gate — checked on tokens the bot is about to buy.
     # Reddit (free) + X/Twitter (needs X_BEARER_TOKEN) scan for scam chatter;

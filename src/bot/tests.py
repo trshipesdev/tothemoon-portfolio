@@ -118,6 +118,8 @@ def _reset(vault: float = 1000.0):
     bot.CONFIG["objective"]["kind"]              = "off"
     bot.OBJ_STATE.update({"started": None, "target_curve": []})
     bot.SHADOW_MODE = True
+    # Gas off by default so vault-math tests are deterministic; gas tests opt in.
+    bot.CONFIG["gas_sim"] = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1771,6 +1773,7 @@ class TestGasSimulation(unittest.TestCase):
         bot.shadow_buy("SOLT", "sol", 50.0, 1.0, 100000.0)
         sol_res = bot.shadow_sell("SOLT", bot.STATE["positions"]["SOLT"]["usd"], 2.0, 100000.0)
         _reset(1000.0)
+        bot.CONFIG["gas_sim"] = True   # _reset turns it off; re-enable for the eth leg
         bot.shadow_buy("ETHT", "eth", 50.0, 1.0, 100000.0)
         eth_res = bot.shadow_sell("ETHT", bot.STATE["positions"]["ETHT"]["usd"], 2.0, 100000.0)
         self.assertGreater(sol_res["pnl"], eth_res["pnl"])

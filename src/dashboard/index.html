@@ -901,6 +901,10 @@ function app() {
     // ── Init ──
     async init() {
       this.tokenInput = localStorage.getItem('dash_token') || '';
+      // Restore the last-selected tab across page refreshes
+      const savedTab = localStorage.getItem('dash_tab');
+      if (savedTab && this.tabs.includes(savedTab)) this.tab = savedTab;
+      this.$watch('tab', v => localStorage.setItem('dash_tab', v));
       await this.refresh();
       setInterval(() => this.refresh(), 20000);
     },
