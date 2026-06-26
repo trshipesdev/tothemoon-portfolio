@@ -895,6 +895,8 @@ def _scout(symbol: str, chain: str, decision: str, reason: str,
                 "reason":    reason,
                 "threshold": threshold,
                 "price":     sc.price,
+                "min_liq":   CONFIG["modes"].get(CONFIG["mode"], {}).get("liq_min",
+                             CONFIG["moonshot"].get("liq_min", 10000)),
             }
 
 # ---------------------------------------------------------------------------
@@ -3262,9 +3264,10 @@ def scan_candidates():
         # Saves API calls and stops the scanner from asking the same question 20+ times.
         _rc = STATE.get("reject_cache", {}).get(symbol)
         if _rc and _rc.get("price", 0) > 0 and price > 0:
-            _needed = _rc["price"] * _rc.get("threshold", 1.3)
-            if price < _needed:
-                continue   # silent skip — no scout log spam for already-cached rejects
+            _price_ok = price >= _rc["price"] * _rc.get("threshold", 1.3)
+            _liq_ok   = liq   >= _rc.get("min_liq", 0)
+            if not (_price_ok and _liq_ok):
+                continue   # silent skip — price hasn't spiked enough OR liq still dead
 
         # Manual blacklist — never buy these (by symbol or address), dashboard-editable
         bl = {str(x).lower() for x in CONFIG.get("blacklist", [])}
