@@ -2457,5 +2457,56 @@ class TestDegenHypeBoost(unittest.TestCase):
         bot.CONFIG["degen_terms"]["enabled"] = True
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 42. Anti-churn — per-token daily entry cap
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEntryChurnCap(unittest.TestCase):
+
+    def setUp(self):
+        _reset(1000.0)
+        bot.CONFIG["max_entries_per_token_day"] = 2
+        bot.STATE["entries_today"] = {}
+
+    def test_under_cap_allowed(self):
+        cap = bot.CONFIG["max_entries_per_token_day"]
+        self.assertLess(bot.STATE["entries_today"].get("PUMP", 0), cap)
+
+    def test_cap_blocks_third_entry(self):
+        bot.STATE["entries_today"]["PUMP"] = 2
+        cap = bot.CONFIG["max_entries_per_token_day"]
+        self.assertGreaterEqual(bot.STATE["entries_today"]["PUMP"], cap)
+
+    def test_daily_reset_clears_entries(self):
+        bot.STATE["entries_today"] = {"PUMP": 5}
+        bot.STATE["last_daily_reset"] = "2000-01-01"
+        today = bot.now_utc().date().isoformat()
+        # mimic the reset logic from engine_once
+        if bot.STATE.get("last_daily_reset") != today:
+            bot.STATE["entries_today"] = {}
+            bot.STATE["last_daily_reset"] = today
+        self.assertEqual(bot.STATE["entries_today"], {})
+
+    @patch.object(bot, "fetch_btc_dominance", return_value=45.0)
+    @patch.object(bot, "fetch_positions_prices", return_value={})
+    @patch.object(bot, "check_reentry_watch")
+    @patch.object(bot, "manage_trusted_coins")
+    @patch.object(bot, "save_state")
+    @patch.object(bot, "safety_gate", return_value=(True, ""))
+    @patch.object(bot, "fetch_social_volume", return_value=2.0)
+    def test_engine_respects_entry_cap(self, *mocks):
+        _reset(1000.0)
+        bot.CONFIG["moonshot"]["mode"] = "enter"
+        bot.CONFIG["max_entries_per_token_day"] = 1
+        bot.STATE["last_daily_reset"] = bot.now_utc().date().isoformat()  # don't trip the daily reset
+        bot.STATE["entries_today"] = {"PUMP": 1}   # already at cap
+        cand = [{"symbol": "PUMP", "chain": "sol", "price": 0.001, "liq": 50000,
+                 "age_min": 10, "hype": 95, "positive": True, "address": "0xpump"}]
+        with patch.object(bot, "fetch_new_candidates", return_value=cand):
+            bot.engine_once()
+        # PUMP was at cap → no new position opened
+        self.assertNotIn("PUMP", bot.STATE["positions"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

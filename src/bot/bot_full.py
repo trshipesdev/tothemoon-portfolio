@@ -108,6 +108,9 @@ CONFIG: Dict[str, Any] = {
     "base_size_usd":        30.0,   # was 50 — smaller bets spread across more tokens
     "reserve_pct":          0.25,   # keep 25% of vault untouched
     "per_token_cap_pct":    0.12,   # max 12% of deployable per token  ← real risk cap
+    # Stop churning the same hyper-volatile token: cap fresh entries per symbol per day.
+    # The bot was re-buying PENISPUMP / 𝕏GIFT ~6x each as they chopped, bleeding out.
+    "max_entries_per_token_day": 2,
     "per_chain_cap_pct":    {"sol": 0.40, "eth": 0.35, "base": 0.25, "bsc": 0.30, "poly": 0.25},  # ← real risk cap
     # Far-off sanity backstop only (5x deployable/day). The REAL, robust risk controls
     # are the reserve + per-chain + per-token caps + drawdown brake, which compute from
@@ -256,6 +259,7 @@ STATE: Dict[str, Any] = {
     "scout_log":        [],  # recent candidate evaluations: why it entered/suggested/rejected
     "gas_live":         {},  # live per-chain gas estimates: {chain: usd, "ts": epoch}
     "ai":               {"last_run": None, "last": None, "history": []},  # AI advisor state
+    "entries_today":    {},  # symbol → count of fresh entries today (anti-churn), reset daily
 }
 
 _state_path_env = os.getenv("STATE_PATH", "")
@@ -311,6 +315,7 @@ def load_state():
         STATE.setdefault("brake_alerted", False)
         STATE.setdefault("gas_paid_usd",  0.0)
         STATE.setdefault("scout_log",     [])
+        STATE.setdefault("entries_today", {})
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -2855,9 +2860,10 @@ def engine_once():
     today = now_utc().date().isoformat()
     if STATE.get("last_daily_reset") != today:
         STATE["open_today_usd"]  = 0.0
+        STATE["entries_today"]   = {}
         STATE["last_daily_reset"] = today
         save_state()
-        log("Daily reset: open_today_usd → 0")
+        log("Daily reset: open_today_usd → 0, entries_today cleared")
 
     btc_d                     = fetch_btc_dominance()
     STATE["signals"]["btc_d"] = btc_d
@@ -2907,10 +2913,17 @@ def engine_once():
                     f"from a likely scam/rug.\n{link}")
                 _scout(symbol, chain, "rejected", f"safety: {why}", sc, addr)
                 continue
+            # Anti-churn: don't keep re-buying the same hyper-volatile token all day
+            entry_cap = CONFIG.get("max_entries_per_token_day", 2)
+            if STATE.setdefault("entries_today", {}).get(symbol, 0) >= entry_cap:
+                _scout(symbol, chain, "rejected",
+                       f"already entered {entry_cap}x today (anti-churn on volatile token)", sc, addr)
+                continue
             if CONFIG["moonshot"]["mode"] == "enter":
                 usd = size_ticket_usd(chain)
                 if usd >= CONFIG["moonshot"]["min_ticket_usd"] and est_price_impact(usd, liq) <= CONFIG["moonshot"]["price_impact_max"]:
                     shadow_buy(symbol, chain, usd, price, liq, addr)
+                    STATE["entries_today"][symbol] = STATE["entries_today"].get(symbol, 0) + 1
                     log(f"ENTER {symbol} new launch ${usd:.2f} (presale score {ps})")
                     send_alert(
                         f"🚀 BOUGHT {symbol} ({chain}) — a new token that passed every safety filter "
