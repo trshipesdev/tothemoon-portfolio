@@ -12,3 +12,6 @@ Thumbs.db
 
 # Private hand-off docs (kept local, never published)
 HANDOFF-SETUP.md
+
+# Live runtime state (per-deploy, never versioned)
+data/state.json

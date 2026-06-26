@@ -300,6 +300,17 @@ class TestPairToCandidate(unittest.TestCase):
         p = self._pair(**{"txns": {"h1": {"buys": 70, "sells": 30}}})
         self.assertAlmostEqual(bot._pair_to_candidate(p, "sol")["buy_ratio"], 0.70)
 
+    def test_conviction_scales_size(self):
+        # strong setup (high hype + heavy buying) sizes bigger than a weak one
+        weak   = bot._conviction_mult(80, 0.46)
+        strong = bot._conviction_mult(100, 0.85)
+        self.assertGreater(strong, weak)
+        self.assertLessEqual(strong, 1.5)        # bounded so it can't blow past caps
+        self.assertGreaterEqual(weak, 0.8)
+
+    def test_conviction_none_is_neutral(self):
+        self.assertEqual(bot._conviction_mult(None, None), 1.0)
+
     def test_chain_passed_through(self):
         self.assertEqual(bot._pair_to_candidate(self._pair(), "base")["chain"], "base")
 
@@ -385,8 +396,9 @@ class TestMoonshotFilters(unittest.TestCase):
             self._sc(liq=bot.CONFIG["moonshot"]["liq_max"] + 1)))
 
     def test_fails_too_old(self):
-        self.assertFalse(bot.passes_moonshot_filters(
-            self._sc(age_min=bot.CONFIG["scan"]["new_max_age_min"] + 1)))
+        # age cap is now the active mode's max_age_min (default mode)
+        max_age = bot.CONFIG["modes"][bot.CONFIG["mode"]]["max_age_min"]
+        self.assertFalse(bot.passes_moonshot_filters(self._sc(age_min=max_age + 1)))
 
     def test_fails_not_positive(self):
         self.assertFalse(bot.passes_moonshot_filters(self._sc(positive=False)))
@@ -2006,7 +2018,8 @@ class TestScoutLog(unittest.TestCase):
         self.assertIn("liquidity", r)
 
     def test_reject_reason_age(self):
-        r = bot.moonshot_reject_reason(self._sc(age_min=bot.CONFIG["scan"]["new_max_age_min"] + 5))
+        max_age = bot.CONFIG["modes"][bot.CONFIG["mode"]]["max_age_min"]
+        r = bot.moonshot_reject_reason(self._sc(age_min=max_age + 5))
         self.assertIn("age", r)
 
     def test_reject_reason_negative_trend(self):
@@ -2553,7 +2566,8 @@ class TestEntryChurnCap(unittest.TestCase):
     def test_engine_respects_entry_cap(self, *mocks):
         _reset(1000.0)
         bot.CONFIG["moonshot"]["mode"] = "enter"
-        bot.CONFIG["max_entries_per_token_day"] = 1
+        # anti-churn cap is now per-mode (falls back to global) — set the active mode's
+        bot.CONFIG["modes"][bot.CONFIG["mode"]]["max_entries_per_token_day"] = 1
         bot.STATE["last_daily_reset"] = bot.now_utc().date().isoformat()  # don't trip the daily reset
         bot.STATE["entries_today"] = {"PUMP": 1}   # already at cap
         cand = [{"symbol": "PUMP", "chain": "sol", "price": 0.001, "liq": 50000,
@@ -2606,6 +2620,29 @@ class TestMoonBagLadder(unittest.TestCase):
         p = bot.STATE["positions"]["PUMP"]
         res = bot.shadow_sell("PUMP", p["usd"], 1.0, 1_000_000.0)  # deep exit
         self.assertGreater(res["sold"], 99.0, "deep pool → only the swap fee, no real impact")
+
+    def test_stall_exit_banks_flat_winner(self):
+        bot.CONFIG["mode"] = "degen"
+        bot.CONFIG["stall_exit"] = {"enabled": True, "min_gain": 0.20,
+                                    "stall_sec": 600, "give_back": 0.06}
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        avg = p["avg"]
+        self._tick(avg * 1.30)               # +30% → new peak
+        p["peak_ts"] = time.time() - 700      # pretend it's been flat 11+ min
+        self._tick(avg * 1.22)               # +22% gain, ~6% off the peak
+        self.assertEqual(p["units"], 0, "stalled winner should be banked, not round-tripped")
+
+    def test_stall_exit_disabled_holds(self):
+        bot.CONFIG["mode"] = "degen"
+        bot.CONFIG["stall_exit"] = {"enabled": False}
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        avg = p["avg"]
+        self._tick(avg * 1.30)
+        p["peak_ts"] = time.time() - 700
+        self._tick(avg * 1.25)
+        self.assertGreater(p["units"], 0, "disabled → no stall exit")
 
     def test_ladder_scalps_and_keeps_moonbag(self):
         bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 100000.0)

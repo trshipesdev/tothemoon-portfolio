@@ -81,10 +81,10 @@ CONFIG: Dict[str, Any] = {
     },
 
     "modes": {
-        "safe":    {"tp": [0.15],      "sl": 0.07, "slip_bps": 60,  "liq_min": 50000, "age_min": 30, "size_mult": 0.7},
-        "default": {"tp": [0.28],      "sl": 0.12, "slip_bps": 100, "liq_min": 30000, "age_min": 10, "size_mult": 1.0},
-        "hype":    {"tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000, "age_min": 5,  "size_mult": 1.3},
-        "degen":   {"tp": [0.80, 1.5], "sl": 0.28, "slip_bps": 220, "liq_min": 10000, "age_min": 0,  "size_mult": 1.6,
+        "safe":    {"tp": [0.15],      "sl": 0.07, "slip_bps": 60,  "liq_min": 50000, "max_age_min": 360, "max_entries_per_token_day": 2, "size_mult": 0.7},
+        "default": {"tp": [0.28],      "sl": 0.12, "slip_bps": 100, "liq_min": 30000, "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0},
+        "hype":    {"tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000, "max_age_min": 120, "max_entries_per_token_day": 4, "size_mult": 1.3},
+        "degen":   {"tp": [0.80, 1.5], "sl": 0.28, "slip_bps": 220, "liq_min": 10000, "max_age_min": 120, "max_entries_per_token_day": 6, "size_mult": 1.6,
                     "no_pump": {"hurdle": 0.03, "min_sec": 240, "max_sec": 900},
                     # Scalp-ladder + moon-bag: sell [fraction] of the original position at each
                     # [gain]. Fractions sum to 0.70 → the remaining 0.30 is the MOON BAG, which
@@ -168,6 +168,16 @@ CONFIG: Dict[str, Any] = {
             "skip_hard_exits": True,
             "max_per_day":    1,    # at most 1 re-entry attempt per token per day
         },
+    },
+
+    # Stall exit — bank a position that ran up then stopped climbing, instead of
+    # letting it round-trip to breakeven (the #1 reason the account gave back gains).
+    # Skips the moon bag, which is meant to ride. Tunable from the dashboard.
+    "stall_exit": {
+        "enabled":   True,
+        "min_gain":  0.20,   # only kicks in once up ≥ 20%
+        "stall_sec": 600,    # no new high for 10 min
+        "give_back": 0.06,   # and price has slipped ≥ 6% off the peak
     },
 
     "oldcoin": {
@@ -682,8 +692,10 @@ def moonshot_reject_reason(sc: Score) -> Optional[str]:
         return f"liquidity ${sc.liq:,.0f} below min ${liq_min:,.0f}"
     if sc.liq > ms["liq_max"]:
         return f"liquidity ${sc.liq:,.0f} above max ${ms['liq_max']:,.0f}"
-    if sc.age_min > CONFIG["scan"]["new_max_age_min"]:
-        return f"age {sc.age_min:.0f}m over {CONFIG['scan']['new_max_age_min']}m limit"
+    max_age = CONFIG["modes"].get(CONFIG["mode"], {}).get(
+        "max_age_min", CONFIG["scan"]["new_max_age_min"])
+    if sc.age_min > max_age:
+        return f"age {sc.age_min:.0f}m over {max_age:.0f}m limit"
     if not sc.positive:
         return "price trend is negative (24h)"
     if sc.hype < hype_min:
@@ -784,9 +796,23 @@ def per_token_cap_room() -> float:
     return CONFIG["per_token_cap_pct"] * deployable_now()
 
 
-def size_ticket_usd(chain: str) -> float:
+def _conviction_mult(hype: Optional[int], buy_ratio: Optional[float]) -> float:
+    """Scale ticket size by setup quality: stronger hype + buying pressure → bigger bet.
+    Bounded [0.8, 1.5] so it nudges, never blows past the risk caps."""
+    m = 1.0
+    if hype is not None:
+        m += max(0.0, (hype - 80) / 20.0) * 0.4   # hype 80→1.0, 100→1.4
+    if buy_ratio is not None:
+        if   buy_ratio >= 0.80: m += 0.15
+        elif buy_ratio >= 0.65: m += 0.07
+    return max(0.8, min(1.5, m))
+
+
+def size_ticket_usd(chain: str, hype: Optional[int] = None,
+                    buy_ratio: Optional[float] = None) -> float:
     base = CONFIG["base_size_usd"] * CONFIG["modes"][CONFIG["mode"]]["size_mult"]
     base *= objective_nudge()["size_mult"]
+    base *= _conviction_mult(hype, buy_ratio)   # bet more on the strongest setups
     if drawdown_brake_active():
         base *= CONFIG["drawdown_brake"]["size_mult"]
     boost = STATE.get("boost", {})
@@ -853,18 +879,49 @@ def _eth_gas_usd_live() -> Optional[float]:
     return gas_price_wei * SWAP_GAS_UNITS / 1e18 * eth_usd
 
 
+def _sol_gas_usd_live() -> Optional[float]:
+    """Live Solana swap cost in USD = (base + priority fee × CU) × SOL price.
+    Priority fees spike during launch congestion — exactly when the bot snipes a
+    fresh token — so a flat estimate understates the cost of the trades you most want."""
+    rpcs = CONFIG["rpc"].get("sol") or []
+    if not rpcs:
+        return None
+    try:
+        r = requests.post(rpcs[0], json={"jsonrpc": "2.0", "id": 1,
+                                         "method": "getRecentPrioritizationFees", "params": [[]]}, timeout=6)
+        fees = sorted(f.get("prioritizationFee", 0) for f in (r.json().get("result") or []))
+        if not fees:
+            return None
+        median_microlamports_per_cu = fees[len(fees) // 2]
+    except Exception:
+        return None
+    px = _get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd")
+    sol_usd = float((px or {}).get("solana", {}).get("usd") or 0)
+    if sol_usd <= 0:
+        return None
+    SWAP_CU, BASE_LAMPORTS = 200_000, 5_000
+    priority_lamports = median_microlamports_per_cu * SWAP_CU / 1e6
+    return (BASE_LAMPORTS + priority_lamports) / 1e9 * sol_usd
+
+
 def refresh_gas_estimates():
-    """Periodically refresh live gas (currently ETH — the costliest). Cached ~5 min."""
+    """Periodically refresh live gas (ETH + SOL — the ones with live feeds). Cached ~5 min."""
     if not (CONFIG.get("gas_sim", True) and CONFIG.get("gas_dynamic", True)):
         return
     cache = STATE.setdefault("gas_live", {})
     if time.time() - cache.get("ts", 0) < 300:
         return
+    updated = False
     eth = _eth_gas_usd_live()
     if eth and eth > 0:
-        cache["eth"] = round(eth, 4)
-        cache["ts"]  = time.time()
+        cache["eth"] = round(eth, 4); updated = True
         log(f"Live ETH gas: ${eth:.2f}/swap")
+    sol = _sol_gas_usd_live()
+    if sol and sol > 0:
+        cache["sol"] = round(sol, 4); updated = True
+        log(f"Live SOL gas: ${sol:.3f}/swap")
+    if updated:
+        cache["ts"] = time.time()
 
 
 def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float, address: str = "") -> Dict[str, Any]:
@@ -2956,14 +3013,16 @@ def scan_candidates():
                     f"from a likely scam/rug.\n{link}")
                 _scout(symbol, chain, "rejected", f"safety: {why}", sc, addr)
                 continue
-            # Anti-churn: don't keep re-buying the same hyper-volatile token all day
-            entry_cap = CONFIG.get("max_entries_per_token_day", 2)
+            # Anti-churn: don't keep re-buying the same hyper-volatile token all day.
+            # Per-mode cap (degen cycles the few liquid tokens faster) → global fallback.
+            entry_cap = CONFIG["modes"].get(CONFIG["mode"], {}).get(
+                "max_entries_per_token_day", CONFIG.get("max_entries_per_token_day", 4))
             if STATE.setdefault("entries_today", {}).get(symbol, 0) >= entry_cap:
                 _scout(symbol, chain, "rejected",
                        f"already entered {entry_cap}x today (anti-churn on volatile token)", sc, addr)
                 continue
             if CONFIG["moonshot"]["mode"] == "enter":
-                usd = size_ticket_usd(chain)
+                usd = size_ticket_usd(chain, hype=sc.hype, buy_ratio=sc.buy_ratio)
                 if usd >= CONFIG["moonshot"]["min_ticket_usd"] and est_price_impact(usd, liq) <= CONFIG["moonshot"]["price_impact_max"]:
                     shadow_buy(symbol, chain, usd, price, liq, addr)
                     STATE["entries_today"][symbol] = STATE["entries_today"].get(symbol, 0) + 1
@@ -3069,9 +3128,10 @@ def manage_positions():
         change_m5 = px["change_m5"]
         entry_ts  = datetime.fromisoformat(p.get("time", now_utc().isoformat())).timestamp()
 
-        # Track peak price
+        # Track peak price (+ when it was last set, for stall detection)
         if price > p.get("peak_price", 0):
             p["peak_price"] = price
+            p["peak_ts"]    = time.time()
         peak = p.get("peak_price", p["avg"])
 
         # Rolling liq history for drain detection
@@ -3126,6 +3186,16 @@ def manage_positions():
             pct = ((price / peak) - 1) * 100
             tag = "MOONBAG TRAIL" if in_moonbag else "TRAIL STOP"
             exit_reason = f"{tag} {pct:.1f}% from peak {peak:.6f}"
+
+        # 3b. Stall exit — up nicely but stopped climbing. This is the fix for the
+        #     account's core pain: winners that peaked then round-tripped to breakeven.
+        #     Skips the moon bag (which is meant to ride). Banks a stalled gain.
+        st = CONFIG.get("stall_exit", {})
+        if (exit_reason is None and st.get("enabled") and not in_moonbag
+                and gain_now >= st.get("min_gain", 0.20)
+                and (time.time() - p.get("peak_ts", entry_ts)) >= st.get("stall_sec", 600)
+                and price <= peak * (1 - st.get("give_back", 0.06))):
+            exit_reason = f"STALL +{gain_now*100:.0f}% then flat {st.get('stall_sec',600)//60}m — locking it in"
 
         # 4. Slow liq drain — consecutive ticks all declining
         if (exit_reason is None
