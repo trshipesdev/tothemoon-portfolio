@@ -2449,57 +2449,56 @@ def api_history():
         if t.get("side") == "sell" and t.get("pnl") is not None:
             running += t["pnl"]
         enriched.append({**t, "running_pnl": running})
-    # $100 runner simulation — replays every trade with a $100 starting vault.
-    # Bet sizes SCALE with the sim vault: each bet is the same % of vault as it
-    # was of the real vault at that time. Profits go straight back in — no holding.
-    # real_vault_start is the vault when the first buy happened.
-    _r_start       = 100.0
-    _r_vault       = _r_start
-    _r_min_cash    = _r_start   # lowest cash (could be fully deployed, not a loss)
-    _r_min_total   = _r_start   # lowest total assets (cash + open position value)
-    _r_max         = _r_start
-    _r_skipped     = 0
+    # $100 runner — replay every actual trade starting with $100.
+    # Same dollar bet sizes as the real run. Every sell's proceeds go straight
+    # back into the pool and fund the next bet — that's the compounding.
+    # As the sim vault grows past the original vault, bets scale up too.
+    _r_start     = 100.0
+    _r_vault     = _r_start
+    _r_min_cash  = _r_start
+    _r_min_total = _r_start
+    _r_max       = _r_start
+    _r_skipped   = 0
     _r_hist: List[Dict] = []
-    _r_open: Dict[str, float] = {}     # symbol -> sim cost basis
-    _r_open_real: Dict[str, float] = {} # symbol -> real cost basis (for scaling)
-    # Use STATE vault_start as the reference vault for scaling bets
-    _real_ref = STATE.get("vault_start") or 1000.0
+    _r_open: Dict[str, float] = {}   # symbol -> sim cost basis
+    _real_ref = max(STATE.get("vault_start") or 1000.0, 1.0)
     for t in trades:
         sym  = t.get("symbol", "")
         side = t.get("side")
         usd  = t.get("usd", 0) or 0
         pnl  = t.get("pnl", 0) or 0
         if side == "buy":
-            # Scale bet proportionally: if real vault was $1000 and bet was $40 (4%),
-            # sim vault at $200 means sim bet = $200 * 4% = $8. Profits compound into larger bets.
-            scale    = (_r_vault + sum(_r_open.values())) / _real_ref
-            sim_usd  = max(1.0, usd * scale)
+            # Fixed bet size while below original vault; scale up once above it.
+            # Below $1000: bet same $ as real run (more aggressive % — that's the punt).
+            # Above $1000: scale bet up with vault so wins keep compounding.
+            total_sim = _r_vault + sum(_r_open.values())
+            sim_usd   = usd if total_sim <= _real_ref else usd * (total_sim / _real_ref)
             if _r_vault >= sim_usd:
                 _r_vault -= sim_usd
-                _r_open[sym]      = _r_open.get(sym, 0) + sim_usd
-                _r_open_real[sym] = _r_open_real.get(sym, 0) + usd
+                _r_open[sym] = _r_open.get(sym, 0) + sim_usd
             else:
                 _r_skipped += 1
                 continue
         elif side == "sell":
             if sym not in _r_open:
-                continue   # was a skipped buy — skip the sell too
-            # Scale proceeds by same ratio as bet was scaled
-            real_cost = _r_open_real.get(sym, usd) or usd
-            scale     = _r_open.get(sym, sim_usd) / max(real_cost, 1e-9)
-            sim_proceeds = usd * scale
-            _r_vault += sim_proceeds
-            _r_open[sym]      = max(0.0, _r_open.get(sym, 0) - (sim_proceeds - pnl * scale))
-            _r_open_real[sym] = max(0.0, _r_open_real.get(sym, 0) - (usd - pnl))
-            if _r_open.get(sym, 0) <= 0:
+                continue
+            # Return proceeds scaled by how much sim cost vs real cost
+            sim_cost  = _r_open.get(sym, usd)
+            cost_real = usd - pnl   # original cost portion of this sell
+            scale     = sim_cost / max(cost_real, 1e-9) if cost_real > 0 else 1.0
+            sim_proc  = usd * min(scale, _real_ref)   # cap scale so we don't explode
+            _r_vault += sim_proc
+            remaining = max(0.0, _r_open.get(sym, 0) - sim_cost)
+            if remaining <= 0:
                 _r_open.pop(sym, None)
-                _r_open_real.pop(sym, None)
+            else:
+                _r_open[sym] = remaining
         _r_vault     = max(0.0, _r_vault)
-        _total_assets = _r_vault + sum(_r_open.values())
+        _total       = _r_vault + sum(_r_open.values())
         _r_min_cash  = min(_r_min_cash, _r_vault)
-        _r_min_total = min(_r_min_total, _total_assets)
-        _r_max       = max(_r_max, _total_assets)
-        _r_hist.append({"ts": t.get("ts", ""), "vault": round(_total_assets, 2)})
+        _r_min_total = min(_r_min_total, _total)
+        _r_max       = max(_r_max, _total)
+        _r_hist.append({"ts": t.get("ts", ""), "vault": round(_total, 2)})
 
     return jsonify({
         "trades":    enriched,
