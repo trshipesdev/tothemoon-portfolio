@@ -357,6 +357,38 @@
 
     <!-- HISTORY -->
     <div x-show="tab === 'History'">
+      <!-- Today vs All-time P&L breakdown -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+        <div class="bg-gray-900 rounded-xl p-4 border border-gray-800">
+          <div class="text-gray-400 text-xs uppercase tracking-wider mb-2">📅 Today (realized)</div>
+          <div class="flex items-end justify-between">
+            <div>
+              <div class="text-green-400 text-sm" x-text="'Gained  +$' + fmt(todayPnl.gained) + '  (' + todayPnl.wins + ' wins)'"></div>
+              <div class="text-red-400 text-sm" x-text="'Lost    -$' + fmt(Math.abs(todayPnl.lost)) + '  (' + todayPnl.losses + ' losses)'"></div>
+            </div>
+            <div class="text-right">
+              <div class="text-gray-500 text-xs">Net today</div>
+              <div :class="todayPnl.net >= 0 ? 'text-green-400' : 'text-red-400'" class="text-2xl font-bold"
+                   x-text="(todayPnl.net >= 0 ? '+$' : '-$') + fmt(Math.abs(todayPnl.net))"></div>
+            </div>
+          </div>
+        </div>
+        <div class="bg-gray-900 rounded-xl p-4 border border-gray-800">
+          <div class="text-gray-400 text-xs uppercase tracking-wider mb-2">🗓️ All-time (realized)</div>
+          <div class="flex items-end justify-between">
+            <div>
+              <div class="text-green-400 text-sm" x-text="'Gained  +$' + fmt(allTimePnl.gained) + '  (' + allTimePnl.wins + ' wins)'"></div>
+              <div class="text-red-400 text-sm" x-text="'Lost    -$' + fmt(Math.abs(allTimePnl.lost)) + '  (' + allTimePnl.losses + ' losses)'"></div>
+            </div>
+            <div class="text-right">
+              <div class="text-gray-500 text-xs">Net total</div>
+              <div :class="allTimePnl.net >= 0 ? 'text-green-400' : 'text-red-400'" class="text-2xl font-bold"
+                   x-text="(allTimePnl.net >= 0 ? '+$' : '-$') + fmt(Math.abs(allTimePnl.net))"></div>
+            </div>
+          </div>
+          <div class="text-gray-600 text-xs mt-1" x-text="'+ open positions: ' + (total_pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(total_pnl)) + ' unrealized'"></div>
+        </div>
+      </div>
       <div class="mb-4 bg-gray-900 rounded-xl p-4">
         <canvas id="pnlChart" height="100"></canvas>
       </div>
@@ -847,6 +879,24 @@ function app() {
     get filteredScout() {
       return this.scoutFilter === 'all' ? this.scout : this.scout.filter(e => e.decision === this.scoutFilter);
     },
+    // Realized P&L broken into gained / lost / net, for a date window
+    _pnlBreakdown(sells) {
+      const gained = sells.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0);
+      const lost   = sells.filter(t => t.pnl <= 0).reduce((s, t) => s + t.pnl, 0);
+      return {
+        gained, lost, net: gained + lost,
+        wins: sells.filter(t => t.pnl > 0).length,
+        losses: sells.filter(t => t.pnl <= 0).length,
+      };
+    },
+    get _allSells() {
+      return (this.history.trades || []).filter(t => t.side === 'sell' && t.pnl != null);
+    },
+    get todayPnl() {
+      const today = new Date().toDateString();
+      return this._pnlBreakdown(this._allSells.filter(t => new Date(t.ts).toDateString() === today));
+    },
+    get allTimePnl() { return this._pnlBreakdown(this._allSells); },
 
     // ── Init ──
     async init() {

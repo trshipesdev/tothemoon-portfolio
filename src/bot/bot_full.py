@@ -90,11 +90,16 @@ CONFIG: Dict[str, Any] = {
         },
     },
 
-    "base_size_usd":        50.0,
+    # Tuned from live data: the bot was finding 100+ good tokens/day but the $148
+    # daily budget (20%) ran out after ~9 trades, forcing the rest to "suggested"
+    # (found-but-not-bought). With a positive edge (75% win, wins > losses), smaller
+    # tickets + a bigger daily budget capture more of that edge. Drawdown brake still
+    # protects the downside. Tunable — re-evaluate each analysis.
+    "base_size_usd":        30.0,   # was 50 — smaller bets spread across more tokens
     "reserve_pct":          0.25,   # keep 25% of vault untouched
     "per_token_cap_pct":    0.12,   # max 12% of deployable per token
     "per_chain_cap_pct":    {"sol": 0.40, "eth": 0.35, "base": 0.25, "bsc": 0.30, "poly": 0.25},
-    "daily_deploy_cap_pct": 0.20,   # max new deployment per 24h
+    "daily_deploy_cap_pct": 0.40,   # was 0.20 — more daily budget to act on the opportunity flow
     "drawdown_brake":       {"lookback": 30, "dd": 0.25, "size_mult": 0.60},
 
     "vaults": {"hot_native_pct": 0.75, "hot_usdc_pct": 0.25},
@@ -2832,11 +2837,11 @@ def engine_once():
                         f"Plan: take profit as it climbs, auto-sell if it drops.\n{link}")
                     _scout(symbol, chain, "entered", f"passed filters, ps {ps}, sized ${usd:.0f}", sc, addr)
                 else:
+                    # "Suggested" = passed every filter but no daily budget / too thin to size.
+                    # Not actionable, and there can be 100+/day — log to the Scout tab but
+                    # don't spam Telegram. Raising the daily cap converts these into buys.
                     log(f"SUGGEST {symbol} new launch (caps/impact)")
-                    send_alert(
-                        f"👀 SPOTTED {symbol} ({chain}) — a promising new launch, but buying it would "
-                        f"exceed your safety caps on position size, so the bot is only watching.\n{link}")
-                    _scout(symbol, chain, "suggested", f"passed filters but blocked by caps/price-impact (ps {ps})", sc, addr)
+                    _scout(symbol, chain, "suggested", f"passed filters but blocked by caps/budget (ps {ps})", sc, addr)
             else:
                 log(f"SUGGEST {symbol} new launch (mode=suggest) [ps:{ps}]")
                 send_alert(
