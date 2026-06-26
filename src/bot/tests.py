@@ -2633,6 +2633,27 @@ class TestMoonBagLadder(unittest.TestCase):
         bot.CONFIG["mode"] = "safe"
         self.assertEqual(bot.STATE["positions"]["PUMP"]["entry_mode"], "degen")
 
+    def test_closed_position_is_purged(self):
+        # a fully-sold position must be removed from the dict, not left as a $0 shell
+        # (the shell was counting against max_open_positions and jamming the bot)
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)
+        self.assertIn("PUMP", bot.STATE["positions"])
+        p = bot.STATE["positions"]["PUMP"]
+        bot.shadow_sell("PUMP", p["usd"], 1.2, 1_000_000.0)   # full close
+        self.assertNotIn("PUMP", bot.STATE["positions"])
+
+    def test_partial_sell_keeps_position(self):
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)
+        p = bot.STATE["positions"]["PUMP"]
+        bot.shadow_sell("PUMP", p["usd"] * 0.5, 1.2, 1_000_000.0)   # half
+        self.assertIn("PUMP", bot.STATE["positions"])
+        self.assertGreater(bot.STATE["positions"]["PUMP"]["units"], 0)
+
+    def test_trade_log_records_mode(self):
+        bot.CONFIG["mode"] = "degen"
+        bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)
+        self.assertEqual(bot.STATE["trade_log"][-1]["mode"], "degen")
+
     def test_mode_perf_attributed_to_entry_mode(self):
         bot.CONFIG["gas_sim"] = False
         bot.CONFIG["mode"] = "degen"

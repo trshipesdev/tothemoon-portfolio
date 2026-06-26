@@ -395,6 +395,10 @@ def load_state():
         STATE.setdefault("gas_paid_usd",  0.0)
         STATE.setdefault("scout_log",     [])
         STATE.setdefault("entries_today", {})
+        # Drop any fully-closed position shells (units<=0) left from before the purge
+        # fix — otherwise they keep counting against the max-open-positions cap.
+        STATE["positions"] = {s: p for s, p in STATE.get("positions", {}).items()
+                              if p.get("units", 0) > 0}
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -1031,6 +1035,7 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
         "side": "buy", "usd": usd, "price": filled_price, "units": units, "gas": gas,
         "address": pos.get("address", ""), "pnl": None,
+        "mode": pos.get("entry_mode", CONFIG.get("mode")),
     })
     return {"price": filled_price, "units": units}
 
@@ -1084,7 +1089,13 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "?"),
         "side": "sell", "usd": proceeds, "price": price, "units": units, "gas": gas,
         "address": pos.get("address", ""), "pnl": pnl,
+        "mode": pos.get("entry_mode", CONFIG.get("mode")),
     })
+    # Purge a fully-closed position so its empty shell doesn't linger in the
+    # positions dict and count against the max-open-positions cap (which had jammed
+    # the bot at 12 phantom "positions", blocking every new entry).
+    if pos.get("units", 0) <= 0:
+        STATE["positions"].pop(symbol, None)
     return {"sold": proceeds, "pnl": pnl}
 
 
@@ -3081,8 +3092,10 @@ def scan_candidates():
             continue
         # Correlation guardrail — don't pile into too many positions at once (memecoins
         # dump together in a market-wide flush). Only blocks NEW symbols, not adds.
+        # Count only LIVE positions (units>0) — closed shells must not jam the cap.
+        open_count = sum(1 for q in STATE["positions"].values() if q.get("units", 0) > 0)
         if (symbol not in STATE["positions"]
-                and len(STATE["positions"]) >= CONFIG.get("max_open_positions", 12)):
+                and open_count >= CONFIG.get("max_open_positions", 12)):
             _scout(symbol, chain, "rejected",
                    f"at max open positions ({CONFIG.get('max_open_positions', 12)})", sc, addr)
             continue

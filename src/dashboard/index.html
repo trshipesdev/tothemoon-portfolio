@@ -510,6 +510,7 @@
             <th class="text-left py-2 pr-3 font-normal">Time</th>
             <th class="text-left py-2 pr-3 font-normal">Symbol</th>
             <th class="text-left py-2 pr-3 font-normal">Side</th>
+            <th class="text-left py-2 pr-3 font-normal">Mode</th>
             <th class="text-right py-2 pr-3 font-normal">$ In / Out</th>
             <th class="text-right py-2 pr-3 font-normal">Gas</th>
             <th class="text-right py-2 pr-3 font-normal">PnL</th>
@@ -518,7 +519,7 @@
         </thead>
         <tbody>
           <template x-if="!(history.trades?.length)">
-            <tr><td colspan="7" class="py-12 text-center text-gray-700">No trades yet</td></tr>
+            <tr><td colspan="8" class="py-12 text-center text-gray-700">No trades yet</td></tr>
           </template>
           <template x-for="t in (history.trades ?? []).slice().reverse().slice(0, 100)" :key="t.ts + t.symbol">
             <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
@@ -530,6 +531,12 @@
               </td>
               <td :class="t.side === 'buy' ? 'text-blue-400' : 'text-orange-400'"
                   class="py-1.5 pr-3 uppercase font-bold" x-text="t.side"></td>
+              <td class="py-1.5 pr-3">
+                <span x-show="t.mode" class="px-1.5 py-0.5 rounded text-xs"
+                      :class="{'bg-emerald-900 text-emerald-300': t.mode==='safe','bg-sky-900 text-sky-300': t.mode==='default','bg-amber-900 text-amber-300': t.mode==='hype','bg-rose-900 text-rose-300': t.mode==='degen'}"
+                      x-text="t.mode"></span>
+                <span x-show="!t.mode" class="text-gray-700">—</span>
+              </td>
               <td class="py-1.5 pr-3 text-right"
                   :class="t.side === 'buy' ? 'text-red-300' : 'text-green-300'"
                   x-text="(t.side === 'buy' ? '−$' : '+$') + fmt(t.usd)"
