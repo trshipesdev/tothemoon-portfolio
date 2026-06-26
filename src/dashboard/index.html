@@ -124,6 +124,35 @@
         </div>
       </div>
 
+      <!-- Capital actually at risk — the REAL money on the table, not future money -->
+      <div class="bg-gray-900 rounded-xl p-4 mb-5">
+        <div class="text-amber-400 text-xs uppercase tracking-wider mb-1">💵 Money actually on the table</div>
+        <div class="text-gray-600 text-xs mb-3">how much was really at risk at once — not your whole vault, just what was deployed</div>
+        <div class="grid grid-cols-2 gap-3 text-center">
+          <div class="bg-gray-800 rounded-lg p-3">
+            <div class="text-gray-500 text-xs mb-1">On the table right now</div>
+            <div class="font-bold" x-text="'$' + fmt(state.cur_deployed_usd ?? 0)"></div>
+          </div>
+          <div class="bg-gray-800 rounded-lg p-3">
+            <div class="text-gray-500 text-xs mb-1">Peak at once (today)</div>
+            <div class="font-bold text-amber-300" x-text="'$' + fmt(state.peak_deployed_usd ?? 0)"></div>
+          </div>
+          <div class="bg-gray-800 rounded-lg p-3">
+            <div class="text-gray-500 text-xs mb-1">Positions at once</div>
+            <div class="font-bold" x-text="(state.peak_open_count ?? 0) + ' / ' + (state.config?.max_open_positions ?? 12) + ' max'"></div>
+          </div>
+          <div class="bg-gray-800 rounded-lg p-3">
+            <div class="text-gray-500 text-xs mb-1">Starting bet · base bet</div>
+            <div class="font-bold" x-text="'$' + fmt(state.first_bet_usd ?? 0) + ' · $' + fmt(state.config?.base_size_usd ?? 0)"></div>
+          </div>
+        </div>
+        <div class="text-gray-500 text-xs mt-3" x-show="(state.peak_deployed_usd ?? 0) > 0">
+          💡 You could have run this with about
+          <span class="text-amber-300 font-bold" x-text="'$' + fmt((state.peak_deployed_usd ?? 0) * 1.34)"></span>
+          in the bank (peak on the table + 25% reserve). Everything above that was never actually at risk at once.
+        </div>
+      </div>
+
       <!-- your assets -->
       <h2 class="font-bold text-gray-300 mb-2 px-1">Your assets</h2>
       <div class="space-y-2">

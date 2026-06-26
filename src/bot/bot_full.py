@@ -1031,6 +1031,16 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
     STATE["vault_usd"]      -= (usd + gas)
     STATE["open_today_usd"] += usd
     STATE["gas_paid_usd"]    = STATE.get("gas_paid_usd", 0.0) + gas
+    # Capital-at-risk tracking — the REAL money on the table, not future money.
+    # peak_deployed = the most $ ever simultaneously in open positions (≈ the smallest
+    # bankroll that could have run this). peak_open = most positions held at once.
+    live = [q for q in STATE["positions"].values() if q.get("units", 0) > 0]
+    cur_deployed = sum(q.get("usd", 0.0) for q in live)
+    STATE["cur_deployed_usd"]  = cur_deployed
+    STATE["peak_deployed_usd"] = max(STATE.get("peak_deployed_usd", 0.0), cur_deployed)
+    STATE["peak_open_count"]   = max(STATE.get("peak_open_count", 0), len(live))
+    if "first_bet_usd" not in STATE:
+        STATE["first_bet_usd"] = usd   # the "starting roller" — size of the very first bet
     STATE.setdefault("trade_log", []).append({
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
         "side": "buy", "usd": usd, "price": filled_price, "units": units, "gas": gas,
@@ -2229,6 +2239,7 @@ def api_state():
             "stall_exit":  CONFIG.get("stall_exit", {}),
             "buy_ratio_min": CONFIG["moonshot"].get("buy_ratio_min", 0.45),
             "max_open_positions": CONFIG.get("max_open_positions", 12),
+            "base_size_usd": CONFIG.get("base_size_usd", 30.0),
             "blacklist":   CONFIG.get("blacklist", []),
         },
         "ai_key_set":      bool(os.getenv(ANTHROPIC_KEY_ENV)),
@@ -3062,9 +3073,11 @@ def scan_candidates():
     if STATE.get("last_daily_reset") != today:
         STATE["open_today_usd"]  = 0.0
         STATE["entries_today"]   = {}
+        STATE["peak_deployed_usd"] = 0.0   # reset the "most on the table at once" for the new day
+        STATE["peak_open_count"]   = 0
         STATE["last_daily_reset"] = today
         save_state()
-        log("Daily reset: open_today_usd → 0, entries_today cleared")
+        log("Daily reset: open_today_usd → 0, entries_today cleared, capital peaks reset")
 
     btc_d                     = fetch_btc_dominance()
     STATE["signals"]["btc_d"] = btc_d

@@ -2654,6 +2654,19 @@ class TestMoonBagLadder(unittest.TestCase):
         bot.shadow_buy("PUMP", "sol", 100.0, 1.0, 1_000_000.0)
         self.assertEqual(bot.STATE["trade_log"][-1]["mode"], "degen")
 
+    def test_capital_at_risk_tracking(self):
+        bot.STATE.pop("first_bet_usd", None)
+        bot.STATE["peak_deployed_usd"] = 0.0
+        bot.shadow_buy("A", "sol", 30.0, 1.0, 1_000_000.0)
+        bot.shadow_buy("B", "sol", 40.0, 1.0, 1_000_000.0)   # two open at once → $70 on the table
+        self.assertEqual(bot.STATE["first_bet_usd"], 30.0)      # starting roller
+        self.assertAlmostEqual(bot.STATE["peak_deployed_usd"], 70.0, places=2)
+        self.assertEqual(bot.STATE["peak_open_count"], 2)
+        # closing one must NOT lower the recorded peak
+        bot.shadow_sell("B", bot.STATE["positions"]["B"]["usd"], 1.0, 1_000_000.0)
+        bot.shadow_buy("C", "sol", 10.0, 1.0, 1_000_000.0)
+        self.assertAlmostEqual(bot.STATE["peak_deployed_usd"], 70.0, places=2)
+
     def test_mode_perf_attributed_to_entry_mode(self):
         bot.CONFIG["gas_sim"] = False
         bot.CONFIG["mode"] = "degen"
