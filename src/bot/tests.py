@@ -2766,6 +2766,23 @@ class TestBacktest(unittest.TestCase):
         bt.replay_episode("PUMP", "sol", "0xpump", ticks, "hype")
         self.assertIs(bot.STATE, before, "replay must not leak its isolated STATE")
 
+    def test_timeframe_scales_to_a_week(self):
+        # ≤3 days → 5-min; a week → coarser candles so it fits the 1000-candle cap
+        self.assertEqual(bt._timeframe_for(2)[1], 5)
+        self.assertEqual(bt._timeframe_for(7)[1], 15)
+        self.assertEqual(bt._timeframe_for(30)[0], "hour")
+
+    def test_fetch_universe_parses_trending(self):
+        gt = {"data": [{
+            "attributes": {"address": "poolA", "name": "WIF / SOL"},
+            "relationships": {"base_token": {"data": {"id": "solana_TOKENADDR"}}},
+        }]}
+        with patch.object(bt, "_gt_get", return_value=gt), \
+             patch.object(bt._real_time, "sleep"), \
+             patch.object(bot, "_get", return_value=[]):
+            u = bt.fetch_universe(limit=5, chains=["sol"])
+        self.assertTrue(any(t[2] == "TOKENADDR" and t[3] == "poolA" for t in u))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

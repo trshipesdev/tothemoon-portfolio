@@ -13,9 +13,14 @@ size_ticket_usd, the moonshot filter) by driving them with a simulated clock and
 mocked price feed, so the backtest behaves exactly like the live bot.
 
 Usage (from the repo root):
-    python src/bot/backtest.py --days 3                  # tokens from the live trade log
-    python src/bot/backtest.py --days 3 --modes degen,hype
+    python src/bot/backtest.py                            # last 7 days, fresh scanner universe
+    python src/bot/backtest.py --days 7 --limit 50 --verbose
+    python src/bot/backtest.py --source tradelog --days 3   # only tokens the bot traded
     python src/bot/backtest.py --tokens sol:So111...,eth:0xabc --days 2
+
+By default it pulls a fresh trending token UNIVERSE from the online scanners
+(GeckoTerminal trending pools + DexScreener boosts), grabs each one's real price
+history, and fast-forwards the whole week through every mode in seconds (a sim).
 
 Honest caveats (printed in the report too):
   • Entry is at the START of the fetched window, not the exact live trending-feed
@@ -67,6 +72,10 @@ except ImportError:                   # as `python src/bot/backtest.py`
 GT_NET = {"sol": "solana", "eth": "eth", "base": "base", "bsc": "bsc", "polygon": "polygon_pos"}
 GT_BASE = "https://api.geckoterminal.com/api/v2"
 
+# pool_addr → reserve_in_usd, populated by fetch_universe so fetch_history doesn't
+# have to re-fetch the pool just to learn its liquidity.
+_POOL_LIQ: Dict[str, float] = {}
+
 
 # ── Simulated clock ────────────────────────────────────────────────────────────
 class _Clock:
@@ -95,21 +104,44 @@ def _gt_get(path: str) -> Optional[dict]:
         return None
 
 
-def fetch_history(chain: str, address: str, days: int) -> List[Dict[str, float]]:
+def _timeframe_for(days: int) -> Tuple[str, int, float]:
+    """Pick a candle size that covers `days` within GeckoTerminal's 1000-candle cap.
+    Returns (timeframe, aggregate, vol_to_hourly_factor)."""
+    if days <= 3:   return ("minute", 5,  12.0)   # 5-min  → 3.5 days max
+    if days <= 7:   return ("minute", 15, 4.0)    # 15-min → 10 days max
+    return ("hour", 1, 1.0)                        # hourly → weeks
+
+
+def fetch_history(chain: str, address: str, days: int,
+                  pool_addr: str = "") -> List[Dict[str, float]]:
     """Return a list of {ts, price, liq, vol_h1} candles (oldest→newest) for a token.
-    Uses the token's top pool. 5-minute candles for intraday detail."""
+    Candle size auto-scales so a full week fits. Pass pool_addr to skip the pool lookup."""
     net = GT_NET.get(chain)
     if not net or not address:
         return []
-    pools = _gt_get(f"/networks/{net}/tokens/{address}/pools")
-    try:
-        pool_addr = (pools["data"][0]["attributes"]["address"])
-        pool_liq  = float(pools["data"][0]["attributes"].get("reserve_in_usd") or 0)
-    except Exception:
-        return []
-    limit = min(1000, max(1, days) * 288)   # 288 five-min candles/day
-    ohlcv = _gt_get(f"/networks/{net}/pools/{pool_addr}/ohlcv/minute"
-                    f"?aggregate=5&limit={limit}&currency=usd")
+    pool_liq = 0.0
+    if not pool_addr:
+        pools = _gt_get(f"/networks/{net}/tokens/{address}/pools")
+        try:
+            pool_addr = pools["data"][0]["attributes"]["address"]
+            pool_liq  = float(pools["data"][0]["attributes"].get("reserve_in_usd") or 0)
+        except Exception:
+            return []
+    else:
+        # pool address came from the universe — use its cached liquidity (the filter
+        # needs it, otherwise liq=0 rejects every token). Fall back to a pool fetch.
+        pool_liq = _POOL_LIQ.get(pool_addr, 0.0)
+        if pool_liq <= 0:
+            p = _gt_get(f"/networks/{net}/pools/{pool_addr}")
+            try:
+                pool_liq = float(p["data"]["attributes"].get("reserve_in_usd") or 0)
+            except Exception:
+                pool_liq = 0.0
+    tf, agg, vol_factor = _timeframe_for(days)
+    per_day = 1440 / (agg if tf == "minute" else agg * 60)
+    limit = min(1000, int(max(1, days) * per_day) + 1)
+    ohlcv = _gt_get(f"/networks/{net}/pools/{pool_addr}/ohlcv/{tf}"
+                    f"?aggregate={agg}&limit={limit}&currency=usd")
     try:
         rows = ohlcv["data"]["attributes"]["ohlcv_list"]
     except Exception:
@@ -117,9 +149,61 @@ def fetch_history(chain: str, address: str, days: int) -> List[Dict[str, float]]
     out: List[Dict[str, float]] = []
     for ts, _o, _h, _l, close, vol in rows:
         out.append({"ts": float(ts), "price": float(close),
-                    "liq": pool_liq, "vol_h1": float(vol or 0) * 12.0})  # 5-min vol → ~hourly
+                    "liq": pool_liq, "vol_h1": float(vol or 0) * vol_factor})
     out.sort(key=lambda r: r["ts"])
     return out
+
+
+def fetch_universe(limit: int = 30, chains: Optional[List[str]] = None
+                   ) -> List[Tuple[str, str, str, str]]:
+    """Pull a broad token universe from the online scanners — GeckoTerminal trending
+    pools (across chains) + DexScreener boosts — so the backtest isn't limited to what
+    the bot already traded. Returns (symbol, chain, token_addr, pool_addr)."""
+    chains = chains or ["sol", "eth", "base", "bsc"]
+    out: List[Tuple[str, str, str, str]] = []
+    seen = set()
+
+    # GeckoTerminal trending pools — gives base token + pool address directly
+    rev_net = {v: k for k, v in GT_NET.items()}
+    for chain in chains:
+        net = GT_NET.get(chain)
+        if not net:
+            continue
+        data = _gt_get(f"/networks/{net}/trending_pools?duration=24h")
+        for pool in (data or {}).get("data", []) or []:
+            try:
+                attr = pool["attributes"]
+                pool_addr = attr["address"]
+                tok = pool["relationships"]["base_token"]["data"]["id"]   # "net_addr"
+                token_addr = tok.split("_", 1)[1]
+                sym = (attr.get("name", "") or "").split("/")[0].strip()[:12] or token_addr[:6]
+            except Exception:
+                continue
+            key = (token_addr, chain)
+            if key in seen:
+                continue
+            seen.add(key)
+            _POOL_LIQ[pool_addr] = float(attr.get("reserve_in_usd") or 0)   # cache liq
+            out.append((sym, chain, token_addr, pool_addr))
+        _real_time.sleep(2.2)   # GeckoTerminal free rate limit
+
+    # DexScreener boosts — currently-promoted tokens (pool resolved later by fetch_history)
+    boosts = _gt_get  # noqa — kept import-light; use bot's DexScreener helper instead
+    try:
+        ds = bot._get(bot.DEXSCREENER_BOOSTS) or []
+        for item in ds:
+            chain_id = item.get("chainId", "")
+            chain = {"solana": "sol", "ethereum": "eth", "base": "base",
+                     "bsc": "bsc"}.get(chain_id)
+            addr = item.get("tokenAddress", "")
+            if not chain or not addr or (addr, chain) in seen:
+                continue
+            seen.add((addr, chain))
+            out.append((addr[:6].upper(), chain, addr, ""))   # pool resolved on fetch
+    except Exception:
+        pass
+
+    return out[:limit]
 
 
 # ── Replay one token under one mode ─────────────────────────────────────────────
@@ -210,8 +294,8 @@ def _fresh_state(vault: float) -> Dict[str, Any]:
 
 
 # ── Drive the whole backtest ────────────────────────────────────────────────────
-def tokens_from_trade_log(days: int) -> List[Tuple[str, str, str]]:
-    """Distinct (symbol, chain, address) the live bot bought in the last `days`."""
+def tokens_from_trade_log(days: int) -> List[Tuple[str, str, str, str]]:
+    """Distinct (symbol, chain, token_addr, pool_addr) the live bot bought in `days`."""
     cutoff = bot.now_utc().timestamp() - days * 86400
     seen, out = set(), []
     for t in bot.STATE.get("trade_log", []):
@@ -227,42 +311,54 @@ def tokens_from_trade_log(days: int) -> List[Tuple[str, str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        out.append((t["symbol"], t.get("chain", "sol"), t["address"]))
+        out.append((t["symbol"], t.get("chain", "sol"), t["address"], ""))
     return out
 
 
 def run(modes: List[str], days: int,
-        tokens: Optional[List[Tuple[str, str, str]]] = None) -> Dict[str, Dict[str, Any]]:
+        tokens: Optional[List[Tuple[str, str, str, str]]] = None,
+        verbose: bool = False) -> Dict[str, Dict[str, Any]]:
     if tokens is None:
         tokens = tokens_from_trade_log(days)
     if not tokens:
-        print("No tokens to backtest — pass --tokens or run the bot first to build a trade log.")
+        print("No tokens to backtest — pass --tokens, use --source scanner, or run the bot first.")
         return {}
 
-    print(f"Fetching {len(tokens)} token histories from GeckoTerminal "
-          f"(real {days}-day price paths)…")
+    print(f"Fetching {len(tokens)} token histories (real {days}-day price paths)…")
     histories: Dict[Tuple[str, str, str], List[Dict[str, float]]] = {}
-    for sym, chain, addr in tokens:
-        h = fetch_history(chain, addr, days)
+    for sym, chain, addr, pool in tokens:
+        h = fetch_history(chain, addr, days, pool_addr=pool)
         if h:
             histories[(sym, chain, addr)] = h
         print(f"  {sym:<12} {chain:<6} {len(h):>4} candles")
         _real_time.sleep(2.2)   # respect GeckoTerminal's free rate limit
 
+    # ── Replay (this is the fast 'sim': a whole week crunches in seconds) ──
+    t0 = _real_time.time()
     agg: Dict[str, Dict[str, Any]] = {
         m: {"pnl": 0.0, "wins": 0, "trades": 0, "peak": 0.0} for m in modes}
+    candle_count = 0
     for (sym, chain, addr), h in histories.items():
+        candle_count += len(h)
+        row = []
         for m in modes:
             r = replay_episode(sym, chain, addr, h, m)
             if not r:
+                row.append(f"{m}: —")
                 continue
             a = agg[m]
             a["pnl"]    += r["pnl"]
             a["trades"] += 1
             a["wins"]   += 1 if r["win"] else 0
             a["peak"]    = max(a["peak"], r["peak_gain_pct"])
+            row.append(f"{m}: {'+' if r['pnl']>=0 else ''}{r['pnl']:.1f} (pk +{r['peak_gain_pct']:.0f}%)")
+        if verbose:
+            print(f"  ▸ {sym:<12} " + "  ".join(row))
+    sim_sec = _real_time.time() - t0
+    print(f"\nSimulated {candle_count:,} candles × {len(modes)} modes in {sim_sec:.2f}s "
+          f"({int(candle_count*len(modes)/max(sim_sec,1e-3)):,} candle-runs/sec).")
 
-    print("\n" + "=" * 64)
+    print("=" * 64)
     print(f"BACKTEST — {len(histories)} tokens, {days}-day real price paths")
     print("=" * 64)
     print(f"{'MODE':<9}{'P&L':>12}{'TRADES':>9}{'WIN%':>8}{'BEST PEAK':>12}")
@@ -282,10 +378,14 @@ def run(modes: List[str], days: int,
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    ap = argparse.ArgumentParser(description="Replay the past days through the bot's real strategy")
-    ap.add_argument("--days", type=int, default=3)
+    ap = argparse.ArgumentParser(description="Replay the past week through the bot's real strategy")
+    ap.add_argument("--days", type=int, default=7, help="how many days of history (default 7)")
     ap.add_argument("--modes", default="safe,default,hype,degen")
-    ap.add_argument("--tokens", default="", help="comma list of chain:address (overrides trade log)")
+    ap.add_argument("--source", choices=["scanner", "tradelog"], default="scanner",
+                    help="scanner = pull a fresh trending universe; tradelog = tokens the bot traded")
+    ap.add_argument("--limit", type=int, default=30, help="max tokens to pull (scanner source)")
+    ap.add_argument("--tokens", default="", help="comma list of chain:address (overrides --source)")
+    ap.add_argument("--verbose", action="store_true", help="print each token's per-mode result")
     args = ap.parse_args(argv)
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -294,10 +394,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         tokens = []
         for item in args.tokens.split(","):
             chain, _, addr = item.partition(":")
-            tokens.append((addr[:6].upper(), chain.strip(), addr.strip()))
+            tokens.append((addr[:6].upper(), chain.strip(), addr.strip(), ""))
+    elif args.source == "scanner":
+        print(f"Pulling a {args.limit}-token trending universe from the online scanners…")
+        tokens = fetch_universe(limit=args.limit)
     else:
         bot.load_state()   # so tokens_from_trade_log sees the live history
-    run(modes, args.days, tokens)
+    run(modes, args.days, tokens, verbose=args.verbose)
 
 
 if __name__ == "__main__":
