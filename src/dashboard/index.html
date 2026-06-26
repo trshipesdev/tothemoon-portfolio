@@ -661,6 +661,7 @@
             <th @click="sortBy('symbol')" class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Symbol <span x-show="histSort==='symbol'" x-text="histDir==='asc'?'▲':'▼'"></span></th>
             <th @click="sortBy('side')"   class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Side <span x-show="histSort==='side'"   x-text="histDir==='asc'?'▲':'▼'"></span></th>
             <th @click="sortBy('mode')"   class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Mode <span x-show="histSort==='mode'"   x-text="histDir==='asc'?'▲':'▼'"></span></th>
+            <th @click="sortBy('chain')"  class="text-left py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Chain <span x-show="histSort==='chain'"  x-text="histDir==='asc'?'▲':'▼'"></span></th>
             <th @click="sortBy('usd')"    class="text-right py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">$ In / Out <span x-show="histSort==='usd'" x-text="histDir==='asc'?'▲':'▼'"></span></th>
             <th @click="sortBy('gas')"    class="text-right py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">Gas <span x-show="histSort==='gas'"    x-text="histDir==='asc'?'▲':'▼'"></span></th>
             <th @click="sortBy('pnl')"    class="text-right py-2 pr-3 font-normal cursor-pointer hover:text-gray-300 select-none">PnL <span x-show="histSort==='pnl'"    x-text="histDir==='asc'?'▲':'▼'"></span></th>
@@ -669,7 +670,7 @@
         </thead>
         <tbody>
           <template x-if="!(history.trades?.length)">
-            <tr><td colspan="8" class="py-12 text-center text-gray-700">No trades yet</td></tr>
+            <tr><td colspan="9" class="py-12 text-center text-gray-700">No trades yet</td></tr>
           </template>
           <template x-for="t in sortedTrades" :key="t.ts + t.symbol + t.side">
             <tr class="border-b border-gray-800/40 hover:bg-gray-900/40">
@@ -683,9 +684,14 @@
                   class="py-1.5 pr-3 uppercase font-bold" x-text="t.side"></td>
               <td class="py-1.5 pr-3">
                 <span x-show="t.mode" class="px-1.5 py-0.5 rounded text-xs"
-                      :class="{'bg-emerald-900 text-emerald-300': t.mode==='safe','bg-sky-900 text-sky-300': t.mode==='default','bg-amber-900 text-amber-300': t.mode==='hype','bg-rose-900 text-rose-300': t.mode==='degen'}"
+                      :class="{'bg-emerald-900 text-emerald-300': t.mode==='safe','bg-sky-900 text-sky-300': t.mode==='default','bg-amber-900 text-amber-300': t.mode==='hype','bg-rose-900 text-rose-300': t.mode==='degen','bg-violet-900 text-violet-300': t.mode==='seed'}"
                       x-text="t.mode"></span>
                 <span x-show="!t.mode" class="text-gray-700">—</span>
+              </td>
+              <td class="py-1.5 pr-3">
+                <span class="px-1.5 py-0.5 rounded text-xs font-mono"
+                      :class="{'bg-sky-950 text-sky-400': t.chain==='sol','bg-indigo-950 text-indigo-400': t.chain==='eth','bg-blue-950 text-blue-400': t.chain==='base','bg-yellow-950 text-yellow-400': t.chain==='bsc','bg-purple-950 text-purple-400': t.chain==='poly'}"
+                      x-text="t.chain || '—'"></span>
               </td>
               <td class="py-1.5 pr-3 text-right"
                   :class="t.side === 'buy' ? 'text-red-300' : 'text-green-300'"
@@ -806,9 +812,12 @@
     </div>
 
     <!-- BACKTEST — what would current logic have done from day one -->
-    <div x-show="tab === 'Backtest'" x-data="{ bt: null, btLoading: false }"
-         x-init="$watch('tab', v => { if (v === 'Backtest' && !bt) loadBt() })"
-         @load-bt.window="loadBt()">
+    <div x-show="tab === 'Backtest'" x-data="{
+           bt: null, btLoading: false,
+           loadBt() { this.btLoading = true; fetch('/api/backtest', {headers: authHeader()})
+             .then(r => r.json()).then(d => { this.bt = d; this.btLoading = false; })
+             .catch(() => { this.btLoading = false; }); }
+         }">
       <template x-if="true">
         <div>
           <div class="flex items-center justify-between mb-4">
@@ -816,7 +825,7 @@
               <h2 class="font-bold text-gray-300">What if today's fixes ran from day one?</h2>
               <div class="text-gray-600 text-xs mt-1">Replays every trade applying: post-exit cooldown · $12 dollar stop</div>
             </div>
-            <button @click="btLoading=true; fetch('/api/backtest', {headers:authHeader()}).then(r=>r.json()).then(d=>{bt=d;btLoading=false})"
+            <button @click="loadBt()"
                     class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1.5 text-gray-300">
               <span x-show="!btLoading">↻ run</span>
               <span x-show="btLoading">running…</span>
@@ -827,7 +836,7 @@
           <template x-if="!bt && !btLoading">
             <div class="text-center py-16">
               <div class="text-gray-500 text-sm mb-3">Click "run" to replay your trade history with the current bot version</div>
-              <button @click="btLoading=true; fetch('/api/backtest', {headers:authHeader()}).then(r=>r.json()).then(d=>{bt=d;btLoading=false})"
+              <button @click="loadBt()"
                       class="bg-emerald-700 hover:bg-emerald-600 text-white rounded px-5 py-2 text-sm">Run simulation</button>
             </div>
           </template>
