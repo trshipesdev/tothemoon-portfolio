@@ -91,6 +91,8 @@ CONFIG: Dict[str, Any] = {
                     # has no TP cap and rides a wide trailing stop to catch the rare +500% runners.
                     "tp_ladder": [[0.30, 0.20], [0.80, 0.25], [1.50, 0.25]],
                     "moonbag_trail_pct": 0.45},   # wide leash on the moon bag (vs 0.15 normal)
+        "seed":    {"tp": [0.50, 1.00], "sl": 0.14, "slip_bps": 120, "liq_min": 15000,
+                    "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0},
     },
     "mode": "default",
 
@@ -145,6 +147,7 @@ CONFIG: Dict[str, Any] = {
         "hype_min":         80,         # 0–100
         "buy_ratio_min":    0.45,       # reject if <45% of recent (h1) trades are buys (being dumped)
         "dollar_stop_usd":  12.0,       # hard dollar stop — exit any position down more than this
+        "dynamic_sizing":   False,      # True → bet = min(base_size, avail_cash × 40%) for seed/small vaults
         "price_impact_max": 0.02,
         "min_ticket_usd":   15.0,
         "adaptive_timer":   {"low_liq_sec": 300, "high_liq_sec": 1200},
@@ -1004,6 +1007,9 @@ def size_ticket_usd(chain: str, hype: Optional[int] = None,
             base *= boost["mult"]
         else:
             STATE["boost"] = {"mult": 1.0, "expires": None}
+    if CONFIG["moonshot"].get("dynamic_sizing"):
+        avail_cash = max(0.0, STATE["vault_usd"] - STATE.get("cur_deployed_usd", 0.0))
+        base = min(base, avail_cash * 0.40)
     base    = min(base, per_chain_room(chain), per_token_cap_room())
     day_cap = CONFIG["daily_deploy_cap_pct"] * deployable_now()
     return max(0.0, min(base, day_cap - STATE["open_today_usd"]))
@@ -2403,6 +2409,7 @@ def api_state():
             "max_open_positions": CONFIG.get("max_open_positions", 12),
             "base_size_usd": CONFIG.get("base_size_usd", 30.0),
             "dollar_stop_usd": CONFIG["moonshot"].get("dollar_stop_usd", 12.0),
+            "dynamic_sizing":  CONFIG["moonshot"].get("dynamic_sizing", False),
             "blacklist":   CONFIG.get("blacklist", []),
         },
         "vault_start":     STATE.get("vault_start", 1000.0),
@@ -2957,6 +2964,8 @@ def api_config():
         CONFIG["max_open_positions"] = max(1, int(data["max_open_positions"]))
     if "dollar_stop_usd" in data:
         CONFIG["moonshot"]["dollar_stop_usd"] = max(0.0, float(data["dollar_stop_usd"]))
+    if "dynamic_sizing" in data:
+        CONFIG["moonshot"]["dynamic_sizing"] = bool(data["dynamic_sizing"])
     if "blacklist" in data and isinstance(data["blacklist"], list):
         CONFIG["blacklist"] = [str(x).strip() for x in data["blacklist"] if str(x).strip()]
     return jsonify({"ok": True})
@@ -3547,7 +3556,14 @@ def scan_candidates():
                         continue
             if CONFIG["moonshot"]["mode"] == "enter":
                 usd = size_ticket_usd(chain, hype=sc.hype, buy_ratio=sc.buy_ratio)
-                if usd >= CONFIG["moonshot"]["min_ticket_usd"] and est_price_impact(usd, liq) <= CONFIG["moonshot"]["price_impact_max"]:
+                _min_ticket = 10.0 if CONFIG["moonshot"].get("dynamic_sizing") else CONFIG["moonshot"]["min_ticket_usd"]
+                if CONFIG["moonshot"].get("dynamic_sizing"):
+                    _avail = max(0.0, STATE["vault_usd"] - STATE.get("cur_deployed_usd", 0.0))
+                    if _avail < usd * 1.5:
+                        _scout(symbol, chain, "rejected",
+                               f"cash buffer thin (avail ${_avail:.0f} < 1.5× bet ${usd:.0f})", sc, addr)
+                        continue
+                if usd >= _min_ticket and est_price_impact(usd, liq) <= CONFIG["moonshot"]["price_impact_max"]:
                     shadow_buy(symbol, chain, usd, price, liq, addr)
                     STATE["entries_today"][symbol] = STATE["entries_today"].get(symbol, 0) + 1
                     _record({"ev": "entry", "symbol": symbol, "chain": chain, "address": addr,
