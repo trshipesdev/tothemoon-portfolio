@@ -2449,12 +2449,55 @@ def api_history():
         if t.get("side") == "sell" and t.get("pnl") is not None:
             running += t["pnl"]
         enriched.append({**t, "running_pnl": running})
+    # Simulate the same trades starting with a $100 vault (same bet sizes, no scaling).
+    # Walks buys/sells chronologically: buy deducts cost, sell returns proceeds.
+    # This is what actually would have happened with $100 — not a proportional estimate.
+    _r_start   = 100.0
+    _r_vault   = _r_start
+    _r_min     = _r_start
+    _r_max     = _r_start
+    _r_skipped = 0
+    _r_hist: List[Dict] = []
+    _r_open: Dict[str, float] = {}   # symbol -> cost basis in the runner sim
+    for t in trades:
+        sym  = t.get("symbol", "")
+        side = t.get("side")
+        usd  = t.get("usd", 0) or 0
+        pnl  = t.get("pnl", 0) or 0
+        if side == "buy":
+            if _r_vault >= usd:
+                _r_vault -= usd
+                _r_open[sym] = _r_open.get(sym, 0) + usd
+            else:
+                _r_skipped += 1
+                continue
+        elif side == "sell":
+            if sym not in _r_open:
+                continue   # was a skipped buy — skip the sell too
+            proceeds = usd   # sell usd field = what we get back (cost + pnl fraction)
+            _r_vault += proceeds
+            _r_open[sym] = max(0.0, _r_open.get(sym, 0) - (usd - pnl))
+            if _r_open[sym] <= 0:
+                _r_open.pop(sym, None)
+        _r_vault = max(0.0, _r_vault)
+        _r_min   = min(_r_min, _r_vault)
+        _r_max   = max(_r_max, _r_vault)
+        _r_hist.append({"ts": t.get("ts", ""), "vault": round(_r_vault, 2)})
+
     return jsonify({
         "trades":    enriched,
         "total_pnl": running,
         "win_rate":  len(wins) / max(1, len(sells)),
         "avg_win":   sum(t["pnl"] for t in wins)   / max(1, len(wins)),
         "avg_loss":  sum(t["pnl"] for t in losses) / max(1, len(losses)),
+        "runner_100": {
+            "start":   _r_start,
+            "end":     round(_r_vault, 2),
+            "min":     round(_r_min, 2),
+            "max":     round(_r_max, 2),
+            "skipped": _r_skipped,
+            "hist":    _r_hist,
+        },
     })
 
 

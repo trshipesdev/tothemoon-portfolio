@@ -222,40 +222,44 @@
         </div>
       </div>
 
-      <!-- $100 runner comparison -->
+      <!-- $100 runner comparison — real simulation, same bet sizes -->
       <div class="bg-gray-900 rounded-xl p-4 mb-5">
         <div class="text-emerald-400 text-xs uppercase tracking-wider mb-1">🏃 $100 runner</div>
-        <div class="text-gray-600 text-xs mb-3">what this exact strategy would have done starting with $100</div>
-        <template x-if="(state.vault_start ?? 0) > 0">
+        <div class="text-gray-600 text-xs mb-3">replays every actual trade starting with $100 — same bet sizes, no scaling</div>
+        <template x-if="history.runner_100">
           <div>
             <div class="flex items-end gap-3 mb-3">
               <div class="text-3xl font-bold"
-                   :class="(state.vault_usd / state.vault_start) >= 1 ? 'text-emerald-400' : 'text-red-400'"
-                   x-text="'$' + fmt(100 * (state.vault_usd / state.vault_start))"></div>
+                   :class="(history.runner_100.end ?? 0) >= 100 ? 'text-emerald-400' : 'text-red-400'"
+                   x-text="'$' + fmt(history.runner_100.end ?? 0)"></div>
               <div class="text-sm pb-1"
-                   :class="(state.vault_usd / state.vault_start) >= 1 ? 'text-emerald-500' : 'text-red-500'"
-                   x-text="((state.vault_usd / state.vault_start - 1) * 100).toFixed(1) + '%'"></div>
+                   :class="(history.runner_100.end ?? 0) >= 100 ? 'text-emerald-500' : 'text-red-500'"
+                   x-text="(((history.runner_100.end ?? 0) / 100 - 1) * 100).toFixed(1) + '%'"></div>
             </div>
-            <div class="grid grid-cols-3 gap-2 text-center text-xs">
+            <div class="grid grid-cols-3 gap-2 text-center text-xs mb-2">
               <div class="bg-gray-800 rounded-lg p-2">
                 <div class="text-gray-500 mb-1">Started</div>
                 <div class="font-bold">$100.00</div>
               </div>
               <div class="bg-gray-800 rounded-lg p-2">
-                <div class="text-gray-500 mb-1">P&amp;L</div>
-                <div class="font-bold"
-                     :class="(state.vault_usd - state.vault_start) >= 0 ? 'text-emerald-400' : 'text-red-400'"
-                     x-text="((state.vault_usd - state.vault_start) >= 0 ? '+' : '-') + '$' + fmt(Math.abs(100 * (state.vault_usd / state.vault_start - 1)))"></div>
+                <div class="text-gray-500 mb-1">Lowest point</div>
+                <div class="font-bold text-red-400" x-text="'$' + fmt(history.runner_100.min ?? 0)"></div>
               </div>
               <div class="bg-gray-800 rounded-lg p-2">
-                <div class="text-gray-500 mb-1">Your vault</div>
-                <div class="font-bold text-gray-300" x-text="'$' + fmt(state.vault_usd)"></div>
+                <div class="text-gray-500 mb-1">Peak</div>
+                <div class="font-bold text-emerald-400" x-text="'$' + fmt(history.runner_100.max ?? 0)"></div>
               </div>
             </div>
-            <div class="text-gray-600 text-xs mt-2 text-center">
-              same % returns · scaled to $100 start · <span x-text="'actual started at $' + fmt(state.vault_start)"></span>
+            <div class="text-gray-500 text-xs" x-show="(history.runner_100.skipped ?? 0) > 0">
+              ⚠️ <span x-text="history.runner_100.skipped"></span> bets skipped — vault ran dry mid-run
+            </div>
+            <div class="text-gray-600 text-xs mt-1">
+              actual trade replay · <span x-text="'your real vault started at $' + fmt(state.vault_start ?? 0)"></span>
             </div>
           </div>
+        </template>
+        <template x-if="!history.runner_100">
+          <div class="text-gray-600 text-sm">No trade history yet</div>
         </template>
       </div>
 
