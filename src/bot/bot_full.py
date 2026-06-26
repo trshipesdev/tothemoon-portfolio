@@ -2553,14 +2553,17 @@ def api_backtest():
 
         if side == "buy":
             ex = last_exit.get(sym)
-            if ex:
+            if ex and ex["pnl"] < 0:
                 elapsed = ts - ex["ts"]
-                if ex["pnl"] < 0 and elapsed < cooldown_loss_sec:
+                if elapsed < cooldown_loss_sec:
                     blocked_buys.add(i)
-                elif ex["pnl"] >= 0 and elapsed < cooldown_profit_sec:
-                    blocked_buys.add(i)
+            # Note: profit cooldown omitted — we can't distinguish a partial TP
+            # (bot still holding) from a full exit in the trade log. Blocking on
+            # profit exits incorrectly blocks scale-ins on hot winners.
         elif side == "sell" and t.get("pnl") is not None:
-            last_exit[sym] = {"ts": ts, "pnl": t["pnl"]}
+            # Only update last_exit if this looks like a loss (to avoid catching partial TPs)
+            if t["pnl"] < 0:
+                last_exit[sym] = {"ts": ts, "pnl": t["pnl"]}
 
     # ── pass 2: build revised trade list ────────────────────────────────────
     # Track which symbols have a blocked buy outstanding so we skip their sells too
