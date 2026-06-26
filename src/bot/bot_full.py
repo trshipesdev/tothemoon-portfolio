@@ -126,7 +126,10 @@ CONFIG: Dict[str, Any] = {
     # could climb to the cap and then freeze (nothing open to sell → can't unwind it →
     # locked out until midnight), starving the bot. Keep this high so it rarely binds.
     "daily_deploy_cap_pct": 5.0,
-    "drawdown_brake":       {"lookback": 30, "dd": 0.25, "size_mult": 0.60},
+    "drawdown_brake":       {"lookback": 30, "dd": 0.25, "size_mult": 0.60, "reserve_pct": 0.40},
+    # Risk guardrails
+    "max_open_positions":   12,     # cap concurrent positions (memecoins dump together)
+    "blacklist":            [],     # symbols/addresses to never buy (manual, dashboard-editable)
 
     "vaults": {"hot_native_pct": 0.75, "hot_usdc_pct": 0.25},
 
@@ -244,7 +247,8 @@ CONFIG: Dict[str, Any] = {
         "enabled":        False,   # master switch (also requires ANTHROPIC_API_KEY)
         "auto_apply":     False,   # True = AI switches modes itself; False = advisory only
         "model":          "claude-haiku-4-5",
-        "interval_min":   30,      # how often to consult the AI
+        "interval_min":   12,      # how often to consult the AI (was 30 — too slow for
+                                   # fast memecoin regimes; also event-triggered on drawdown)
         "min_confidence": 0.6,     # only auto-apply at/above this confidence
     },
 }
@@ -783,7 +787,12 @@ def drawdown_brake_active() -> bool:
 
 
 def deployable_now() -> float:
-    return max(0.0, STATE["vault_usd"] - CONFIG["reserve_pct"] * STATE["vault_usd"])
+    # Hold back MORE capital while the drawdown brake is on (bad streak) — protect the
+    # bankroll when the edge has gone cold, lean in again when it recovers.
+    reserve = CONFIG["reserve_pct"]
+    if drawdown_brake_active():
+        reserve = max(reserve, CONFIG.get("drawdown_brake", {}).get("reserve_pct", 0.40))
+    return max(0.0, STATE["vault_usd"] * (1 - reserve))
 
 
 def per_chain_room(chain: str) -> float:
@@ -2142,6 +2151,10 @@ def api_state():
             "ai":     CONFIG["ai"],
             "safety": CONFIG["safety"],
             "degen_terms": CONFIG.get("degen_terms", {}),
+            "stall_exit":  CONFIG.get("stall_exit", {}),
+            "buy_ratio_min": CONFIG["moonshot"].get("buy_ratio_min", 0.45),
+            "max_open_positions": CONFIG.get("max_open_positions", 12),
+            "blacklist":   CONFIG.get("blacklist", []),
         },
         "ai_key_set":      bool(os.getenv(ANTHROPIC_KEY_ENV)),
         "x_key_set":       bool(os.getenv(X_BEARER_ENV)),
@@ -2483,6 +2496,20 @@ def api_config():
             CONFIG["degen_terms"]["enabled"] = bool(data["degen_terms"]["enabled"])
         if "bonus" in data["degen_terms"]:
             CONFIG["degen_terms"]["bonus"] = max(0, int(data["degen_terms"]["bonus"]))
+    if isinstance(data.get("stall_exit"), dict):
+        if "enabled" in data["stall_exit"]:
+            CONFIG["stall_exit"]["enabled"] = bool(data["stall_exit"]["enabled"])
+        for k in ("min_gain", "give_back"):
+            if k in data["stall_exit"]:
+                CONFIG["stall_exit"][k] = max(0.0, float(data["stall_exit"][k]))
+        if "stall_sec" in data["stall_exit"]:
+            CONFIG["stall_exit"]["stall_sec"] = max(30, int(data["stall_exit"]["stall_sec"]))
+    if "buy_ratio_min" in data:
+        CONFIG["moonshot"]["buy_ratio_min"] = max(0.0, min(1.0, float(data["buy_ratio_min"])))
+    if "max_open_positions" in data:
+        CONFIG["max_open_positions"] = max(1, int(data["max_open_positions"]))
+    if "blacklist" in data and isinstance(data["blacklist"], list):
+        CONFIG["blacklist"] = [str(x).strip() for x in data["blacklist"] if str(x).strip()]
     return jsonify({"ok": True})
 
 
@@ -2983,6 +3010,18 @@ def scan_candidates():
 
         addr = c.get("address", "")
         link = _dex_link(chain, addr)
+        # Manual blacklist — never buy these (by symbol or address), dashboard-editable
+        bl = {str(x).lower() for x in CONFIG.get("blacklist", [])}
+        if symbol.lower() in bl or (addr and addr.lower() in bl):
+            _scout(symbol, chain, "rejected", "on manual blacklist", sc, addr)
+            continue
+        # Correlation guardrail — don't pile into too many positions at once (memecoins
+        # dump together in a market-wide flush). Only blocks NEW symbols, not adds.
+        if (symbol not in STATE["positions"]
+                and len(STATE["positions"]) >= CONFIG.get("max_open_positions", 12)):
+            _scout(symbol, chain, "rejected",
+                   f"at max open positions ({CONFIG.get('max_open_positions', 12)})", sc, addr)
+            continue
         if is_new:
             reject = moonshot_reject_reason(sc)
             if reject:
@@ -3329,9 +3368,15 @@ def engine_loop():
             except Exception:
                 pass
             last_gas_refresh = time.time()
-        if CONFIG["ai"].get("enabled") and time.time() - last_ai_run > CONFIG["ai"].get("interval_min", 30) * 60:
+        # Consult the AI on a timer, OR immediately when the drawdown brake first trips
+        # (a bad streak is exactly when a mode change matters most — don't wait 12 min).
+        brake_now    = drawdown_brake_active()
+        brake_tripped = brake_now and not STATE.get("_brake_prev", False)
+        STATE["_brake_prev"] = brake_now
+        ai_due = time.time() - last_ai_run > CONFIG["ai"].get("interval_min", 12) * 60
+        if CONFIG["ai"].get("enabled") and (ai_due or brake_tripped):
             try:
-                ai_advise()
+                ai_advise(force=brake_tripped)
             except Exception:
                 pass
             last_ai_run = time.time()

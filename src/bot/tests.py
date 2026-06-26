@@ -2577,6 +2577,32 @@ class TestEntryChurnCap(unittest.TestCase):
         # PUMP was at cap → no new position opened
         self.assertNotIn("PUMP", bot.STATE["positions"])
 
+    def test_dynamic_reserve_in_drawdown(self):
+        _reset(1000.0)
+        bot.CONFIG["reserve_pct"] = 0.25
+        bot.CONFIG["drawdown_brake"]["reserve_pct"] = 0.40
+        with patch.object(bot, "drawdown_brake_active", return_value=False):
+            self.assertAlmostEqual(bot.deployable_now(), 750.0, places=2)
+        with patch.object(bot, "drawdown_brake_active", return_value=True):
+            self.assertAlmostEqual(bot.deployable_now(), 600.0, places=2)  # holds back more
+
+    @patch.object(bot, "fetch_btc_dominance", return_value=45.0)
+    @patch.object(bot, "fetch_positions_prices", return_value={})
+    @patch.object(bot, "check_reentry_watch")
+    @patch.object(bot, "manage_trusted_coins")
+    @patch.object(bot, "save_state")
+    def test_blacklist_blocks_entry(self, *mocks):
+        _reset(1000.0)
+        bot.CONFIG["moonshot"]["mode"] = "enter"
+        bot.CONFIG["blacklist"] = ["SCAMX"]
+        bot.STATE["last_daily_reset"] = bot.now_utc().date().isoformat()
+        cand = [{"symbol": "SCAMX", "chain": "sol", "price": 0.001, "liq": 50000,
+                 "age_min": 10, "hype": 95, "positive": True, "address": "0xscam"}]
+        with patch.object(bot, "fetch_new_candidates", return_value=cand):
+            bot.engine_once()
+        self.assertNotIn("SCAMX", bot.STATE["positions"])
+        bot.CONFIG["blacklist"] = []
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 43. TP ladder + moon bag (catch the +500% runners)

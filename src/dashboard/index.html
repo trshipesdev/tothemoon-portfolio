@@ -734,6 +734,71 @@
         </div>
       </div>
 
+      <!-- Strategy & risk -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3">
+        <h3 class="text-amber-400 text-xs uppercase tracking-wider">🎯 Strategy &amp; risk</h3>
+
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Stall exit
+            <span class="text-gray-600 text-xs block">bank a winner that ran up then stopped climbing (stops round-trips to breakeven)</span>
+          </span>
+          <button @click="post('/api/config', {stall_exit: {enabled: !state.config?.stall_exit?.enabled}}).then(refresh)"
+                  :class="state.config?.stall_exit?.enabled ? 'bg-green-600' : 'bg-gray-700'"
+                  class="w-11 h-6 rounded-full transition-colors relative shrink-0">
+            <span :class="state.config?.stall_exit?.enabled ? 'translate-x-6' : 'translate-x-1'"
+                  class="absolute top-1 w-4 h-4 bg-white rounded-full transition-transform shadow"></span>
+          </button>
+        </div>
+        <div class="grid grid-cols-3 gap-2 text-xs" x-show="state.config?.stall_exit?.enabled">
+          <label class="text-gray-500">min gain
+            <input x-model="cfg.stall_min_gain" type="number" step="0.05" placeholder="0.20"
+                   class="w-full mt-1 bg-gray-800 rounded px-2 py-1 text-white"></label>
+          <label class="text-gray-500">flat for (min)
+            <input x-model="cfg.stall_min" type="number" step="1" placeholder="10"
+                   class="w-full mt-1 bg-gray-800 rounded px-2 py-1 text-white"></label>
+          <label class="text-gray-500">give back
+            <input x-model="cfg.stall_give" type="number" step="0.01" placeholder="0.06"
+                   class="w-full mt-1 bg-gray-800 rounded px-2 py-1 text-white"></label>
+        </div>
+        <button x-show="state.config?.stall_exit?.enabled"
+                @click="post('/api/config', {stall_exit: {min_gain: +cfg.stall_min_gain, stall_sec: Math.round((+cfg.stall_min||10)*60), give_back: +cfg.stall_give}}).then(refresh)"
+                class="text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1">save stall settings</button>
+
+        <div class="flex items-center justify-between pt-2 border-t border-gray-800">
+          <span class="text-sm">Buyer/seller gate
+            <span class="text-gray-600 text-xs block">skip tokens being dumped — require this % of recent trades to be buys</span>
+          </span>
+          <div class="flex items-center gap-2">
+            <input x-model="cfg.buy_ratio_min" type="number" step="0.05" placeholder="0.45"
+                   class="w-16 bg-gray-800 rounded px-2 py-1 text-white text-sm">
+            <button @click="post('/api/config', {buy_ratio_min: +cfg.buy_ratio_min}).then(refresh)"
+                    class="text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1">set</button>
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between">
+          <span class="text-sm">Max open positions
+            <span class="text-gray-600 text-xs block">cap concurrent trades (memecoins dump together)</span>
+          </span>
+          <div class="flex items-center gap-2">
+            <input x-model="cfg.max_open" type="number" step="1" placeholder="12"
+                   class="w-16 bg-gray-800 rounded px-2 py-1 text-white text-sm">
+            <button @click="post('/api/config', {max_open_positions: +cfg.max_open}).then(refresh)"
+                    class="text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1">set</button>
+          </div>
+        </div>
+
+        <div class="pt-2 border-t border-gray-800">
+          <span class="text-sm">Blacklist
+            <span class="text-gray-600 text-xs block">never buy these — one symbol or address per line</span>
+          </span>
+          <textarea x-model="cfg.blacklist" rows="2" placeholder="SCAMCOIN&#10;0xbadtoken..."
+                    class="w-full mt-2 bg-gray-800 rounded px-2 py-1 text-white text-xs font-mono"></textarea>
+          <button @click="post('/api/config', {blacklist: (cfg.blacklist||'').split('\n').map(s=>s.trim()).filter(Boolean)}).then(refresh)"
+                  class="mt-1 text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1">save blacklist</button>
+        </div>
+      </div>
+
       <!-- Scam / rug safety -->
       <div class="bg-gray-900 rounded-xl p-4 space-y-3">
         <h3 class="text-rose-400 text-xs uppercase tracking-wider">🛡️ Scam / rug safety gate</h3>
@@ -944,7 +1009,8 @@ function app() {
     obj:      { target: '', weeks: '' },
     wl:       { symbol: '', address: '' },
     sprayDate: '',
-    cfg:      { presale_min_score: '', cooldown_min: '', volume_x: '', mentions_x: '', doge_core: '', doge_lo: '', doge_hi: '' },
+    cfg:      { presale_min_score: '', cooldown_min: '', volume_x: '', mentions_x: '', doge_core: '', doge_lo: '', doge_hi: '',
+                stall_min_gain: '', stall_min: '', stall_give: '', buy_ratio_min: '', max_open: '', blacklist: '' },
     importText: '',
 
     editModal:     { show: false, sym: '', tp: '', sl: '' },
@@ -1033,6 +1099,12 @@ function app() {
         if (this.cfg.doge_core === '')         this.cfg.doge_core         = c.doge?.core_units ?? '';
         if (this.cfg.doge_lo === '')           this.cfg.doge_lo           = c.doge?.exit_band?.[0] ?? '';
         if (this.cfg.doge_hi === '')           this.cfg.doge_hi           = c.doge?.exit_band?.[1] ?? '';
+        if (this.cfg.stall_min_gain === '')    this.cfg.stall_min_gain    = c.stall_exit?.min_gain ?? '';
+        if (this.cfg.stall_min === '')         this.cfg.stall_min         = c.stall_exit?.stall_sec ? Math.round(c.stall_exit.stall_sec / 60) : '';
+        if (this.cfg.stall_give === '')        this.cfg.stall_give        = c.stall_exit?.give_back ?? '';
+        if (this.cfg.buy_ratio_min === '')     this.cfg.buy_ratio_min     = c.buy_ratio_min ?? '';
+        if (this.cfg.max_open === '')          this.cfg.max_open          = c.max_open_positions ?? '';
+        if (this.cfg.blacklist === '')         this.cfg.blacklist         = (c.blacklist || []).join('\n');
       }
       if (p)   this.pos     = p;
       if (h) { this.history = h; this.$nextTick(() => this.drawChart(h)); }
