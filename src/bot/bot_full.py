@@ -284,6 +284,7 @@ STATE: Dict[str, Any] = {
     "gas_live":         {},  # live per-chain gas estimates: {chain: usd, "ts": epoch}
     "ai":               {"last_run": None, "last": None, "history": []},  # AI advisor state
     "entries_today":    {},  # symbol → count of fresh entries today (anti-churn), reset daily
+    "recently_exited":  {},  # symbol → {ts, price, pnl} — blocks scanner re-entry after full close
     # Wallet goal: Phase 1 = grow to $1000. Phase 2 = skim 50% of profit above $100 threshold.
     "wallet_goal": {
         "goal_usd":        1000.0,   # target vault before skim phase kicks in
@@ -407,6 +408,7 @@ def load_state():
         STATE.setdefault("gas_paid_usd",  0.0)
         STATE.setdefault("scout_log",     [])
         STATE.setdefault("entries_today", {})
+        STATE.setdefault("recently_exited", {})
         # Set vault_start once from the loaded vault if it was never recorded
         STATE.setdefault("vault_start", STATE.get("vault_usd", 1000.0))
         STATE.setdefault("wallet_goal", {})
@@ -1165,6 +1167,14 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
     # the bot at 12 phantom "positions", blocking every new entry).
     if pos.get("units", 0) <= 0:
         STATE["positions"].pop(symbol, None)
+        # Record the full close so the entry loop can enforce a cool-down.
+        # Pattern blocked: re-entering a declining token within minutes of a stop exit,
+        # or chasing back in at the same high price after a profitable exit.
+        STATE.setdefault("recently_exited", {})[symbol] = {
+            "ts":    time.time(),
+            "price": price,
+            "pnl":   pnl,
+        }
     return {"sold": proceeds, "pnl": pnl}
 
 
@@ -3134,7 +3144,8 @@ def scan_candidates():
     if STATE.get("last_daily_reset") != today:
         STATE["open_today_usd"]  = 0.0
         STATE["entries_today"]   = {}
-        STATE["peak_deployed_usd"] = 0.0   # reset the "most on the table at once" for the new day
+        STATE["recently_exited"] = {}   # clear cooldowns at midnight — fresh day, fresh tokens
+        STATE["peak_deployed_usd"] = 0.0
         STATE["peak_open_count"]   = 0
         STATE["last_daily_reset"] = today
         save_state()
@@ -3211,6 +3222,26 @@ def scan_candidates():
                 _scout(symbol, chain, "rejected",
                        f"already entered {entry_cap}x today (anti-churn on volatile token)", sc, addr)
                 continue
+            # Post-exit cooldown: don't re-enter a token that was just fully closed.
+            # Pattern A (declining re-entry): after a loss exit, the scanner keeps finding
+            # the same token and buying back in while it continues to dump. Block for 30 min.
+            # Pattern B (profit chasing): after a win exit, bot re-enters at the same high
+            # price before the token pulls back. Block unless price is ≥8% below exit price.
+            _rex = STATE.get("recently_exited", {}).get(symbol)
+            if _rex:
+                _rex_elapsed = time.time() - _rex.get("ts", 0)
+                _rex_pnl     = _rex.get("pnl", 0)
+                _rex_price   = _rex.get("price", 0)
+                if _rex_pnl < 0 and _rex_elapsed < 30 * 60:
+                    _scout(symbol, chain, "rejected",
+                           f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, pnl=${_rex_pnl:.2f})", sc, addr)
+                    continue
+                if _rex_pnl >= 0 and _rex_elapsed < 15 * 60 and _rex_price > 0:
+                    _pullback = (_rex_price - price) / _rex_price
+                    if _pullback < 0.08:
+                        _scout(symbol, chain, "rejected",
+                               f"profit-chase block: price {_pullback*100:.1f}% below exit (need 8%)", sc, addr)
+                        continue
             if CONFIG["moonshot"]["mode"] == "enter":
                 usd = size_ticket_usd(chain, hype=sc.hype, buy_ratio=sc.buy_ratio)
                 if usd >= CONFIG["moonshot"]["min_ticket_usd"] and est_price_impact(usd, liq) <= CONFIG["moonshot"]["price_impact_max"]:
