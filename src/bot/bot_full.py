@@ -284,6 +284,17 @@ STATE: Dict[str, Any] = {
     "gas_live":         {},  # live per-chain gas estimates: {chain: usd, "ts": epoch}
     "ai":               {"last_run": None, "last": None, "history": []},  # AI advisor state
     "entries_today":    {},  # symbol → count of fresh entries today (anti-churn), reset daily
+    # Wallet goal: Phase 1 = grow to $1000. Phase 2 = skim 50% of profit above $100 threshold.
+    "wallet_goal": {
+        "goal_usd":        1000.0,   # target vault before skim phase kicks in
+        "phase":           1,        # 1 = growing, 2 = skimming
+        "phase2_basis":    None,     # vault value when phase 2 was entered (or last skim)
+        "total_paid_out":  0.0,      # lifetime earnings extracted
+        "skim_threshold":  100.0,    # profit above basis needed to trigger a payout
+        "skim_pct":        0.50,     # fraction of profit to take out (50%)
+        "skim_cap":        100.0,    # max single payout
+        "payout_log":      [],       # [{ts, amount, basis_before, vault_after}]
+    },
 }
 
 _state_path_env = os.getenv("STATE_PATH", "")
@@ -398,6 +409,16 @@ def load_state():
         STATE.setdefault("entries_today", {})
         # Set vault_start once from the loaded vault if it was never recorded
         STATE.setdefault("vault_start", STATE.get("vault_usd", 1000.0))
+        STATE.setdefault("wallet_goal", {})
+        wg = STATE["wallet_goal"]
+        wg.setdefault("goal_usd",       1000.0)
+        wg.setdefault("phase",          1)
+        wg.setdefault("phase2_basis",   None)
+        wg.setdefault("total_paid_out", 0.0)
+        wg.setdefault("skim_threshold", 100.0)
+        wg.setdefault("skim_pct",       0.50)
+        wg.setdefault("skim_cap",       100.0)
+        wg.setdefault("payout_log",     [])
         # Drop any fully-closed position shells (units<=0) left from before the purge
         # fix — otherwise they keep counting against the max-open-positions cap.
         STATE["positions"] = {s: p for s, p in STATE.get("positions", {}).items()
@@ -1053,6 +1074,40 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
     return {"price": filled_price, "units": units}
 
 
+def _wallet_goal_check() -> Optional[float]:
+    """Phase 1→2 transition and Phase 2 skim payout. Returns payout amount or None."""
+    wg   = STATE.setdefault("wallet_goal", {})
+    goal = wg.get("goal_usd", 1000.0)
+    v    = STATE["vault_usd"]
+
+    # Phase 1 → 2 transition
+    if wg.get("phase", 1) == 1:
+        if v >= goal:
+            wg["phase"]        = 2
+            wg["phase2_basis"] = v
+            log(f"wallet_goal: Phase 2 reached — vault ${v:.2f} hit goal ${goal:.2f}. Skim mode active.")
+        return None
+
+    # Phase 2: check if profit above basis clears the threshold
+    basis     = wg.get("phase2_basis") or goal
+    profit    = v - basis
+    threshold = wg.get("skim_threshold", 100.0)
+    if profit < threshold:
+        return None
+
+    payout = min(profit * wg.get("skim_pct", 0.50), wg.get("skim_cap", 100.0))
+    STATE["vault_usd"]          -= payout
+    STATE["income_usd"]          = STATE.get("income_usd", 0.0) + payout
+    wg["total_paid_out"]         = wg.get("total_paid_out", 0.0) + payout
+    wg["phase2_basis"]           = STATE["vault_usd"]   # reset basis to post-payout vault
+    wg.setdefault("payout_log", []).append({
+        "ts": now_utc().isoformat(), "amount": round(payout, 2),
+        "profit_before": round(profit, 2), "vault_after": round(STATE["vault_usd"], 2),
+    })
+    log(f"wallet_goal: Payout ${payout:.2f} (profit was ${profit:.2f}). Vault now ${STATE['vault_usd']:.2f}. Total paid out ${wg['total_paid_out']:.2f}.")
+    return payout
+
+
 def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[str, Any]:
     pos = STATE["positions"].get(symbol)
     if not pos or pos["usd"] <= 0:
@@ -1097,6 +1152,7 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
         STATE["income_usd"] = STATE.get("income_usd", 0.0) + skim
         proceeds -= skim
     STATE["vault_usd"] += proceeds
+    _wallet_goal_check()
     STATE["pnl_hist"].append(pnl)
     STATE.setdefault("trade_log", []).append({
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "?"),
@@ -2208,7 +2264,8 @@ def dashboard_ui(path):
 def api_state():
     mode_cfg = CONFIG["modes"].get(CONFIG["mode"], {})
     return jsonify({
-        **{k: v for k, v in STATE.items() if k not in ("trade_log", "liq_prev", "scout_log")},
+        **{k: v for k, v in STATE.items() if k not in ("trade_log", "liq_prev", "scout_log", "wallet_goal")},
+        "wallet_goal": {**STATE.get("wallet_goal", {}), "payout_log": STATE.get("wallet_goal", {}).get("payout_log", [])[-20:]},
         "deployable_usd":  deployable_now(),
         "mode":            CONFIG["mode"],
         "modes":           list(CONFIG["modes"].keys()),
