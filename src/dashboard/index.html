@@ -955,6 +955,19 @@
           </div>
         </div>
 
+        <div class="flex items-center justify-between py-2 border-t border-gray-800">
+          <span class="text-sm">Hard dollar stop
+            <span class="text-gray-600 text-xs block">exit any position that's down more than this amount</span>
+          </span>
+          <div class="flex items-center gap-2">
+            <span class="text-gray-500 text-sm">$</span>
+            <input x-model="cfg.dollar_stop_usd" type="number" step="1" placeholder="12"
+                   class="w-16 bg-gray-800 rounded px-2 py-1 text-white text-sm">
+            <button @click="post('/api/config', {dollar_stop_usd: +cfg.dollar_stop_usd}).then(refresh)"
+                    class="text-xs bg-gray-700 hover:bg-gray-600 rounded px-3 py-1">set</button>
+          </div>
+        </div>
+
         <div class="pt-2 border-t border-gray-800">
           <span class="text-sm">Blacklist
             <span class="text-gray-600 text-xs block">never buy these — one symbol or address per line</span>
@@ -1180,7 +1193,7 @@ function app() {
     wl:       { symbol: '', address: '' },
     sprayDate: '',
     cfg:      { presale_min_score: '', cooldown_min: '', volume_x: '', mentions_x: '', doge_core: '', doge_lo: '', doge_hi: '',
-                stall_min_gain: '', stall_min: '', stall_give: '', buy_ratio_min: '', max_open: '', blacklist: '' },
+                stall_min_gain: '', stall_min: '', stall_give: '', buy_ratio_min: '', max_open: '', blacklist: '', dollar_stop_usd: '' },
     importText: '',
 
     editModal:     { show: false, sym: '', tp: '', sl: '' },
@@ -1299,6 +1312,7 @@ function app() {
         if (this.cfg.stall_give === '')        this.cfg.stall_give        = c.stall_exit?.give_back ?? '';
         if (this.cfg.buy_ratio_min === '')     this.cfg.buy_ratio_min     = c.buy_ratio_min ?? '';
         if (this.cfg.max_open === '')          this.cfg.max_open          = c.max_open_positions ?? '';
+        if (this.cfg.dollar_stop_usd === '')   this.cfg.dollar_stop_usd   = c.dollar_stop_usd ?? 12;
         if (this.cfg.blacklist === '')         this.cfg.blacklist         = (c.blacklist || []).join('\n');
       }
       if (p)   this.pos     = p;

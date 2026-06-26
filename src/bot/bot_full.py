@@ -144,6 +144,7 @@ CONFIG: Dict[str, Any] = {
         "liq_max":          250000,
         "hype_min":         80,         # 0–100
         "buy_ratio_min":    0.45,       # reject if <45% of recent (h1) trades are buys (being dumped)
+        "dollar_stop_usd":  12.0,       # hard dollar stop — exit any position down more than this
         "price_impact_max": 0.02,
         "min_ticket_usd":   15.0,
         "adaptive_timer":   {"low_liq_sec": 300, "high_liq_sec": 1200},
@@ -2398,6 +2399,7 @@ def api_state():
             "buy_ratio_min": CONFIG["moonshot"].get("buy_ratio_min", 0.45),
             "max_open_positions": CONFIG.get("max_open_positions", 12),
             "base_size_usd": CONFIG.get("base_size_usd", 30.0),
+            "dollar_stop_usd": CONFIG["moonshot"].get("dollar_stop_usd", 12.0),
             "blacklist":   CONFIG.get("blacklist", []),
         },
         "vault_start":     STATE.get("vault_start", 1000.0),
@@ -2753,6 +2755,8 @@ def api_config():
         CONFIG["moonshot"]["buy_ratio_min"] = max(0.0, min(1.0, float(data["buy_ratio_min"])))
     if "max_open_positions" in data:
         CONFIG["max_open_positions"] = max(1, int(data["max_open_positions"]))
+    if "dollar_stop_usd" in data:
+        CONFIG["moonshot"]["dollar_stop_usd"] = max(0.0, float(data["dollar_stop_usd"]))
     if "blacklist" in data and isinstance(data["blacklist"], list):
         CONFIG["blacklist"] = [str(x).strip() for x in data["blacklist"] if str(x).strip()]
     return jsonify({"ok": True})
@@ -3493,6 +3497,15 @@ def manage_positions():
 
         # ── EXIT PRIORITY ORDER ────────────────────────────────────────────
         exit_reason: Optional[str] = None
+
+        # 0. Hard dollar stop — never lose more than $12 on any single position.
+        #    Fires before everything else. Unrealized loss = current value vs cost.
+        _dollar_stop = CONFIG["moonshot"].get("dollar_stop_usd", 12.0)
+        _cur_val     = p.get("units", 0) * price
+        _cost        = p.get("deployed_usd", p.get("usd", 0)) or p.get("usd", 0)
+        _unrealized  = _cur_val - _cost
+        if _dollar_stop > 0 and _unrealized < -_dollar_stop:
+            exit_reason = f"DOLLAR STOP -${abs(_unrealized):.2f} (limit ${_dollar_stop:.0f})"
 
         # 1. Instant rug guard — liq craters in one tick
         prev_liq = STATE["liq_prev"].get(s, liq)
