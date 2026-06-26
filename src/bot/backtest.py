@@ -32,6 +32,7 @@ Honest caveats (printed in the report too):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time as _real_time
@@ -206,13 +207,35 @@ def fetch_universe(limit: int = 30, chains: Optional[List[str]] = None
     return out[:limit]
 
 
+# ── Entry timing ────────────────────────────────────────────────────────────────
+def _hype_of(tick: Dict[str, float]) -> int:
+    """Same hype formula the live scanner uses: h1 volume velocity vs liquidity."""
+    return min(100, int(tick["vol_h1"] / max(tick["liq"], 1) * 40))
+
+
+def find_entry_index(ticks: List[Dict[str, float]], lookback: int = 3) -> Optional[int]:
+    """First tick that passes the bot's REAL moonshot filter — i.e. momentum is
+    building (price rising over `lookback` candles) AND volume velocity clears the
+    hype floor. This stops the backtest from blindly buying a trending token at the
+    top of the window; a token that only bleeds never triggers an entry → no trade.
+    Uses the live filter, so the active mode's liq floor + hype_min apply."""
+    for i in range(lookback, len(ticks)):
+        t = ticks[i]
+        positive = t["price"] > ticks[i - lookback]["price"]
+        sc = bot.Score(_hype_of(t), t["liq"], 0.0, positive)   # age 0 = fresh; buy_ratio unknown
+        if bot.moonshot_reject_reason(sc) is None:
+            return i
+    return None
+
+
 # ── Replay one token under one mode ─────────────────────────────────────────────
 def replay_episode(symbol: str, chain: str, address: str,
                    ticks: List[Dict[str, float]], mode: str,
-                   start_vault: float = 1000.0) -> Optional[Dict[str, Any]]:
-    """Buy at the first tick, then feed every later tick through the REAL
-    manage_positions() exit cascade. Returns the episode result, or None if the
-    token never qualified for entry under this mode."""
+                   start_vault: float = 1000.0,
+                   entry: str = "momentum") -> Optional[Dict[str, Any]]:
+    """Enter when a real momentum signal fires (default) or at the first tick
+    (entry="start"), then feed every later tick through the REAL manage_positions()
+    exit cascade. Returns the episode result, or None if the token never qualified."""
     if len(ticks) < 2:
         return None
 
@@ -236,19 +259,26 @@ def replay_episode(symbol: str, chain: str, address: str,
         # Fresh, isolated state for this single-token run
         bot.STATE = _fresh_state(start_vault)
 
-        first = ticks[0]
-        sc = bot.Score(95, first["liq"], 0.0, True)   # known-traded token → assume hype ok
-        if bot.moonshot_reject_reason(sc) and bot.moonshot_reject_reason(sc).startswith("liquidity"):
+        # Pick the entry tick. "momentum" = first tick that passes the live filter
+        # (don't buy a token that's only declining). "start" = old behaviour.
+        e = 0 if entry == "start" else find_entry_index(ticks)
+        if e is None or e >= len(ticks) - 1:
+            return None                                # never built momentum → no trade
+        first = ticks[e]
+        clock.now = first["ts"]
+        sc = bot.Score(_hype_of(first), first["liq"], 0.0, True)
+        if entry == "start" and bot.moonshot_reject_reason(sc) and \
+           bot.moonshot_reject_reason(sc).startswith("liquidity"):
             return None                                # too thin for this mode → no entry
 
-        usd = bot.size_ticket_usd(chain, hype=95)
+        usd = bot.size_ticket_usd(chain, hype=_hype_of(first))
         if usd < bot.CONFIG["moonshot"]["min_ticket_usd"]:
             return None
         bot.shadow_buy(symbol, chain, usd, first["price"], first["liq"], address)
         entry_price = bot.STATE["positions"][symbol]["avg"]
         peak_gain = 0.0
 
-        for i in range(1, len(ticks)):
+        for i in range(e + 1, len(ticks)):
             t = ticks[i]
             clock.now = t["ts"]
             prev = ticks[i - 1]["price"] or t["price"]
@@ -268,7 +298,7 @@ def replay_episode(symbol: str, chain: str, address: str,
 
         end_val = bot.STATE["vault_usd"] + bot.STATE.get("income_usd", 0.0)
         pnl = end_val - start_vault
-        hold_min = (clock.now - ticks[0]["ts"]) / 60.0
+        hold_min = (clock.now - first["ts"]) / 60.0
         return {
             "symbol": symbol, "chain": chain, "mode": mode,
             "deployed": usd, "pnl": pnl, "peak_gain_pct": peak_gain * 100.0,
@@ -291,6 +321,39 @@ def _fresh_state(vault: float) -> Dict[str, Any]:
         "trade_log": [], "entries_today": {}, "open_burst": [],
         "mode_perf": {}, "last_daily_reset": "2000-01-01",
     }
+
+
+# ── Replay from the live FORWARD RECORDING (most faithful) ──────────────────────
+def histories_from_recording(days: int, rec_dir: str = ""
+                             ) -> Dict[Tuple[str, str, str], List[Dict[str, float]]]:
+    """Reconstruct per-token tick series from the bot's forward recording (the
+    per-tick price/liq/vol it logged while holding each position). Because these are
+    the REAL ticks of tokens it really entered, the replay has real entry timing AND
+    real per-tick liquidity → rug/liq-drain exits get modelled too."""
+    import glob
+    rec_dir = rec_dir or os.path.join(os.path.dirname(bot.SAVEFILE) or ".", "recordings")
+    cutoff = bot.now_utc().timestamp() - days * 86400
+    series: Dict[Tuple[str, str, str], List[Dict[str, float]]] = {}
+    for path in sorted(glob.glob(os.path.join(rec_dir, "*.jsonl"))):
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("ev") != "tick" or ev.get("ts", 0) < cutoff:
+                        continue
+                    key = (ev.get("symbol", "?"), ev.get("chain", "sol"), ev.get("address", ""))
+                    series.setdefault(key, []).append({
+                        "ts": float(ev["ts"]), "price": float(ev["price"]),
+                        "liq": float(ev.get("liq", 0)), "vol_h1": float(ev.get("vol_h1", 0)),
+                    })
+        except Exception:
+            continue
+    for k in series:
+        series[k].sort(key=lambda r: r["ts"])
+    return {k: v for k, v in series.items() if len(v) >= 2}
 
 
 # ── Drive the whole backtest ────────────────────────────────────────────────────
@@ -317,21 +380,26 @@ def tokens_from_trade_log(days: int) -> List[Tuple[str, str, str, str]]:
 
 def run(modes: List[str], days: int,
         tokens: Optional[List[Tuple[str, str, str, str]]] = None,
-        verbose: bool = False) -> Dict[str, Dict[str, Any]]:
-    if tokens is None:
-        tokens = tokens_from_trade_log(days)
-    if not tokens:
-        print("No tokens to backtest — pass --tokens, use --source scanner, or run the bot first.")
+        verbose: bool = False, entry: str = "momentum", recorded: bool = False,
+        histories: Optional[Dict[Tuple[str, str, str], List[Dict[str, float]]]] = None
+        ) -> Dict[str, Dict[str, Any]]:
+    if histories is None:
+        if tokens is None:
+            tokens = tokens_from_trade_log(days)
+        if not tokens:
+            print("No tokens to backtest — pass --tokens, use --source scanner/recording, or run the bot first.")
+            return {}
+        print(f"Fetching {len(tokens)} token histories (real {days}-day price paths)…")
+        histories = {}
+        for sym, chain, addr, pool in tokens:
+            h = fetch_history(chain, addr, days, pool_addr=pool)
+            if h:
+                histories[(sym, chain, addr)] = h
+            print(f"  {sym:<12} {chain:<6} {len(h):>4} candles")
+            _real_time.sleep(2.2)   # respect GeckoTerminal's free rate limit
+    if not histories:
+        print("No price history found for any token.")
         return {}
-
-    print(f"Fetching {len(tokens)} token histories (real {days}-day price paths)…")
-    histories: Dict[Tuple[str, str, str], List[Dict[str, float]]] = {}
-    for sym, chain, addr, pool in tokens:
-        h = fetch_history(chain, addr, days, pool_addr=pool)
-        if h:
-            histories[(sym, chain, addr)] = h
-        print(f"  {sym:<12} {chain:<6} {len(h):>4} candles")
-        _real_time.sleep(2.2)   # respect GeckoTerminal's free rate limit
 
     # ── Replay (this is the fast 'sim': a whole week crunches in seconds) ──
     t0 = _real_time.time()
@@ -342,7 +410,7 @@ def run(modes: List[str], days: int,
         candle_count += len(h)
         row = []
         for m in modes:
-            r = replay_episode(sym, chain, addr, h, m)
+            r = replay_episode(sym, chain, addr, h, m, entry=entry)
             if not r:
                 row.append(f"{m}: —")
                 continue
@@ -369,11 +437,16 @@ def run(modes: List[str], days: int,
         print(f"{m:<9}{('+$' if a['pnl']>=0 else '-$')+format(abs(a['pnl']),'.2f'):>12}"
               f"{a['trades']:>9}{win:>7.0f}%{('+'+format(a['peak'],'.0f')+'%'):>12}")
     print("-" * 64)
-    print("Caveats: entry at start of window (this backtests EXIT + SIZING, where the")
-    print("  big losses were). Buyer/seller gate skipped (no OHLCV trade split).")
-    print("  Liquidity held constant (OHLCV has no historical liq) → models price exits")
-    print("  (TP ladder, trailing, stall, velocity, SL) but NOT rug/liq-drain exits.")
-    print("  Slippage, gas and exit price-impact ARE modelled (same code as live).")
+    if recorded:
+        print("Source: live RECORDING — real entry moments + real per-tick liquidity, so")
+        print("  rug/liq-drain exits ARE modelled. This is the faithful backtest.")
+    else:
+        ent = "momentum (enters only when the live filter would)" if entry == "momentum" \
+              else "start-of-window (buys the top of trending tokens)"
+        print(f"Caveats: entry = {ent}. Buyer/seller gate skipped (no OHLCV trade split).")
+        print("  Liquidity held constant (OHLCV has no historical liq) → models price exits")
+        print("  but NOT rug/liq-drain. Run --source recording (after the bot records a few")
+        print("  days) for real entry timing + liquidity. Slippage+gas+exit-impact modelled.")
     return agg
 
 
@@ -381,10 +454,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Replay the past week through the bot's real strategy")
     ap.add_argument("--days", type=int, default=7, help="how many days of history (default 7)")
     ap.add_argument("--modes", default="safe,default,hype,degen")
-    ap.add_argument("--source", choices=["scanner", "tradelog"], default="scanner",
-                    help="scanner = pull a fresh trending universe; tradelog = tokens the bot traded")
+    ap.add_argument("--source", choices=["scanner", "tradelog", "recording"], default="scanner",
+                    help="scanner = fresh trending universe; tradelog = tokens the bot traded; "
+                         "recording = the bot's own forward recording (most faithful)")
     ap.add_argument("--limit", type=int, default=30, help="max tokens to pull (scanner source)")
     ap.add_argument("--tokens", default="", help="comma list of chain:address (overrides --source)")
+    ap.add_argument("--entry", choices=["momentum", "start"], default="momentum",
+                    help="momentum = enter only when the live filter fires; start = buy at window open")
     ap.add_argument("--verbose", action="store_true", help="print each token's per-mode result")
     args = ap.parse_args(argv)
 
@@ -395,12 +471,23 @@ def main(argv: Optional[List[str]] = None) -> None:
         for item in args.tokens.split(","):
             chain, _, addr = item.partition(":")
             tokens.append((addr[:6].upper(), chain.strip(), addr.strip(), ""))
+    elif args.source == "recording":
+        bot.load_state()
+        hist = histories_from_recording(args.days)
+        if not hist:
+            print("No recording found yet. The bot records as it trades — give it a few "
+                  "hours/days, then re-run with --source recording.")
+            return
+        # recorded ticks start at the real entry moment → enter at the first tick
+        run(modes, args.days, verbose=args.verbose, entry="start",
+            recorded=True, histories=hist)
+        return
     elif args.source == "scanner":
         print(f"Pulling a {args.limit}-token trending universe from the online scanners…")
         tokens = fetch_universe(limit=args.limit)
     else:
         bot.load_state()   # so tokens_from_trade_log sees the live history
-    run(modes, args.days, tokens, verbose=args.verbose)
+    run(modes, args.days, tokens, verbose=args.verbose, entry=args.entry)
 
 
 if __name__ == "__main__":

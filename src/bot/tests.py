@@ -2733,12 +2733,13 @@ class TestBacktest(unittest.TestCase):
         _reset(1000.0)
 
     @staticmethod
-    def _ticks(prices, liq=100000.0, step_sec=300):
+    def _ticks(prices, liq=100000.0, step_sec=300, vol=300000.0):
+        # vol high enough that hype (vol/liq*40) clears the moonshot hype floor
         return [{"ts": 1_700_000_000.0 + i * step_sec, "price": p,
-                 "liq": liq, "vol_h1": 50000.0} for i, p in enumerate(prices)]
+                 "liq": liq, "vol_h1": vol} for i, p in enumerate(prices)]
 
     def test_replay_winner_is_profitable(self):
-        # steady climb to +300% then flat → should bank a gain and leave globals intact
+        # steady climb to +300% then flat → momentum entry fires, banks a gain
         ticks = self._ticks([1.0] + [1.0 + 0.2 * i for i in range(1, 20)])
         r = bt.replay_episode("PUMP", "sol", "0xpump", ticks, "degen")
         self.assertIsNotNone(r)
@@ -2748,12 +2749,18 @@ class TestBacktest(unittest.TestCase):
         self.assertEqual(bot.CONFIG["mode"], "default")
 
     def test_replay_rug_is_a_loss(self):
-        # pumps then liquidity craters → rug/trailing exit → a loss, position closed
-        ticks = self._ticks([1.0, 1.2, 1.3], liq=100000.0)
+        # rises (momentum entry fires) then craters → exit at a loss, position closed
+        ticks = self._ticks([1.0, 1.05, 1.1, 1.15, 1.2, 1.25])
         ticks += [{"ts": ticks[-1]["ts"] + 300, "price": 0.2, "liq": 1000.0, "vol_h1": 100.0}]
         r = bt.replay_episode("PUMP", "sol", "0xpump", ticks, "degen")
         self.assertIsNotNone(r)
         self.assertLess(r["pnl"], 0)
+
+    def test_momentum_entry_skips_pure_decliner(self):
+        # a token that only falls never triggers a momentum entry → no trade (no loss)
+        ticks = self._ticks([1.0 - 0.03 * i for i in range(12)])
+        self.assertIsNone(bt.find_entry_index(ticks))
+        self.assertIsNone(bt.replay_episode("DUMP", "sol", "0xd", ticks, "degen"))
 
     def test_replay_skips_too_thin_for_mode(self):
         # $20k pool is below safe mode's $50k floor → no entry under safe
@@ -2782,6 +2789,33 @@ class TestBacktest(unittest.TestCase):
              patch.object(bot, "_get", return_value=[]):
             u = bt.fetch_universe(limit=5, chains=["sol"])
         self.assertTrue(any(t[2] == "TOKENADDR" and t[3] == "poolA" for t in u))
+
+    def test_recorder_writes_and_backtest_reads_it(self):
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        bot.RECORDER["enabled"] = True
+        bot.RECORDER["dir"] = d
+        bot.RECORDER["tick_sec"] = 0          # don't throttle in the test
+        bot._REC_TS.clear()
+        p = {"chain": "sol", "address": "0xrec"}
+        # record a rising-then-crashing tick path for one held position
+        for i, (price, liq) in enumerate([(1.0, 100000), (1.2, 100000), (0.3, 5000)]):
+            with patch.object(bot, "now_utc",
+                              return_value=bot.datetime.fromtimestamp(1_700_000_000 + i*60,
+                                                                      tz=bot.timezone.utc)):
+                bot._record_tick("REC", p, bot._px_dict(price, liq, 200000.0, 0.0))
+        self.assertTrue(_os.path.exists(_os.path.join(d, _os.listdir(d)[0])))
+        hist = bt.histories_from_recording(days=3650, rec_dir=d)
+        self.assertIn(("REC", "sol", "0xrec"), hist)
+        self.assertEqual(len(hist[("REC", "sol", "0xrec")]), 3)
+
+    def test_recorder_disabled_writes_nothing(self):
+        import tempfile, os as _os
+        d = tempfile.mkdtemp()
+        bot.RECORDER["enabled"] = False
+        bot._record_tick("X", {"chain": "sol"}, bot._px_dict(1.0))
+        self.assertEqual(_os.listdir(d), [])
+        bot.RECORDER["enabled"] = True
 
 
 if __name__ == "__main__":

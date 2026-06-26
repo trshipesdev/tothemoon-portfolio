@@ -293,6 +293,62 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ── Forward recorder ───────────────────────────────────────────────────────────
+# Append a compact, timestamped log of what the bot SAW (entered candidates) and the
+# per-tick price/liquidity of positions it HELD, so the backtester can later replay
+# the REAL entry moments and REAL liquidity path (rug/liq-drain modelling). Best-effort
+# and throttled; never allowed to break the engine. Toggle with RECORDER env (default on).
+RECORDER = {
+    "enabled":   os.getenv("RECORDER", "true").lower() != "false",
+    "dir":       os.path.join(os.path.dirname(SAVEFILE) or ".", "recordings"),
+    "tick_sec":  30,    # min seconds between recorded ticks per position
+    "keep_days": 14,    # prune recordings older than this
+}
+_REC_TS: Dict[str, float] = {}   # symbol → last recorded tick time (module-level, not in STATE)
+_REC_PRUNED_DAY = {"d": ""}
+
+
+def _record(ev: Dict[str, Any]) -> None:
+    """Append one event to today's recording file. Best-effort; swallows all errors."""
+    if not RECORDER["enabled"]:
+        return
+    try:
+        os.makedirs(RECORDER["dir"], exist_ok=True)
+        day = now_utc().date().isoformat()
+        if _REC_PRUNED_DAY["d"] != day:        # prune once per day
+            _REC_PRUNED_DAY["d"] = day
+            _prune_recordings()
+        ev.setdefault("ts", now_utc().timestamp())
+        with open(os.path.join(RECORDER["dir"], f"{day}.jsonl"), "a") as f:
+            f.write(json.dumps(ev, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def _prune_recordings() -> None:
+    import glob
+    try:
+        cutoff = now_utc().timestamp() - RECORDER["keep_days"] * 86400
+        for p in glob.glob(os.path.join(RECORDER["dir"], "*.jsonl")):
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+    except Exception:
+        pass
+
+
+def _record_tick(symbol: str, p: Dict[str, Any], px: Dict[str, float]) -> None:
+    """Record a position's price/liq/vol, throttled to RECORDER['tick_sec']."""
+    if not RECORDER["enabled"]:
+        return
+    last = _REC_TS.get(symbol, 0.0)
+    if time.time() - last < RECORDER["tick_sec"]:
+        return
+    _REC_TS[symbol] = time.time()
+    _record({"ev": "tick", "symbol": symbol, "chain": p.get("chain", "sol"),
+             "address": p.get("address", ""), "price": px.get("price", 0.0),
+             "liq": px.get("liq", 0.0), "vol_h1": px.get("vol_h1", 0.0)})
+
+
 # DexScreener chain slugs for building clickable token links
 DEX_CHAIN_SLUG = {"sol": "solana", "eth": "ethereum", "base": "base", "bsc": "bsc", "poly": "polygon"}
 
@@ -3073,6 +3129,9 @@ def scan_candidates():
                 if usd >= CONFIG["moonshot"]["min_ticket_usd"] and est_price_impact(usd, liq) <= CONFIG["moonshot"]["price_impact_max"]:
                     shadow_buy(symbol, chain, usd, price, liq, addr)
                     STATE["entries_today"][symbol] = STATE["entries_today"].get(symbol, 0) + 1
+                    _record({"ev": "entry", "symbol": symbol, "chain": chain, "address": addr,
+                             "price": price, "liq": liq, "hype": sc.hype,
+                             "buy_ratio": sc.buy_ratio, "usd": usd})
                     log(f"ENTER {symbol} new launch ${usd:.2f} (presale score {ps})")
                     send_alert(
                         f"🚀 BOUGHT {symbol} ({chain}) — a new token that passed every safety filter "
@@ -3174,6 +3233,7 @@ def manage_positions():
         vol_h1    = px["vol_h1"]
         change_m5 = px["change_m5"]
         entry_ts  = datetime.fromisoformat(p.get("time", now_utc().isoformat())).timestamp()
+        _record_tick(s, p, px)   # forward recorder: real per-tick price/liq for backtests
 
         # Track peak price (+ when it was last set, for stall detection)
         if price > p.get("peak_price", 0):
