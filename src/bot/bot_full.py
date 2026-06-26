@@ -99,11 +99,11 @@ CONFIG: Dict[str, Any] = {
     "reserve_pct":          0.25,   # keep 25% of vault untouched
     "per_token_cap_pct":    0.12,   # max 12% of deployable per token  ← real risk cap
     "per_chain_cap_pct":    {"sol": 0.40, "eth": 0.35, "base": 0.25, "bsc": 0.30, "poly": 0.25},  # ← real risk cap
-    # Raised 0.40→1.0 after live evidence: 5/5 tokens the bot flagged as "suggested"
-    # (couldn't afford) mooned +123% to +570%. The daily cap throttles TURNOVER, not
-    # point-in-time RISK (which the reserve + per-chain + per-token caps + drawdown
-    # brake already bound), so it was costing huge gains. 1.0 = can cycle the full
-    # deployable balance once per day.
+    # Now tracks NET new exposure (capital is returned to the budget when a position
+    # closes — see shadow_sell), not gross turnover, so the bot can cycle into the next
+    # moonshot after banking a winner. 1.0 = up to 100% of deployable in fresh positions
+    # at once. Real point-in-time risk stays bounded by reserve + per-chain + per-token
+    # caps + the drawdown brake.
     "daily_deploy_cap_pct": 1.0,
     "drawdown_brake":       {"lookback": 30, "dd": 0.25, "size_mult": 0.60},
 
@@ -875,6 +875,10 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
         pos["fees_usd"] = 0.0
     pos["realized"]    += pnl
     STATE["gas_paid_usd"] = STATE.get("gas_paid_usd", 0.0) + gas
+    # Return the freed capital to today's deploy budget so the daily cap tracks NET
+    # new exposure, not gross turnover — lets the bot cycle into the next moonshot
+    # after closing a winner instead of being budget-locked for the day.
+    STATE["open_today_usd"] = max(0.0, STATE.get("open_today_usd", 0.0) - cost)
     if STATE.get("skim", {}).get("enabled") and pnl > 0:
         skim = pnl * CONFIG.get("skim_pct", 0.10)
         STATE["income_usd"] = STATE.get("income_usd", 0.0) + skim

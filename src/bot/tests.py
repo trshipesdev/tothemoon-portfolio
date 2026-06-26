@@ -599,6 +599,22 @@ class TestShadowBuy(unittest.TestCase):
         bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
         self.assertAlmostEqual(bot.STATE["open_today_usd"], 50.0, places=2)
 
+    def test_sell_returns_capital_to_daily_budget(self):
+        # Net-exposure tracking: closing a position frees its cost back into the day's budget
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        self.assertAlmostEqual(bot.STATE["open_today_usd"], 50.0, places=2)
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)  # full close
+        self.assertAlmostEqual(bot.STATE["open_today_usd"], 0.0, places=1)
+
+    def test_sell_daily_budget_never_negative(self):
+        bot.STATE["open_today_usd"] = 0.0
+        bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
+        bot.STATE["open_today_usd"] = 0.0   # simulate a position opened on a prior day
+        pos = bot.STATE["positions"]["TST"]
+        bot.shadow_sell("TST", pos["usd"], 1.0, 100000.0)
+        self.assertGreaterEqual(bot.STATE["open_today_usd"], 0.0)
+
     def test_units_computed(self):
         bot.shadow_buy("TST", "sol", 50.0, 1.0, 100000.0)
         self.assertGreater(bot.STATE["positions"]["TST"]["units"], 0.0)
