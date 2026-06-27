@@ -456,9 +456,40 @@
         </div>
       </div>
 
-      <!-- Manual Buy -->
+      <!-- Manual Buy / Quick Sim -->
       <div class="bg-gray-900 rounded-xl p-4 space-y-2">
-        <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-3">Manual Buy</h3>
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-gray-500 text-xs uppercase tracking-wider">Simulate Trade</h3>
+          <button @click="findHotToken()"
+                  :disabled="buy.finding"
+                  class="flex items-center gap-1 bg-indigo-800 hover:bg-indigo-700 disabled:opacity-40 rounded-lg px-2 py-1 text-xs font-bold transition-colors">
+            <span x-text="buy.finding ? '…' : '⚡ Find Hot Token'"></span>
+          </button>
+        </div>
+        <!-- Token preview card when auto-filled -->
+        <div x-show="buy.preview" x-cloak class="bg-gray-800 rounded-lg px-3 py-2 text-xs space-y-0.5">
+          <div class="flex justify-between">
+            <span class="text-gray-400">Token</span>
+            <span class="text-white font-bold" x-text="buy.symbol"></span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-gray-400">Price</span>
+            <span class="text-gray-200" x-text="'$' + (buy.preview?.price || 0).toFixed(10)"></span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-gray-400">Liquidity</span>
+            <span class="text-gray-200" x-text="'$' + fmt(buy.preview?.liq)"></span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-gray-400">Age / Buy ratio</span>
+            <span class="text-gray-200" x-text="(buy.preview?.age_min || 0) + 'min · ' + Math.round((buy.preview?.buy_ratio||0)*100) + '% buys'"></span>
+          </div>
+          <div class="flex justify-between">
+            <span class="text-gray-400">Momentum</span>
+            <span :class="(buy.preview?.ch_m5||0)>=0 ? 'text-green-400' : 'text-red-400'"
+                  x-text="(buy.preview?.ch_m5>=0?'+':'') + (buy.preview?.ch_m5||0).toFixed(1) + '% (5m)'"></span>
+          </div>
+        </div>
         <input x-model="buy.symbol" placeholder="SYMBOL" maxlength="20"
                class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs uppercase placeholder-gray-600 focus:border-blue-500"/>
         <div class="flex gap-2">
@@ -1352,7 +1383,7 @@ function app() {
     scoutCounts:  {},
     scoutFilter:  'all',
 
-    buy:      { symbol: '', usd: '', chain: 'sol', address: '' },
+    buy:      { symbol: '', usd: '', chain: 'sol', address: '', finding: false, preview: null },
     sell:     { symbol: '', amount: '100%' },
     boost:    { mult: '2', hours: '4' },
     obj:      { target: '', weeks: '' },
@@ -1449,7 +1480,7 @@ function app() {
         if (v === 'History') this.$nextTick(() => this.drawChart());
       });
       await this.refresh();
-      setInterval(() => this.refresh(), 20000);
+      setInterval(() => this.refresh(), 3000);
     },
 
     async refresh() {
@@ -1591,13 +1622,31 @@ function app() {
       await this.refresh();
     },
 
+    async findHotToken() {
+      this.buy.finding = true;
+      try {
+        const d = await this.get('/api/sim_hot');
+        if (d && d.symbol) {
+          this.buy.symbol  = d.symbol;
+          this.buy.chain   = d.chain || 'sol';
+          this.buy.address = d.address || '';
+          this.buy.usd     = this.buy.usd || '25';
+          this.buy.preview = d;
+        } else {
+          this.toast = { show: true, msg: d?.error || 'No candidates right now', ok: false };
+        }
+      } finally {
+        this.buy.finding = false;
+      }
+    },
+
     async submitBuy() {
       if (!this.buy.symbol || !this.buy.usd) return;
       const ok = await this.post('/api/buy', {
         symbol: this.buy.symbol.toUpperCase(), usd: +this.buy.usd,
         chain: this.buy.chain, address: this.buy.address,
       });
-      if (ok) { this.buy = { symbol: '', usd: '', chain: 'sol', address: '' }; await this.refresh(); }
+      if (ok) { this.buy = { symbol: '', usd: '', chain: 'sol', address: '', finding: false, preview: null }; await this.refresh(); }
     },
     async submitSell() {
       if (!this.sell.symbol) return;

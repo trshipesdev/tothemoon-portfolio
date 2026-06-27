@@ -2979,6 +2979,69 @@ def api_config():
     return jsonify({"ok": True})
 
 
+@app.route("/api/sim_hot", methods=["GET"])
+@_dash_auth
+def api_sim_hot():
+    """Return a live DexScreener candidate matching current mode filters — for dashboard Quick Sim."""
+    mode_cfg = CONFIG["modes"].get(CONFIG["mode"], CONFIG["modes"]["default"])
+    liq_min  = mode_cfg.get("liq_min", 15000)
+    age_max  = mode_cfg.get("max_age_min", 180)
+    try:
+        import time as _time
+        data  = _get("https://api.dexscreener.com/token-profiles/latest/v1") or []
+        addrs = [item["tokenAddress"] for item in (data if isinstance(data, list) else [])
+                 if item.get("chainId") == "solana"][:20]
+        if not addrs:
+            return jsonify({"error": "no candidates from DexScreener"}), 503
+        pairs_data = _get(DEXSCREENER_TOKEN + ",".join(addrs)) or {}
+        pairs = pairs_data.get("pairs") or []
+        now_ms = _time.time() * 1000
+        best = None
+        best_score = -9999
+        for p in pairs:
+            if p.get("chainId") != "solana":
+                continue
+            liq    = float((p.get("liquidity") or {}).get("usd") or 0)
+            if liq < liq_min:
+                continue
+            age_ms = now_ms - (p.get("pairCreatedAt") or now_ms)
+            age_min = age_ms / 60000
+            if age_min > age_max:
+                continue
+            # skip tokens already in open positions or recently exited
+            sym  = (p.get("baseToken") or {}).get("symbol", "")
+            if sym in STATE.get("positions", {}) or sym in STATE.get("recently_exited", {}):
+                continue
+            vol_h1  = float((p.get("volume") or {}).get("h1") or 0)
+            ch_m5   = float((p.get("priceChange") or {}).get("m5") or 0)
+            ch_h1   = float((p.get("priceChange") or {}).get("h1") or 0)
+            buys    = int((p.get("txns") or {}).get("h1", {}).get("buys") or 0)
+            sells   = int((p.get("txns") or {}).get("h1", {}).get("sells") or 0)
+            ratio   = buys / (buys + sells) if (buys + sells) > 0 else 0
+            if ratio < 0.45 or ch_m5 < 0:
+                continue
+            score = ch_m5 + ratio * 20 + (vol_h1 / 10000)
+            if score > best_score:
+                best_score = score
+                best = {
+                    "symbol":  sym,
+                    "address": (p.get("baseToken") or {}).get("address", ""),
+                    "chain":   "sol",
+                    "price":   float(p.get("priceUsd") or 0),
+                    "liq":     liq,
+                    "age_min": round(age_min),
+                    "vol_h1":  round(vol_h1),
+                    "ch_m5":   ch_m5,
+                    "ch_h1":   ch_h1,
+                    "buy_ratio": round(ratio, 2),
+                }
+        if not best:
+            return jsonify({"error": "no token matched current mode filters"}), 404
+        return jsonify(best)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/export", methods=["GET"])
 @_dash_auth
 def api_export():
