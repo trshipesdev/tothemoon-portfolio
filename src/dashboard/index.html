@@ -1043,6 +1043,11 @@
                         class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-gray-500">no cap</button>
                 <button @click="btParams = {...btParams, cooldown_min:0}"
                         class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-gray-500">no cooldown</button>
+                <template x-for="[name, params] in Object.entries(customModes)" :key="name">
+                  <button @click="loadCustomMode(params)"
+                          class="text-xs bg-indigo-900 hover:bg-indigo-800 rounded px-3 py-1 text-indigo-300"
+                          x-text="name"></button>
+                </template>
               </div>
 
               <!-- Save as runnable mode -->
