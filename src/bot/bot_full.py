@@ -61,7 +61,7 @@ CONFIG: Dict[str, Any] = {
         "evm_hex_key_env":          "WALLET_PK_EVM",
     },
 
-    "chains": ["sol", "eth", "base", "bsc", "poly"],
+    "chains": ["sol"],  # EVM disabled: 0% WR on eth, 25% on base/bsc — all losses, no wins
     "scan": {
         "new_max_age_min":      120,  # pairs ≤ this age treated as NEW
         "hype_window_min":      240,
@@ -160,6 +160,7 @@ CONFIG: Dict[str, Any] = {
         # Momentum exit params
         "trailing_stop_pct": 0.15,  # exit if price falls >15% from peak
         "velocity_exit_pct": 0.08,  # exit if m5 price change < -8% (single tick crash)
+        "velocity_2m_pct":   0.12,  # exit if internal 2-min drop ≥ 12% (catches slow rugs early)
         "vol_dry_pct":       0.20,  # alert if h1 vol < 20% of entry vol
         "liq_drain_ticks":   3,     # exit if liq declining for 3 consecutive ticks
         "liq_drain_pct":     0.05,  # each tick must drop >5% to count as drain
@@ -3779,12 +3780,19 @@ def scan_candidates():
                 _scout(symbol, chain, "rejected",
                        f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, pnl=${_rex_pnl:.2f})", sc, addr)
                 continue
-            if _rex_pnl >= 0 and _rex_elapsed < 15 * 60 and _rex_price > 0:
-                _pullback = (_rex_price - price) / _rex_price
-                if _pullback < 0.08:
+            if _rex_pnl >= 0 and _rex_elapsed < 15 * 60:
+                # Hard minimum: never re-enter within 60s of a profit exit regardless of price.
+                # TOPDOG re-bought 0s after selling — no time for price to have pulled back.
+                if _rex_elapsed < 60:
                     _scout(symbol, chain, "rejected",
-                           f"profit-chase block: price {_pullback*100:.1f}% below exit (need 8%)", sc, addr)
+                           f"profit-chase block: only {_rex_elapsed:.0f}s since exit (min 60s)", sc, addr)
                     continue
+                if _rex_price > 0:
+                    _pullback = (_rex_price - price) / _rex_price
+                    if _pullback < 0.08:
+                        _scout(symbol, chain, "rejected",
+                               f"profit-chase block: price {_pullback*100:.1f}% below exit (need 8%)", sc, addr)
+                        continue
         # Anti-churn: applies to ALL tokens regardless of age (same reasoning as cooldown fix).
         # Without this, tokens older than new_max_age_min had no per-day entry cap from the scanner.
         entry_cap = CONFIG["modes"].get(CONFIG["mode"], {}).get(
@@ -4002,9 +4010,24 @@ def manage_positions():
             exit_reason = f"RUG liq {prev_liq:.0f}→{liq:.0f}"
         STATE["liq_prev"][s] = liq
 
-        # 2. Velocity exit — sharp m5 drop (rug unfolding, panic sell)
+        # 2. Velocity exit — sharp price drop signals rug unfolding or panic sell.
+        #    2a: DexScreener m5 drop (standard check)
         if exit_reason is None and change_m5 < -(MS["velocity_exit_pct"] * 100):
             exit_reason = f"VELOCITY {change_m5:.1f}% in 5m"
+        #    2b: Internal 2-min drop check using tick-tracked price history.
+        #        Data: 0.5s polling → ~240 ticks/2min. We store last 240 prices per position.
+        #        If price dropped ≥ 12% vs the oldest of the last 240 ticks → exit fast.
+        #        Catches slow rugs that haven't shown up in the 5-min window yet.
+        if exit_reason is None:
+            _price_hist = p.setdefault("price_hist_2m", [])
+            _price_hist.append((time.time(), price))
+            if len(_price_hist) > 240:
+                _price_hist[:] = _price_hist[-240:]
+            if len(_price_hist) >= 60:   # need ≥ 30s of data before firing
+                _oldest_price = _price_hist[0][1]
+                if _oldest_price > 0 and price < _oldest_price * (1 - MS.get("velocity_2m_pct", 0.12)):
+                    _drop_pct = (_oldest_price - price) / _oldest_price * 100
+                    exit_reason = f"VELOCITY2M -{_drop_pct:.1f}% in {len(_price_hist)/2:.0f}s"
 
         # 3. Trailing stop — drop from peak (locks in gains, cuts reversals). Once the
         #    ladder is done, the moon bag rides a WIDE trailing stop to catch +500% runners.
