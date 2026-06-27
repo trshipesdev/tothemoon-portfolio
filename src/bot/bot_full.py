@@ -2632,8 +2632,9 @@ def api_sim100():
                 trades_out.append({**t, "sim_status": "blocked", "sim_usd": 0, "sim_pnl": None})
                 continue
 
-            # 3. Per-token cap: 12% of current portfolio per symbol
-            token_cap = PER_TOKEN_CAP_PCT * total_now
+            # 3. Per-token cap: 12% of real-vault equivalent (sim × 10 since we start at $100 vs $1000).
+            # Using raw sim total makes the cap $12 on a $100 start — too tight to allow even one buy.
+            token_cap = PER_TOKEN_CAP_PCT * (total_now * 10)
             cap_room  = max(0.0, token_cap - open_pos.get(sym, 0.0))
             if cap_room < 10.0:
                 blocked += 1
