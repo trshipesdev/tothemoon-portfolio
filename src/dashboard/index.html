@@ -1389,6 +1389,35 @@
                 class="w-full bg-yellow-700 hover:bg-yellow-600 rounded-lg py-2 text-xs font-bold">⬆ Apply import</button>
       </div>
 
+      <!-- Profit sweep -->
+      <div class="bg-gray-900 rounded-xl p-4 space-y-3 border border-emerald-900/40">
+        <div class="flex items-center justify-between">
+          <h3 class="text-emerald-400 text-xs uppercase tracking-wider">Profit sweep</h3>
+          <span :class="state.sweep_enabled ? 'text-emerald-400' : 'text-gray-600'"
+                class="text-xs" x-text="state.sweep_enabled ? 'active' : 'not configured'"></span>
+        </div>
+        <p class="text-gray-500 text-xs">
+          When balance exceeds
+          <span class="text-white" x-text="state.sweep_enabled ? '$'+state.sweep_above_usd : '—'"></span>,
+          sweeps down to
+          <span class="text-white" x-text="state.sweep_enabled ? '$'+state.sweep_keep_usd : '—'"></span>
+          into your cold wallet after each live sell.
+          Set <code class="text-gray-400">SWEEP_SOL_ADDRESS</code>, <code class="text-gray-400">SWEEP_ABOVE_USD</code>,
+          <code class="text-gray-400">SWEEP_KEEP_USD</code> in <code class="text-gray-400">.env</code>.
+        </p>
+        <div class="grid grid-cols-2 gap-2 text-xs" x-show="state.sweep_enabled">
+          <div class="bg-gray-800 rounded-lg p-2 text-center">
+            <div class="text-gray-500">Total swept</div>
+            <div class="text-emerald-400 font-bold" x-text="'$'+fmt(state.total_swept_usd ?? 0)"></div>
+          </div>
+          <div class="bg-gray-800 rounded-lg p-2 text-center">
+            <div class="text-gray-500">Last sweep</div>
+            <div class="text-white font-mono text-xs"
+                 x-text="state.last_sweep ? '$'+fmt(state.last_sweep.amount_usd)+' · '+fmtTime(state.last_sweep.ts) : '—'"></div>
+          </div>
+        </div>
+      </div>
+
       <!-- Danger zone -->
       <div class="bg-gray-900 rounded-xl p-4 space-y-3 border border-red-900/40">
         <h3 class="text-red-500 text-xs uppercase tracking-wider">Danger zone</h3>

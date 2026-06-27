@@ -1682,7 +1682,10 @@ def exec_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reason
     pos     = STATE["positions"].get(symbol, {})
     chain   = pos.get("chain", "sol")
     address = pos.get("address", "")
-    return live_sell(symbol, chain, usd, price, liq_usd, address)
+    result  = live_sell(symbol, chain, usd, price, liq_usd, address)
+    if not result.get("error") and chain == "sol":
+        _maybe_sweep()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1738,6 +1741,123 @@ def refresh_vault_balance():
     if total > 0:
         STATE["vault_usd"] = total
         log(f"Live vault: ${total:.2f}")
+
+
+# ---------------------------------------------------------------------------
+# Profit sweep — transfer excess USDC to cold wallet after each sell
+# ---------------------------------------------------------------------------
+_SOL_TOKEN_PROG    = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+_SOL_ASSOC_PROG    = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1brs"
+_SOL_SYSTEM_PROG   = "11111111111111111111111111111111"
+
+
+def _find_sol_ata(wallet: str, mint: str) -> str:
+    from solders.pubkey import Pubkey  # type: ignore
+    tok  = Pubkey.from_string(_SOL_TOKEN_PROG)
+    assoc = Pubkey.from_string(_SOL_ASSOC_PROG)
+    seeds = [bytes(Pubkey.from_string(wallet)), bytes(tok), bytes(Pubkey.from_string(mint))]
+    ata, _ = Pubkey.find_program_address(seeds, assoc)
+    return str(ata)
+
+
+def _sweep_usdc_sol(amount_usdc: float, cold_address: str) -> str:
+    """Send amount_usdc USDC from the hot wallet to cold_address. Returns tx signature."""
+    import base64, struct
+    from solders.pubkey import Pubkey          # type: ignore
+    from solders.instruction import AccountMeta, Instruction  # type: ignore
+    from solders.message import MessageV0      # type: ignore
+    from solders.transaction import VersionedTransaction  # type: ignore
+    from solders.hash import Hash              # type: ignore
+
+    kp      = _sol_keypair()
+    hot_pk  = kp.pubkey()
+    cold_pk = Pubkey.from_string(cold_address)
+    mint_pk = Pubkey.from_string(USDC_MINT_SOL)
+    tok_pk  = Pubkey.from_string(_SOL_TOKEN_PROG)
+    assoc_pk = Pubkey.from_string(_SOL_ASSOC_PROG)
+    sys_pk  = Pubkey.from_string(_SOL_SYSTEM_PROG)
+
+    src_ata = Pubkey.from_string(_find_sol_ata(str(hot_pk), USDC_MINT_SOL))
+    dst_ata = Pubkey.from_string(_find_sol_ata(cold_address, USDC_MINT_SOL))
+
+    # Idempotent create destination ATA (no-ops if it already exists)
+    create_ix = Instruction(
+        program_id=assoc_pk,
+        accounts=[
+            AccountMeta(pubkey=hot_pk,   is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=dst_ata,  is_signer=False, is_writable=True),
+            AccountMeta(pubkey=cold_pk,  is_signer=False, is_writable=False),
+            AccountMeta(pubkey=mint_pk,  is_signer=False, is_writable=False),
+            AccountMeta(pubkey=sys_pk,   is_signer=False, is_writable=False),
+            AccountMeta(pubkey=tok_pk,   is_signer=False, is_writable=False),
+        ],
+        data=bytes([1]),  # 1 = CreateAssociatedTokenAccountIdempotent
+    )
+
+    # SPL Token Transfer
+    units = int(amount_usdc * 10 ** USDC_DECIMALS)
+    transfer_ix = Instruction(
+        program_id=tok_pk,
+        accounts=[
+            AccountMeta(pubkey=src_ata, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=dst_ata, is_signer=False, is_writable=True),
+            AccountMeta(pubkey=hot_pk,  is_signer=True,  is_writable=False),
+        ],
+        data=bytes([3]) + struct.pack("<Q", units),  # 3 = Transfer
+    )
+
+    rpc = _sol_rpc()
+    bh  = requests.post(rpc, json={
+        "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
+        "params": [{"commitment": "finalized"}],
+    }, timeout=10).json()["result"]["value"]["blockhash"]
+
+    msg = MessageV0.try_compile(
+        payer=hot_pk,
+        instructions=[create_ix, transfer_ix],
+        address_lookup_table_accounts=[],
+        recent_blockhash=Hash.from_string(bh),
+    )
+    tx      = VersionedTransaction(msg, [kp])
+    encoded = base64.b64encode(bytes(tx)).decode()
+
+    resp = requests.post(rpc, json={
+        "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+        "params": [encoded, {"encoding": "base64", "skipPreflight": False, "maxRetries": 3}],
+    }, timeout=30).json()
+    if "error" in resp:
+        raise RuntimeError(resp["error"])
+    return resp["result"]
+
+
+def _maybe_sweep():
+    """After a live sell: if USDC balance > SWEEP_ABOVE_USD, send excess to cold wallet."""
+    if SHADOW_MODE:
+        return
+    cold_addr   = os.getenv("SWEEP_SOL_ADDRESS", "").strip()
+    above_usd   = float(os.getenv("SWEEP_ABOVE_USD", "0").strip() or "0")
+    keep_usd    = float(os.getenv("SWEEP_KEEP_USD",  "200").strip() or "200")
+    if not cold_addr or above_usd <= 0:
+        return
+    balance = fetch_sol_balance()
+    if balance <= above_usd:
+        return
+    amount = round(balance - keep_usd, 2)
+    if amount < 1.0:
+        return
+    try:
+        sig = _sweep_usdc_sol(amount, cold_addr)
+        entry = {
+            "ts": now_utc().isoformat(), "amount_usd": amount,
+            "to": cold_addr, "sig": sig,
+        }
+        STATE.setdefault("sweep_log", []).append(entry)
+        STATE["total_swept_usd"] = round(STATE.get("total_swept_usd", 0.0) + amount, 2)
+        save_state()
+        log(f"SWEEP ${amount:.2f} USDC → {cold_addr[:8]}… sig={sig[:16]}…")
+    except Exception as e:
+        log(f"SWEEP FAILED: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Position manager
@@ -2405,6 +2525,11 @@ def api_state():
         "loss_cooldown_min": CONFIG["moonshot"].get("loss_cooldown_min", 30),
         "seed_pct":        int(CONFIG["moonshot"].get("seed_pct", 0.40) * 100),
         "per_token_cap_pct": CONFIG.get("per_token_cap_pct", 0.12),
+        "sweep_enabled":   bool(os.getenv("SWEEP_SOL_ADDRESS", "").strip() and float(os.getenv("SWEEP_ABOVE_USD", "0") or 0) > 0),
+        "sweep_above_usd": float(os.getenv("SWEEP_ABOVE_USD", "0") or 0),
+        "sweep_keep_usd":  float(os.getenv("SWEEP_KEEP_USD", "200") or 200),
+        "total_swept_usd": STATE.get("total_swept_usd", 0.0),
+        "last_sweep":      (STATE.get("sweep_log") or [None])[-1],
         "shadow_mode":     SHADOW_MODE,
         "moonshot_mode":   CONFIG["moonshot"]["mode"],
         "auto_old":        CONFIG["oldcoin"]["auto_join"],
