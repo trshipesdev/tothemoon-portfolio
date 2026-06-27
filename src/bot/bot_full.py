@@ -61,7 +61,7 @@ CONFIG: Dict[str, Any] = {
         "evm_hex_key_env":          "WALLET_PK_EVM",
     },
 
-    "chains": ["sol"],  # EVM disabled: 0% WR on eth, 25% on base/bsc — all losses, no wins
+    "chains": ["sol", "eth", "base", "bsc"],
     "scan": {
         "new_max_age_min":      120,  # pairs ≤ this age treated as NEW
         "hype_window_min":      240,
@@ -833,7 +833,7 @@ class Score:
         self.price     = price
 
 
-def moonshot_reject_reason(sc: Score) -> Optional[str]:
+def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     """Return a human-readable reason the candidate fails the filters, or None if it passes."""
     ms = CONFIG["moonshot"]
     spray = STATE.get("spray_until")
@@ -842,7 +842,10 @@ def moonshot_reject_reason(sc: Score) -> Optional[str]:
     # (degen $10k → more candidates, safe $50k → fewer/safer). Falls back to the
     # moonshot floor if a mode doesn't set one.
     mode_liq = CONFIG["modes"].get(CONFIG["mode"], {}).get("liq_min", ms["liq_min"])
-    liq_min  = mode_liq * (0.7 if spraying else 1.0)
+    # EVM chains need higher liq floors: ETH gas is $6/trade, thin pools are instantly fatal.
+    # Data: SOL 47% WR +$206 vs EVM chains -$138. Raise the bar, not the ban.
+    _evm_mult = {"eth": 5.0, "base": 3.0, "bsc": 3.0}
+    liq_min  = mode_liq * (0.7 if spraying else 1.0) * _evm_mult.get(chain, 1.0)
     hype_min = max(50, ms["hype_min"] - (20 if spraying else 0))
     if sc.liq < liq_min:
         return f"liquidity ${sc.liq:,.0f} below min ${liq_min:,.0f}"
@@ -863,8 +866,8 @@ def moonshot_reject_reason(sc: Score) -> Optional[str]:
     return None
 
 
-def passes_moonshot_filters(sc: Score) -> bool:
-    return moonshot_reject_reason(sc) is None
+def passes_moonshot_filters(sc: Score, chain: str = "sol") -> bool:
+    return moonshot_reject_reason(sc, chain) is None
 
 
 def _reject_spike_threshold(reason: str) -> float:
@@ -3802,7 +3805,7 @@ def scan_candidates():
                    f"already entered {entry_cap}x today (anti-churn)", sc, addr)
             continue
         if is_new:
-            reject = moonshot_reject_reason(sc)
+            reject = moonshot_reject_reason(sc, chain)
             if reject:
                 _scout(symbol, chain, "rejected", reject, sc, addr)
                 continue
