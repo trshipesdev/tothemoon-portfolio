@@ -885,7 +885,7 @@
                   <span>Starting vault</span>
                   <span class="text-white font-bold" x-text="'$'+btParams.start"></span>
                 </div>
-                <input type="range" min="50" max="1000" step="50" x-model.number="btParams.start"
+                <input type="range" min="50" max="10000" step="50" x-model.number="btParams.start"
                        class="w-full accent-emerald-500">
               </div>
 
@@ -894,7 +894,7 @@
                   <span>Bet size ×</span>
                   <span class="text-white font-bold" x-text="btParams.size_mult.toFixed(1)+'× ($'+(btParams.size_mult*30).toFixed(0)+')' "></span>
                 </div>
-                <input type="range" min="0.5" max="2.5" step="0.1" x-model.number="btParams.size_mult"
+                <input type="range" min="0.1" max="10.0" step="0.1" x-model.number="btParams.size_mult"
                        class="w-full accent-emerald-500">
               </div>
 
@@ -903,7 +903,7 @@
                   <span>Stop loss %</span>
                   <span class="text-white font-bold" x-text="btParams.sl_pct+'%'"></span>
                 </div>
-                <input type="range" min="5" max="40" step="1" x-model.number="btParams.sl_pct"
+                <input type="range" min="1" max="60" step="1" x-model.number="btParams.sl_pct"
                        class="w-full accent-emerald-500">
               </div>
 
@@ -912,7 +912,7 @@
                   <span>$ hard stop</span>
                   <span class="text-white font-bold" x-text="'$'+btParams.dollar_stop"></span>
                 </div>
-                <input type="range" min="5" max="50" step="1" x-model.number="btParams.dollar_stop"
+                <input type="range" min="1" max="500" step="1" x-model.number="btParams.dollar_stop"
                        class="w-full accent-emerald-500">
               </div>
 
@@ -921,7 +921,7 @@
                   <span>Per-token cap</span>
                   <span class="text-white font-bold" x-text="btParams.per_token_cap===0?'off':'$'+btParams.per_token_cap"></span>
                 </div>
-                <input type="range" min="0" max="300" step="10" x-model.number="btParams.per_token_cap"
+                <input type="range" min="0" max="5000" step="10" x-model.number="btParams.per_token_cap"
                        class="w-full accent-emerald-500">
               </div>
 
@@ -930,7 +930,7 @@
                   <span>Cooldown after loss</span>
                   <span class="text-white font-bold" x-text="btParams.cooldown_min===0?'off':btParams.cooldown_min+'min'"></span>
                 </div>
-                <input type="range" min="0" max="120" step="5" x-model.number="btParams.cooldown_min"
+                <input type="range" min="0" max="240" step="5" x-model.number="btParams.cooldown_min"
                        class="w-full accent-emerald-500">
               </div>
 
@@ -939,7 +939,7 @@
                   <span>Seed % per bet</span>
                   <span class="text-white font-bold" x-text="btParams.seed_pct+'%'"></span>
                 </div>
-                <input type="range" min="10" max="70" step="5" x-model.number="btParams.seed_pct"
+                <input type="range" min="1" max="100" step="1" x-model.number="btParams.seed_pct"
                        class="w-full accent-emerald-500">
               </div>
 
