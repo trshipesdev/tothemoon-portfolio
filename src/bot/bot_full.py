@@ -2581,6 +2581,8 @@ def api_sim100():
     vault       = START
     open_pos: Dict[str, float] = {}   # sym -> sim cost basis currently deployed
     last_loss_exit: Dict[str, float] = {}  # sym -> exit ts (losses only)
+    entries_today: Dict[str, int] = {}    # sym -> buy count today (anti-churn)
+    last_day: str = ""
     running     = 0.0
     skipped     = 0
     blocked     = 0
@@ -2590,12 +2592,29 @@ def api_sim100():
     trough      = START
     trades_out: List[Dict] = []
 
+    PER_TOKEN_CAP_PCT = CONFIG.get("per_token_cap_pct", 0.12)
+    ENTRY_CAP = CONFIG["modes"].get(CONFIG["mode"], {}).get(
+        "max_entries_per_token_day", CONFIG.get("max_entries_per_token_day", 4))
+
     for t in trades:
-        sym  = t.get("symbol", "")
+        sym  = t.get("symbol", "") or "?"
         side = t.get("side")
         usd  = float(t.get("usd") or 0)
         pnl  = t.get("pnl")
         ts   = _ts(t)
+
+        # Null-symbol skip — mirrors scanner fix
+        if sym == "?":
+            if side == "buy":
+                blocked += 1
+            trades_out.append({**t, "sim_status": "blocked", "sim_usd": 0, "sim_pnl": None})
+            continue
+
+        # Daily reset for anti-churn counter
+        trade_day = t.get("ts", "")[:10]
+        if trade_day != last_day:
+            entries_today = {}
+            last_day = trade_day
 
         total_now = vault + sum(open_pos.values())
 
@@ -2607,14 +2626,29 @@ def api_sim100():
                 trades_out.append({**t, "sim_status": "blocked", "sim_usd": 0, "sim_pnl": None})
                 continue
 
-            # 2. Seed mode sizing
-            avail   = max(0.0, vault)          # only free cash, not deployed
-            sim_usd = min(usd, avail * 0.40)   # at most 40% of free cash
+            # 2. Anti-churn: cap entries per token per day
+            if entries_today.get(sym, 0) >= ENTRY_CAP:
+                blocked += 1
+                trades_out.append({**t, "sim_status": "blocked", "sim_usd": 0, "sim_pnl": None})
+                continue
+
+            # 3. Per-token cap: 12% of current portfolio per symbol
+            token_cap = PER_TOKEN_CAP_PCT * total_now
+            cap_room  = max(0.0, token_cap - open_pos.get(sym, 0.0))
+            if cap_room < 10.0:
+                blocked += 1
+                trades_out.append({**t, "sim_status": "blocked", "sim_usd": 0, "sim_pnl": None})
+                continue
+
+            # 4. Seed mode sizing
+            avail   = max(0.0, vault)
+            sim_usd = min(usd, avail * 0.40, cap_room)
             if sim_usd < 10.0 or avail < sim_usd * 1.5:
                 skipped += 1
                 trades_out.append({**t, "sim_status": "skipped", "sim_usd": 0, "sim_pnl": None})
                 continue
 
+            entries_today[sym] = entries_today.get(sym, 0) + 1
             vault -= sim_usd
             open_pos[sym] = open_pos.get(sym, 0.0) + sim_usd
             total_now = vault + sum(open_pos.values())
