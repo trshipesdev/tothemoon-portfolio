@@ -981,8 +981,10 @@ def per_chain_room(chain: str) -> float:
     return max(0.0, cap - used)
 
 
-def per_token_cap_room() -> float:
-    return CONFIG["per_token_cap_pct"] * deployable_now()
+def per_token_cap_room(symbol: str) -> float:
+    cap = CONFIG["per_token_cap_pct"] * deployable_now()
+    already_in = STATE.get("positions", {}).get(symbol, {}).get("usd", 0.0)
+    return max(0.0, cap - already_in)
 
 
 def _conviction_mult(hype: Optional[int], buy_ratio: Optional[float]) -> float:
@@ -998,7 +1000,7 @@ def _conviction_mult(hype: Optional[int], buy_ratio: Optional[float]) -> float:
 
 
 def size_ticket_usd(chain: str, hype: Optional[int] = None,
-                    buy_ratio: Optional[float] = None) -> float:
+                    buy_ratio: Optional[float] = None, symbol: str = "") -> float:
     base = CONFIG["base_size_usd"] * CONFIG["modes"][CONFIG["mode"]]["size_mult"]
     base *= objective_nudge()["size_mult"]
     base *= _conviction_mult(hype, buy_ratio)   # bet more on the strongest setups
@@ -1013,7 +1015,7 @@ def size_ticket_usd(chain: str, hype: Optional[int] = None,
     if CONFIG["moonshot"].get("dynamic_sizing"):
         avail_cash = max(0.0, STATE["vault_usd"] - STATE.get("cur_deployed_usd", 0.0))
         base = min(base, avail_cash * 0.40)
-    base    = min(base, per_chain_room(chain), per_token_cap_room())
+    base    = min(base, per_chain_room(chain), per_token_cap_room(symbol))
     day_cap = CONFIG["daily_deploy_cap_pct"] * deployable_now()
     return max(0.0, min(base, day_cap - STATE["open_today_usd"]))
 
@@ -1761,7 +1763,7 @@ def autoscale_maybe(symbol: str, chain: str, price: float, liq_usd: float, veloc
         add_usd *= 0.5
         if est_price_impact(add_usd, liq_usd) > A["pi_max"]:
             return
-    add_usd = min(add_usd, per_chain_room(chain), per_token_cap_room())
+    add_usd = min(add_usd, per_chain_room(chain), per_token_cap_room(symbol))
     if add_usd < CONFIG["moonshot"]["min_ticket_usd"]:
         return
     addr = pos.get("address", "")
@@ -3690,6 +3692,8 @@ def scan_candidates():
 
     for c in candidates:
         symbol = c["symbol"]
+        if not symbol or symbol == "?":
+            continue  # skip tokens with no symbol — position dict collision risk
         chain  = c["chain"]
         price  = c["price"]
         liq    = c["liq"]
@@ -3742,6 +3746,14 @@ def scan_candidates():
                     _scout(symbol, chain, "rejected",
                            f"profit-chase block: price {_pullback*100:.1f}% below exit (need 8%)", sc, addr)
                     continue
+        # Anti-churn: applies to ALL tokens regardless of age (same reasoning as cooldown fix).
+        # Without this, tokens older than new_max_age_min had no per-day entry cap from the scanner.
+        entry_cap = CONFIG["modes"].get(CONFIG["mode"], {}).get(
+            "max_entries_per_token_day", CONFIG.get("max_entries_per_token_day", 4))
+        if STATE.setdefault("entries_today", {}).get(symbol, 0) >= entry_cap:
+            _scout(symbol, chain, "rejected",
+                   f"already entered {entry_cap}x today (anti-churn)", sc, addr)
+            continue
         if is_new:
             reject = moonshot_reject_reason(sc)
             if reject:
@@ -3772,15 +3784,8 @@ def scan_candidates():
                     f"from a likely scam/rug.\n{link}")
                 _scout(symbol, chain, "rejected", f"safety: {why}", sc, addr)
                 continue
-            # Anti-churn: don't keep re-buying the same hyper-volatile token all day.
-            entry_cap = CONFIG["modes"].get(CONFIG["mode"], {}).get(
-                "max_entries_per_token_day", CONFIG.get("max_entries_per_token_day", 4))
-            if STATE.setdefault("entries_today", {}).get(symbol, 0) >= entry_cap:
-                _scout(symbol, chain, "rejected",
-                       f"already entered {entry_cap}x today (anti-churn on volatile token)", sc, addr)
-                continue
             if CONFIG["moonshot"]["mode"] == "enter":
-                usd = size_ticket_usd(chain, hype=sc.hype, buy_ratio=sc.buy_ratio)
+                usd = size_ticket_usd(chain, hype=sc.hype, buy_ratio=sc.buy_ratio, symbol=symbol)
                 _min_ticket = 10.0 if CONFIG["moonshot"].get("dynamic_sizing") else CONFIG["moonshot"]["min_ticket_usd"]
                 if CONFIG["moonshot"].get("dynamic_sizing"):
                     _avail = max(0.0, STATE["vault_usd"] - STATE.get("cur_deployed_usd", 0.0))
@@ -3815,7 +3820,7 @@ def scan_candidates():
         else:
             if detect_oldcoin_pump(symbol, CONFIG["oldcoin"]["volume_x"], CONFIG["oldcoin"]["mentions_x"]):
                 if CONFIG["oldcoin"]["auto_join"]:
-                    usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(chain))
+                    usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(chain, symbol=symbol))
                     if usd >= CONFIG["moonshot"]["min_ticket_usd"]:
                         shadow_buy(symbol, chain, usd, price, liq, addr)
                         log(f"AUTO-JOIN tiny {symbol} ${usd:.2f}")
@@ -3849,7 +3854,7 @@ def scan_candidates():
                 w_liq   = float((p0.get("liquidity") or {}).get("usd") or 100000.0)
                 cid     = p0.get("chainId", "solana")
                 w_chain = next((k for k, v in CHAIN_IDS.items() if v == cid), "sol")
-            usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(w_chain))
+            usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(w_chain, symbol=sym))
             if usd >= CONFIG["moonshot"]["min_ticket_usd"]:
                 shadow_buy(sym, w_chain, usd, w_price, w_liq, addr)
                 log(f"AUTO-JOIN watchlist {sym} ${usd:.2f}")
