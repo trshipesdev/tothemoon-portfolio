@@ -2904,7 +2904,39 @@ def api_set_mode():
     if m not in CONFIG["modes"]:
         return jsonify({"error": "invalid mode"}), 400
     CONFIG["mode"] = m
+    # If switching to a custom mode, apply its stored global params too
+    custom = STATE.get("custom_modes", {}).get(m)
+    if custom:
+        _apply_custom_mode_globals(custom)
     return jsonify({"ok": True, "mode": m})
+
+
+def _register_custom_mode(name: str, p: dict):
+    """Build a full mode config from saved btParams and add to CONFIG["modes"]."""
+    base = CONFIG["modes"].get("hype", {})
+    CONFIG["modes"][name] = {
+        "tp":                       list(base.get("tp", [0.45, 0.9])),
+        "sl":                       float(p.get("sl_pct", 18)) / 100.0,
+        "slip_bps":                 int(base.get("slip_bps", 150)),
+        "liq_min":                  int(base.get("liq_min", 20000)),
+        "max_age_min":              int(base.get("max_age_min", 120)),
+        "max_entries_per_token_day": int(base.get("max_entries_per_token_day", 4)),
+        "size_mult":                float(p.get("size_mult", 1.3)),
+        "_custom": True,
+    }
+
+
+def _apply_custom_mode_globals(p: dict):
+    """Apply the non-mode-dict params (dollar_stop, cooldown, etc.) from a custom mode."""
+    if "dollar_stop" in p:
+        CONFIG["moonshot"]["dollar_stop_usd"] = float(p["dollar_stop"])
+    if "per_token_cap" in p:
+        cap = float(p["per_token_cap"])
+        CONFIG["per_token_cap_pct"] = (cap / (STATE.get("vault_usd", 1000) * 10)) if cap > 0 else 1.0
+    if "cooldown_min" in p:
+        CONFIG["moonshot"]["loss_cooldown_min"] = max(0, int(p["cooldown_min"]))
+    if "seed_pct" in p:
+        CONFIG["moonshot"]["seed_pct"] = float(p["seed_pct"]) / 100.0
 
 
 @app.route("/api/custom_modes", methods=["GET"])
@@ -2923,7 +2955,10 @@ def api_save_custom_mode():
         return jsonify({"error": "name and params required"}), 400
     if len(name) > 40:
         return jsonify({"error": "name too long (max 40 chars)"}), 400
+    if name in ("safe", "default", "hype", "degen", "seed"):
+        return jsonify({"error": "cannot overwrite a built-in mode"}), 400
     STATE.setdefault("custom_modes", {})[name] = params
+    _register_custom_mode(name, params)
     save_state()
     return jsonify({"ok": True, "name": name})
 
@@ -2935,32 +2970,11 @@ def api_delete_custom_mode(name):
     if name not in modes:
         return jsonify({"error": "not found"}), 404
     del modes[name]
+    CONFIG["modes"].pop(name, None)
+    if CONFIG["mode"] == name:
+        CONFIG["mode"] = "hype"
     save_state()
     return jsonify({"ok": True})
-
-
-@app.route("/api/custom_modes/<name>/activate", methods=["POST"])
-@_dash_auth
-def api_activate_custom_mode(name):
-    modes = STATE.get("custom_modes", {})
-    if name not in modes:
-        return jsonify({"error": "not found"}), 404
-    p = modes[name]
-    mode = CONFIG["mode"]
-    if "size_mult" in p:
-        CONFIG["modes"][mode]["size_mult"] = float(p["size_mult"])
-    if "sl_pct" in p:
-        CONFIG["modes"][mode]["sl"] = float(p["sl_pct"]) / 100.0
-    if "dollar_stop" in p:
-        CONFIG["moonshot"]["dollar_stop_usd"] = float(p["dollar_stop"])
-    if "per_token_cap" in p:
-        cap = float(p["per_token_cap"])
-        CONFIG["per_token_cap_pct"] = (cap / (STATE.get("vault_usd", 1000) * 10)) if cap > 0 else 1.0
-    if "cooldown_min" in p:
-        CONFIG["moonshot"]["loss_cooldown_min"] = int(p["cooldown_min"]) if p["cooldown_min"] > 0 else 0
-    if "seed_pct" in p:
-        CONFIG["moonshot"]["seed_pct"] = float(p["seed_pct"]) / 100.0
-    return jsonify({"ok": True, "applied": name, "mode": mode})
 
 
 @app.route("/api/shadow", methods=["POST"])
@@ -4330,6 +4344,9 @@ def start_telegram():
 def main():
     load_state()
     global SHADOW_MODE
+    # Restore user-saved modes into CONFIG["modes"] so the bot can run them
+    for name, params in STATE.get("custom_modes", {}).items():
+        _register_custom_mode(name, params)
     if "shadow_mode" in STATE:
         SHADOW_MODE = bool(STATE["shadow_mode"])
     else:

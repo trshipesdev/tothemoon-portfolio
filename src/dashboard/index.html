@@ -419,10 +419,17 @@
       <div class="bg-gray-900 rounded-xl p-4">
         <h3 class="text-gray-500 text-xs uppercase tracking-wider mb-3">Strategy Mode</h3>
         <div class="flex gap-2 flex-wrap">
-          <template x-for="m in ['safe','default','hype','degen','seed']" :key="m">
+          <template x-for="m in (state.modes || ['safe','default','hype','degen','seed'])" :key="m">
             <button @click="setMode(m)"
-                    :class="state.mode === m ? 'bg-blue-600 text-white ring-1 ring-blue-400' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'"
-                    class="px-4 py-2 rounded-lg text-xs font-bold" x-text="m.toUpperCase()"></button>
+                    :class="state.mode === m
+                      ? 'bg-blue-600 text-white ring-1 ring-blue-400'
+                      : (customModes[m] ? 'bg-indigo-900 text-indigo-300 hover:bg-indigo-800' : 'bg-gray-800 text-gray-300 hover:bg-gray-700')"
+                    class="px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-1">
+              <span x-text="m.toUpperCase()"></span>
+              <span x-show="!!customModes[m]"
+                    @click.stop="deleteCustomMode(m); $nextTick(() => refresh())"
+                    class="text-indigo-400 hover:text-red-400 leading-none">×</span>
+            </button>
           </template>
         </div>
       </div>
@@ -1030,46 +1037,20 @@
                         class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-gray-500">no cooldown</button>
               </div>
 
-              <!-- Saved custom modes -->
-              <div class="mt-4 border-t border-gray-800 pt-4 space-y-3">
-                <!-- Save current params -->
+              <!-- Save as runnable mode -->
+              <div class="mt-4 border-t border-gray-800 pt-4">
+                <div class="text-xs text-gray-500 mb-2">Save these params as a bot mode (appears in Controls tab):</div>
                 <div class="flex items-center gap-2">
                   <input x-model="newModeName"
                          @keydown.enter="saveCustomMode()"
-                         type="text" maxlength="40" placeholder="Name this config…"
+                         type="text" maxlength="40" placeholder="Mode name…"
                          class="flex-1 bg-gray-800 text-white text-xs rounded px-3 py-1.5 border border-gray-700 focus:border-indigo-500 outline-none placeholder-gray-600" />
                   <button @click="saveCustomMode()"
                           :disabled="!newModeName.trim()"
-                          class="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:cursor-not-allowed rounded px-3 py-1.5 text-white font-medium">
-                    Save mode
+                          class="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:cursor-not-allowed rounded px-3 py-1.5 text-white font-medium whitespace-nowrap">
+                    + Add mode
                   </button>
                 </div>
-
-                <!-- List of saved modes -->
-                <template x-if="Object.keys(customModes).length">
-                  <div class="space-y-1.5">
-                    <div class="text-xs text-gray-600 mb-1">Saved modes:</div>
-                    <template x-for="[name, params] in Object.entries(customModes)" :key="name">
-                      <div class="flex items-center gap-2 bg-gray-800/60 rounded px-3 py-1.5">
-                        <span class="text-xs text-gray-300 flex-1 font-medium" x-text="name"></span>
-                        <span class="text-xs text-gray-600"
-                              x-text="params.size_mult?.toFixed(1)+'× / '+params.sl_pct+'%SL / $'+params.dollar_stop+'stop'"></span>
-                        <button @click="loadCustomMode(params)"
-                                class="text-xs text-blue-400 hover:text-blue-300 px-2 py-0.5 rounded hover:bg-gray-700">
-                          load
-                        </button>
-                        <button @click="activateCustomMode(name)"
-                                class="text-xs text-green-400 hover:text-green-300 px-2 py-0.5 rounded hover:bg-gray-700">
-                          ▶ run
-                        </button>
-                        <button @click="deleteCustomMode(name)"
-                                class="text-xs text-gray-600 hover:text-red-400 px-1.5 py-0.5 rounded hover:bg-gray-700">
-                          ×
-                        </button>
-                      </div>
-                    </template>
-                  </div>
-                </template>
               </div>
 
             </div>
