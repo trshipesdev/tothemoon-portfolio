@@ -1737,6 +1737,14 @@ function app() {
           const costReal = Math.max(Math.abs(realUsd - realPnl), 1e-9);
           let rawPnl     = realPnl * (simCost / costReal);
           const effStop  = Math.max(p.dollar_stop, simCost * sl);
+          // If we have min_price data: check if the simulated SL would have fired
+          // during the trade before the actual exit. Without this, tight-SL modes
+          // incorrectly inherit all wins from looser-SL historical trades that held
+          // through a dip the new SL would not have survived.
+          if (rawPnl > 0 && t.min_price != null && t.entry_price != null && t.entry_price > 0) {
+            const minMove = (t.min_price - t.entry_price) / t.entry_price;
+            if (minMove < -sl) { rawPnl = -effStop; nCapped++; }
+          }
           if (rawPnl < -effStop) { rawPnl = -effStop; nCapped++; }
           vault += simCost + rawPnl;
           delete open_pos[sym];

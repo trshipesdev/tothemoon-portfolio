@@ -1144,7 +1144,7 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         "chain": chain, "units": 0.0, "usd": 0.0,
         "avg": 0.0, "realized": 0.0, "time": now_utc().isoformat(),
         "address": address, "add_count": 0, "last_add_ts": 0.0,
-        "peak_price": filled_price, "entry_vol_h1": 0.0,
+        "peak_price": filled_price, "trough_price": filled_price, "entry_vol_h1": 0.0,
         "entry_liq": liq_usd, "liq_ticks": [], "fees_usd": 0.0, "deployed_usd": 0.0,
         # Lock the risk profile to the mode at ENTRY. Otherwise an AI mode-switch
         # mid-trade would retroactively change this position's stop-loss/TP.
@@ -1278,6 +1278,8 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
         "address": pos.get("address", ""), "pnl": pnl,
         "mode": pos.get("entry_mode", CONFIG.get("mode")),
         "exit_reason": exit_reason,
+        "entry_price": pos.get("avg"),
+        "min_price":   pos.get("trough_price"),
     }
     STATE.setdefault("trade_log", []).append(_trade_entry)
     _append_trade(_trade_entry)
@@ -4156,10 +4158,12 @@ def manage_positions():
         entry_ts  = datetime.fromisoformat(p.get("time", now_utc().isoformat())).timestamp()
         _record_tick(s, p, px)   # forward recorder: real per-tick price/liq for backtests
 
-        # Track peak price (+ when it was last set, for stall detection)
+        # Track peak and trough price
         if price > p.get("peak_price", 0):
             p["peak_price"] = price
             p["peak_ts"]    = time.time()
+        if price < p.get("trough_price", float("inf")):
+            p["trough_price"] = price
         peak = p.get("peak_price", p["avg"])
 
         # Rolling liq history for drain detection
