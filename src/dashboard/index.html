@@ -1010,7 +1010,7 @@
               <div class="grid grid-cols-2 gap-3 mb-3">
                 <div class="bg-gray-900 rounded-xl p-3">
                   <div class="text-emerald-400 text-xs uppercase tracking-wider mb-2">Best trades</div>
-                  <template x-for="t in btResult.bestTrades" :key="t.sym+t.pnl">
+                  <template x-for="(t, i) in btResult.bestTrades" :key="'b'+i">
                     <div class="flex justify-between text-xs py-0.5">
                       <span class="text-gray-300" x-text="t.sym"></span>
                       <span class="text-emerald-400" x-text="'+$'+fmt(t.pnl)"></span>
@@ -1019,7 +1019,7 @@
                 </div>
                 <div class="bg-gray-900 rounded-xl p-3">
                   <div class="text-red-400 text-xs uppercase tracking-wider mb-2">Worst trades</div>
-                  <template x-for="t in btResult.worstTrades" :key="t.sym+t.pnl">
+                  <template x-for="(t, i) in btResult.worstTrades" :key="'w'+i">
                     <div class="flex justify-between text-xs py-0.5">
                       <span class="text-gray-300" x-text="t.sym"></span>
                       <span class="text-red-400" x-text="'−$'+fmt(Math.abs(t.pnl))"></span>
@@ -1659,7 +1659,7 @@ function app() {
       const trades = this.sim100?.trades;
       if (!trades?.length) return;
       const p = this.btParams;
-      const REAL_MULT = 1.6;
+      const BASE_BET = 30;  // base_size_usd — same as server
       const sl = p.sl_pct / 100;
       const seedPct = p.seed_pct / 100;
 
@@ -1686,7 +1686,7 @@ function app() {
             const room = Math.max(0, p.per_token_cap - (open_pos[sym] || 0));
             if (room < 10) { nSkipped++; continue; }
           }
-          const scaled  = realUsd * (p.size_mult / REAL_MULT);
+          const scaled  = p.size_mult * BASE_BET;
           const avail   = Math.max(0, vault);
           let simUsd    = Math.min(scaled, avail * seedPct);
           if (p.per_token_cap > 0) {
