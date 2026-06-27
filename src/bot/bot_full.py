@@ -149,7 +149,9 @@ CONFIG: Dict[str, Any] = {
                                         # was 0.45 — FRONT (+511%) and MASTERCOIN (+656%) were blocked at 40%/38%
                                         # rugs are capped at dollar_stop anyway; see DECISIONS.md
         "dollar_stop_usd":  12.0,       # hard dollar stop — exit any position down more than this
-        "dynamic_sizing":   False,      # True → bet = min(base_size, avail_cash × 40%) for seed/small vaults
+        "loss_cooldown_min": 30,        # minutes to block re-entry after a loss exit on same token
+        "seed_pct":          0.40,      # max fraction of available cash per bet in dynamic_sizing mode
+        "dynamic_sizing":   False,      # True → bet = min(base_size, avail_cash × seed_pct) for seed/small vaults
         "price_impact_max": 0.02,
         "min_ticket_usd":   15.0,
         "adaptive_timer":   {"low_liq_sec": 300, "high_liq_sec": 1200},
@@ -292,6 +294,7 @@ STATE: Dict[str, Any] = {
     "ai":               {"last_run": None, "last": None, "history": []},  # AI advisor state
     "entries_today":    {},  # symbol → count of fresh entries today (anti-churn), reset daily
     "recently_exited":  {},  # symbol → {ts, price, pnl} — blocks scanner re-entry after full close
+    "custom_modes":     {},  # user-saved backtest configs {name → btParams}
     "reject_cache":     {},  # symbol → {ts, reason_type, price} — skip re-eval until price spikes
     # Wallet goal: Phase 1 = grow to $1000. Phase 2 = skim 50% of profit above $100 threshold.
     "wallet_goal": {
@@ -1021,7 +1024,7 @@ def size_ticket_usd(chain: str, hype: Optional[int] = None,
             STATE["boost"] = {"mult": 1.0, "expires": None}
     if CONFIG["moonshot"].get("dynamic_sizing"):
         avail_cash = max(0.0, STATE["vault_usd"] - STATE.get("cur_deployed_usd", 0.0))
-        base = min(base, avail_cash * 0.40)
+        base = min(base, avail_cash * CONFIG["moonshot"].get("seed_pct", 0.40))
     base    = min(base, per_chain_room(chain), per_token_cap_room(symbol))
     day_cap = CONFIG["daily_deploy_cap_pct"] * deployable_now()
     return max(0.0, min(base, day_cap - STATE["open_today_usd"]))
@@ -2904,6 +2907,62 @@ def api_set_mode():
     return jsonify({"ok": True, "mode": m})
 
 
+@app.route("/api/custom_modes", methods=["GET"])
+@_dash_auth
+def api_list_custom_modes():
+    return jsonify({"modes": STATE.get("custom_modes", {})})
+
+
+@app.route("/api/custom_modes", methods=["POST"])
+@_dash_auth
+def api_save_custom_mode():
+    data = flask_request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    params = data.get("params")
+    if not name or not params:
+        return jsonify({"error": "name and params required"}), 400
+    if len(name) > 40:
+        return jsonify({"error": "name too long (max 40 chars)"}), 400
+    STATE.setdefault("custom_modes", {})[name] = params
+    save_state()
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/custom_modes/<name>", methods=["DELETE"])
+@_dash_auth
+def api_delete_custom_mode(name):
+    modes = STATE.get("custom_modes", {})
+    if name not in modes:
+        return jsonify({"error": "not found"}), 404
+    del modes[name]
+    save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/custom_modes/<name>/activate", methods=["POST"])
+@_dash_auth
+def api_activate_custom_mode(name):
+    modes = STATE.get("custom_modes", {})
+    if name not in modes:
+        return jsonify({"error": "not found"}), 404
+    p = modes[name]
+    mode = CONFIG["mode"]
+    if "size_mult" in p:
+        CONFIG["modes"][mode]["size_mult"] = float(p["size_mult"])
+    if "sl_pct" in p:
+        CONFIG["modes"][mode]["sl"] = float(p["sl_pct"]) / 100.0
+    if "dollar_stop" in p:
+        CONFIG["moonshot"]["dollar_stop_usd"] = float(p["dollar_stop"])
+    if "per_token_cap" in p:
+        cap = float(p["per_token_cap"])
+        CONFIG["per_token_cap_pct"] = (cap / (STATE.get("vault_usd", 1000) * 10)) if cap > 0 else 1.0
+    if "cooldown_min" in p:
+        CONFIG["moonshot"]["loss_cooldown_min"] = int(p["cooldown_min"]) if p["cooldown_min"] > 0 else 0
+    if "seed_pct" in p:
+        CONFIG["moonshot"]["seed_pct"] = float(p["seed_pct"]) / 100.0
+    return jsonify({"ok": True, "applied": name, "mode": mode})
+
+
 @app.route("/api/shadow", methods=["POST"])
 @_dash_auth
 def api_set_shadow():
@@ -3779,7 +3838,7 @@ def scan_candidates():
             _rex_elapsed = time.time() - _rex.get("ts", 0)
             _rex_pnl     = _rex.get("pnl", 0)
             _rex_price   = _rex.get("price", 0)
-            if _rex_pnl < 0 and _rex_elapsed < 30 * 60:
+            if _rex_pnl < 0 and _rex_elapsed < CONFIG["moonshot"].get("loss_cooldown_min", 30) * 60:
                 _scout(symbol, chain, "rejected",
                        f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, pnl=${_rex_pnl:.2f})", sc, addr)
                 continue

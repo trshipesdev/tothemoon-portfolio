@@ -1030,6 +1030,48 @@
                         class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-gray-500">no cooldown</button>
               </div>
 
+              <!-- Saved custom modes -->
+              <div class="mt-4 border-t border-gray-800 pt-4 space-y-3">
+                <!-- Save current params -->
+                <div class="flex items-center gap-2">
+                  <input x-model="newModeName"
+                         @keydown.enter="saveCustomMode()"
+                         type="text" maxlength="40" placeholder="Name this config…"
+                         class="flex-1 bg-gray-800 text-white text-xs rounded px-3 py-1.5 border border-gray-700 focus:border-indigo-500 outline-none placeholder-gray-600" />
+                  <button @click="saveCustomMode()"
+                          :disabled="!newModeName.trim()"
+                          class="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:cursor-not-allowed rounded px-3 py-1.5 text-white font-medium">
+                    Save mode
+                  </button>
+                </div>
+
+                <!-- List of saved modes -->
+                <template x-if="Object.keys(customModes).length">
+                  <div class="space-y-1.5">
+                    <div class="text-xs text-gray-600 mb-1">Saved modes:</div>
+                    <template x-for="[name, params] in Object.entries(customModes)" :key="name">
+                      <div class="flex items-center gap-2 bg-gray-800/60 rounded px-3 py-1.5">
+                        <span class="text-xs text-gray-300 flex-1 font-medium" x-text="name"></span>
+                        <span class="text-xs text-gray-600"
+                              x-text="params.size_mult?.toFixed(1)+'× / '+params.sl_pct+'%SL / $'+params.dollar_stop+'stop'"></span>
+                        <button @click="loadCustomMode(params)"
+                                class="text-xs text-blue-400 hover:text-blue-300 px-2 py-0.5 rounded hover:bg-gray-700">
+                          load
+                        </button>
+                        <button @click="activateCustomMode(name)"
+                                class="text-xs text-green-400 hover:text-green-300 px-2 py-0.5 rounded hover:bg-gray-700">
+                          ▶ run
+                        </button>
+                        <button @click="deleteCustomMode(name)"
+                                class="text-xs text-gray-600 hover:text-red-400 px-1.5 py-0.5 rounded hover:bg-gray-700">
+                          ×
+                        </button>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+
             </div>
           </template>
 
@@ -1430,6 +1472,8 @@ function app() {
     sim100:  null,
     btParams: { start: 100, size_mult: 1.3, sl_pct: 18, dollar_stop: 12, per_token_cap: 90, cooldown_min: 30, seed_pct: 40 },
     btResult: null,
+    customModes: {},
+    newModeName: '',
     histWindow: '100',     // '100' | 'week' | 'all'
     histSort:   'ts',
     histDir:    'desc',
@@ -1536,7 +1580,7 @@ function app() {
         if (v === 'Backtest') this.$nextTick(() => this.runBacktest());
       });
       this.$watch('btParams', () => this.runBacktest(), { deep: true });
-      await this.refresh();
+      await Promise.all([this.refresh(), this.fetchCustomModes()]);
       setInterval(() => this.refresh(), 3000);
     },
 
@@ -1583,6 +1627,42 @@ function app() {
       if (al)  this.alerts  = al;
       if (rpc) this.rpc     = rpc;
       this.lastRefresh = new Date().toLocaleTimeString();
+    },
+
+    // ── Custom Modes ──
+    async fetchCustomModes() {
+      const r = await this.get('/api/custom_modes');
+      if (r?.modes) this.customModes = r.modes;
+    },
+    async saveCustomMode() {
+      const name = this.newModeName.trim();
+      if (!name) return;
+      const r = await this.post('/api/custom_modes', { name, params: { ...this.btParams } });
+      if (r?.ok) {
+        this.customModes[name] = { ...this.btParams };
+        this.newModeName = '';
+        this.showToast(`Saved "${name}"`);
+      } else {
+        this.showToast(r?.error || 'Save failed', false);
+      }
+    },
+    async deleteCustomMode(name) {
+      const r = await this.del(`/api/custom_modes/${encodeURIComponent(name)}`);
+      if (r?.ok) {
+        delete this.customModes[name];
+        this.customModes = { ...this.customModes };
+      }
+    },
+    loadCustomMode(params) {
+      this.btParams = { ...this.btParams, ...params };
+    },
+    async activateCustomMode(name) {
+      const r = await this.post(`/api/custom_modes/${encodeURIComponent(name)}/activate`, {});
+      if (r?.ok) {
+        this.showToast(`"${name}" activated on bot`);
+      } else {
+        this.showToast(r?.error || 'Activate failed', false);
+      }
     },
 
     // ── Backtest Lab (client-side, instant) ──
@@ -1694,6 +1774,18 @@ function app() {
         setTimeout(() => this.toast.show = false, 3000);
         return null;
       }
+    },
+
+    async del(url) {
+      try {
+        const r = await fetch(url, { method: 'DELETE', headers: this._headers() });
+        const d = await r.json();
+        return r.ok ? d : null;
+      } catch { return null; }
+    },
+    showToast(msg, ok = true) {
+      this.toast = { show: true, msg, ok };
+      setTimeout(() => this.toast.show = false, 3000);
     },
 
     // ── Actions ──
