@@ -2382,6 +2382,7 @@ def api_state():
     return jsonify({
         **{k: v for k, v in STATE.items() if k not in ("trade_log", "liq_prev", "scout_log", "wallet_goal")},
         "wallet_goal": {**STATE.get("wallet_goal", {}), "payout_log": STATE.get("wallet_goal", {}).get("payout_log", [])[-20:]},
+        "trade_count":     len(STATE.get("trade_log", [])),
         "deployable_usd":  deployable_now(),
         "mode":            CONFIG["mode"],
         "modes":           list(CONFIG["modes"].keys()),
@@ -2451,10 +2452,16 @@ def api_positions():
     return jsonify(result)
 
 
+_history_cache: Dict[str, Any] = {}   # {n_trades, ts_last, payload}
+_backtest_cache: Dict[str, Any] = {}  # same pattern
+
 @app.route("/api/history")
 @_dash_auth
 def api_history():
     trades  = STATE.get("trade_log", [])
+    n = len(trades)
+    if _history_cache.get("n") == n and _history_cache.get("payload"):
+        return _history_cache["payload"]
     sells   = [t for t in trades if t.get("side") == "sell" and t.get("pnl") is not None]
     wins    = [t for t in sells if t["pnl"] > 0]
     losses  = [t for t in sells if t["pnl"] <= 0]
@@ -2515,7 +2522,7 @@ def api_history():
         _r_max       = max(_r_max, _total)
         _r_hist.append({"ts": t.get("ts", ""), "vault": round(_total, 2)})
 
-    return jsonify({
+    resp = jsonify({
         "trades":    enriched,
         "total_pnl": running,
         "win_rate":  len(wins) / max(1, len(sells)),
@@ -2531,6 +2538,9 @@ def api_history():
             "hist":     _r_hist,
         },
     })
+    _history_cache["n"]       = n
+    _history_cache["payload"] = resp
+    return resp
 
 
 @app.route("/api/backtest")
@@ -2548,6 +2558,9 @@ def api_backtest():
     Returns per-trade status ('kept'/'blocked'/'capped') plus revised stats.
     """
     trades   = STATE.get("trade_log", [])
+    n = len(trades)
+    if _backtest_cache.get("n") == n and _backtest_cache.get("payload"):
+        return _backtest_cache["payload"]
     dollar_stop = CONFIG["moonshot"].get("dollar_stop_usd", 12.0)
     cooldown_loss_sec   = 30 * 60
     cooldown_profit_sec = 15 * 60
@@ -2651,7 +2664,7 @@ def api_backtest():
 
     real_total = sum(t["pnl"] for t in trades if t.get("side") == "sell" and t.get("pnl") is not None)
 
-    return jsonify({
+    resp = jsonify({
         "trades":        revised,
         "real_total":    round(real_total, 2),
         "sim_total":     round(sim_running, 2),
@@ -2668,6 +2681,9 @@ def api_backtest():
         "saved_by_cap_usd":   round(saved_by_cap, 2),
         "saved_usd":          round(saved, 2),
     })
+    _backtest_cache["n"]       = n
+    _backtest_cache["payload"] = resp
+    return resp
 
 
 @app.route("/api/alerts")

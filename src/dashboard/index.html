@@ -1484,14 +1484,20 @@ function app() {
     },
 
     async refresh() {
-      const [s, p, h, al, rpc, sc] = await Promise.all([
+      // history is cached server-side — only re-fetch when trade count changes
+      const prevTrades = (this.history || []).length;
+      const [s, p, al, rpc, sc] = await Promise.all([
         this.get('/api/state'),
         this.get('/api/positions'),
-        this.get('/api/history'),
         this.get('/api/alerts'),
         this.get('/api/rpc'),
         this.get('/api/scoutlog'),
       ]);
+      const tradeCount = s?.trade_count ?? -1;
+      const h = (tradeCount !== this._lastTradeCount || !this.history?.length)
+        ? await this.get('/api/history')
+        : null;
+      if (h !== null) this._lastTradeCount = tradeCount;
       if (sc) { this.scout = sc.scout || []; this.scoutCounts = sc.counts || {}; }
       if (s) {
         this.state = s;
