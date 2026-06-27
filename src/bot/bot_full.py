@@ -2908,10 +2908,12 @@ def api_set_mode():
     if m not in CONFIG["modes"]:
         return jsonify({"error": "invalid mode"}), 400
     CONFIG["mode"] = m
+    STATE["active_mode"] = m   # persist so restarts don't revert to BOT_MODE env
     # If switching to a custom mode, apply its stored global params too
     custom = STATE.get("custom_modes", {}).get(m)
     if custom:
         _apply_custom_mode_globals(custom)
+    save_state()
     return jsonify({"ok": True, "mode": m})
 
 
@@ -4357,13 +4359,20 @@ def main():
         STATE["shadow_mode"] = SHADOW_MODE
         save_state()
 
-    # Optional env overrides so runtime settings survive restarts.
-    env_mode = os.getenv("BOT_MODE", "").strip().lower()
-    if env_mode:
-        if env_mode in CONFIG["modes"]:
-            CONFIG["mode"] = env_mode
-        else:
-            log(f"WARN BOT_MODE='{env_mode}' invalid — keeping '{CONFIG['mode']}'")
+    # Restore whichever mode the user last set via the dashboard — takes priority over BOT_MODE env.
+    saved_mode = STATE.get("active_mode", "")
+    if saved_mode and saved_mode in CONFIG["modes"]:
+        CONFIG["mode"] = saved_mode
+        if saved_mode in STATE.get("custom_modes", {}):
+            _apply_custom_mode_globals(STATE["custom_modes"][saved_mode])
+        log(f"Restored mode '{saved_mode}' from state")
+    else:
+        env_mode = os.getenv("BOT_MODE", "").strip().lower()
+        if env_mode:
+            if env_mode in CONFIG["modes"]:
+                CONFIG["mode"] = env_mode
+            else:
+                log(f"WARN BOT_MODE='{env_mode}' invalid — keeping '{CONFIG['mode']}'")
     env_moon = os.getenv("MOONSHOT_MODE", "").strip().lower()
     if env_moon in ("enter", "suggest"):
         CONFIG["moonshot"]["mode"] = env_moon
