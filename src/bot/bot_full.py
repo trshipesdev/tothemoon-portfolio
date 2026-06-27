@@ -83,7 +83,7 @@ CONFIG: Dict[str, Any] = {
     "modes": {
         "safe":    {"tp": [0.15],      "sl": 0.07, "slip_bps": 60,  "liq_min": 50000, "max_age_min": 360, "max_entries_per_token_day": 2, "size_mult": 0.7},
         "default": {"tp": [0.28],      "sl": 0.12, "slip_bps": 100, "liq_min": 30000, "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0},
-        "hype":    {"tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000, "max_age_min": 120, "max_entries_per_token_day": 4, "size_mult": 1.3},
+        "hype":    {"tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000, "max_age_min": 120, "max_entries_per_token_day": 4, "size_mult": 1.6},
         "degen":   {"tp": [0.80, 1.5], "sl": 0.28, "slip_bps": 220, "liq_min": 10000, "max_age_min": 120, "max_entries_per_token_day": 6, "size_mult": 1.6,
                     "no_pump": {"hurdle": 0.03, "min_sec": 240, "max_sec": 900},
                     # Scalp-ladder + moon-bag: sell [fraction] of the original position at each
