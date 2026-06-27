@@ -856,143 +856,183 @@
     </div>
 
     <!-- BACKTEST — what would current logic have done from day one -->
-    <div x-show="tab === 'Backtest'" x-data="{
-           bt: null, btLoading: false,
-           loadBt() { this.btLoading = true; fetch('/api/backtest', {headers: authHeader()})
-             .then(r => r.json()).then(d => { this.bt = d; this.btLoading = false; })
-             .catch(() => { this.btLoading = false; }); }
-         }">
-      <template x-if="true">
+
+    <!-- BACKTEST LAB -->
+    <div x-show="tab === 'Backtest'">
+
+      <!-- No data yet -->
+      <template x-if="!sim100">
+        <div class="text-center py-20 text-gray-500 text-sm">Loading trade history…</div>
+      </template>
+
+      <template x-if="sim100">
         <div>
-          <div class="flex items-center justify-between mb-4">
-            <div>
-              <h2 class="font-bold text-gray-300">What if today's fixes ran from day one?</h2>
-              <div class="text-gray-600 text-xs mt-1">Replays every trade applying: post-exit cooldown · $12 dollar stop</div>
+
+          <!-- ── SLIDERS ── -->
+          <div class="bg-gray-900 rounded-xl p-4 mb-4">
+            <div class="text-emerald-400 text-xs uppercase tracking-wider mb-3">⚙ Parameters — adjust to see instant results</div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-4 text-xs">
+
+              <div>
+                <div class="flex justify-between text-gray-400 mb-1">
+                  <span>Starting vault</span>
+                  <span class="text-white font-bold" x-text="'$'+btParams.start"></span>
+                </div>
+                <input type="range" min="50" max="1000" step="50" x-model.number="btParams.start"
+                       class="w-full accent-emerald-500">
+              </div>
+
+              <div>
+                <div class="flex justify-between text-gray-400 mb-1">
+                  <span>Bet size ×</span>
+                  <span class="text-white font-bold" x-text="btParams.size_mult.toFixed(1)+'× ($'+(btParams.size_mult*30).toFixed(0)+')' "></span>
+                </div>
+                <input type="range" min="0.5" max="2.5" step="0.1" x-model.number="btParams.size_mult"
+                       class="w-full accent-emerald-500">
+              </div>
+
+              <div>
+                <div class="flex justify-between text-gray-400 mb-1">
+                  <span>Stop loss %</span>
+                  <span class="text-white font-bold" x-text="btParams.sl_pct+'%'"></span>
+                </div>
+                <input type="range" min="5" max="40" step="1" x-model.number="btParams.sl_pct"
+                       class="w-full accent-emerald-500">
+              </div>
+
+              <div>
+                <div class="flex justify-between text-gray-400 mb-1">
+                  <span>$ hard stop</span>
+                  <span class="text-white font-bold" x-text="'$'+btParams.dollar_stop"></span>
+                </div>
+                <input type="range" min="5" max="50" step="1" x-model.number="btParams.dollar_stop"
+                       class="w-full accent-emerald-500">
+              </div>
+
+              <div>
+                <div class="flex justify-between text-gray-400 mb-1">
+                  <span>Per-token cap</span>
+                  <span class="text-white font-bold" x-text="btParams.per_token_cap===0?'off':'$'+btParams.per_token_cap"></span>
+                </div>
+                <input type="range" min="0" max="300" step="10" x-model.number="btParams.per_token_cap"
+                       class="w-full accent-emerald-500">
+              </div>
+
+              <div>
+                <div class="flex justify-between text-gray-400 mb-1">
+                  <span>Cooldown after loss</span>
+                  <span class="text-white font-bold" x-text="btParams.cooldown_min===0?'off':btParams.cooldown_min+'min'"></span>
+                </div>
+                <input type="range" min="0" max="120" step="5" x-model.number="btParams.cooldown_min"
+                       class="w-full accent-emerald-500">
+              </div>
+
+              <div>
+                <div class="flex justify-between text-gray-400 mb-1">
+                  <span>Seed % per bet</span>
+                  <span class="text-white font-bold" x-text="btParams.seed_pct+'%'"></span>
+                </div>
+                <input type="range" min="10" max="70" step="5" x-model.number="btParams.seed_pct"
+                       class="w-full accent-emerald-500">
+              </div>
+
+              <div class="flex items-end">
+                <button @click="btParams = { start:100, size_mult:1.3, sl_pct:18, dollar_stop:12, per_token_cap:90, cooldown_min:30, seed_pct:40 }"
+                        class="w-full text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-2 text-gray-400">
+                  ↺ reset to current
+                </button>
+              </div>
             </div>
-            <button @click="loadBt()"
-                    class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1.5 text-gray-300">
-              <span x-show="!btLoading">↻ run</span>
-              <span x-show="btLoading">running…</span>
-            </button>
           </div>
 
-          <!-- Load prompt -->
-          <template x-if="!bt && !btLoading">
-            <div class="text-center py-16">
-              <div class="text-gray-500 text-sm mb-3">Click "run" to replay your trade history with the current bot version</div>
-              <button @click="loadBt()"
-                      class="bg-emerald-700 hover:bg-emerald-600 text-white rounded px-5 py-2 text-sm">Run simulation</button>
-            </div>
-          </template>
-          <template x-if="btLoading && !bt">
-            <div class="text-center py-16 text-gray-500 text-sm">Replaying trade history…</div>
-          </template>
-
-          <template x-if="bt">
+          <!-- ── RESULTS ── -->
+          <template x-if="btResult">
             <div>
-              <!-- Top line comparison -->
-              <div class="grid grid-cols-3 gap-3 mb-4">
+
+              <!-- Top stats -->
+              <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
                 <div class="bg-gray-900 rounded-xl p-4 text-center">
-                  <div class="text-gray-500 text-xs mb-1">Actual PnL</div>
-                  <div :class="(bt.real_total??0)>=0?'text-emerald-400':'text-red-400'"
-                       class="text-2xl font-bold"
-                       x-text="((bt.real_total??0)>=0?'+$':'−$')+fmt(Math.abs(bt.real_total??0))"></div>
-                  <div class="text-gray-600 text-xs mt-1" x-text="(bt.real_win_rate*100).toFixed(0)+'% win rate'"></div>
-                </div>
-                <div class="bg-gray-900 rounded-xl p-4 text-center border border-emerald-900">
-                  <div class="text-gray-500 text-xs mb-1">Simulated PnL</div>
-                  <div :class="(bt.sim_total??0)>=0?'text-emerald-400':'text-red-400'"
-                       class="text-2xl font-bold"
-                       x-text="((bt.sim_total??0)>=0?'+$':'−$')+fmt(Math.abs(bt.sim_total??0))"></div>
-                  <div class="text-gray-600 text-xs mt-1" x-text="(bt.win_rate*100).toFixed(0)+'% win rate'"></div>
+                  <div class="text-gray-500 text-xs mb-1">End value</div>
+                  <div :class="btResult.pct>=0?'text-emerald-400':'text-red-400'"
+                       class="text-2xl font-bold" x-text="'$'+fmt(btResult.end)"></div>
+                  <div :class="btResult.pct>=0?'text-emerald-600':'text-red-600'"
+                       class="text-xs mt-1" x-text="(btResult.pct>=0?'+':'')+btResult.pct+'%'"></div>
                 </div>
                 <div class="bg-gray-900 rounded-xl p-4 text-center">
-                  <div class="text-gray-500 text-xs mb-1">Difference</div>
-                  <div :class="(bt.difference??0)>=0?'text-emerald-400':'text-red-400'"
-                       class="text-2xl font-bold"
-                       x-text="((bt.difference??0)>=0?'+$':'−$')+fmt(Math.abs(bt.difference??0))"></div>
-                  <div class="text-gray-600 text-xs mt-1">vs actual</div>
+                  <div class="text-gray-500 text-xs mb-1">Peak / Trough</div>
+                  <div class="text-emerald-400 font-bold" x-text="'$'+fmt(btResult.peak)"></div>
+                  <div class="text-red-400 text-xs mt-1" x-text="'↓ $'+fmt(btResult.trough)"></div>
+                </div>
+                <div class="bg-gray-900 rounded-xl p-4 text-center">
+                  <div class="text-gray-500 text-xs mb-1">Win rate</div>
+                  <div class="text-white font-bold text-xl" x-text="btResult.wr+'%'"></div>
+                  <div class="text-gray-500 text-xs mt-1" x-text="btResult.nW+'W / '+btResult.nL+'L'"></div>
+                </div>
+                <div class="bg-gray-900 rounded-xl p-4 text-center">
+                  <div class="text-gray-500 text-xs mb-1">Avg win / loss</div>
+                  <div class="text-emerald-400 font-bold" x-text="'+$'+fmt(btResult.avgWin)"></div>
+                  <div class="text-red-400 text-xs mt-1" x-text="'−$'+fmt(Math.abs(btResult.avgLoss))"></div>
                 </div>
               </div>
 
-              <!-- Fix breakdown -->
-              <div class="grid grid-cols-2 gap-3 mb-3 text-center text-xs">
+              <!-- Filter stats -->
+              <div class="grid grid-cols-3 gap-3 mb-4 text-center text-xs">
                 <div class="bg-gray-900 rounded-xl p-3">
-                  <div class="text-gray-400 font-bold mb-2">30-min cooldown after losses</div>
-                  <div class="flex justify-around">
-                    <div>
-                      <div class="text-gray-500 mb-1">losses dodged</div>
-                      <div class="text-emerald-400 font-bold" x-text="'+$'+fmt(bt.losses_dodged_usd??0)"></div>
-                    </div>
-                    <div>
-                      <div class="text-gray-500 mb-1">wins missed</div>
-                      <div class="text-red-400 font-bold" x-text="'−$'+fmt(bt.wins_missed_usd??0)"></div>
-                    </div>
-                  </div>
-                  <div class="text-gray-600 mt-2" x-text="bt.n_blocked + ' re-entries blocked'"></div>
+                  <div class="text-amber-400 font-bold text-lg" x-text="btResult.nBlocked"></div>
+                  <div class="text-gray-500 mt-1">cooldown blocks</div>
                 </div>
                 <div class="bg-gray-900 rounded-xl p-3">
-                  <div class="text-gray-400 font-bold mb-2">Dollar stop ($12 / 10%)</div>
-                  <div class="text-center">
-                    <div class="text-gray-500 mb-1">losses capped</div>
-                    <div :class="(bt.saved_by_cap_usd??0)>=0?'text-emerald-400':'text-red-400'"
-                         class="font-bold"
-                         x-text="((bt.saved_by_cap_usd??0)>=0?'+$':'−$')+fmt(Math.abs(bt.saved_by_cap_usd??0))"></div>
-                  </div>
-                  <div class="text-gray-600 mt-2" x-text="bt.n_capped + ' trades capped'"></div>
-                </div>
-              </div>
-              <div class="bg-gray-800 rounded-lg p-2 text-xs text-gray-500 mb-4">
-                💡 When blocked tokens recover and run, the cooldown costs wins. When they keep dumping, it saves losses. Today's split:
-                <span class="text-emerald-400" x-text="'+$'+fmt(bt.losses_dodged_usd??0)+' saved'"></span> vs
-                <span class="text-red-400" x-text="'−$'+fmt(bt.wins_missed_usd??0)+' missed'"></span>
-              </div>
-
-              <!-- Avg win/loss comparison -->
-              <div class="grid grid-cols-2 gap-3 mb-5 text-center text-xs">
-                <div class="bg-gray-900 rounded-xl p-3">
-                  <div class="text-gray-500 mb-2">Avg loss: actual vs simulated</div>
-                  <div class="flex justify-around">
-                    <div><div class="text-gray-600 text-xs">actual</div>
-                      <div class="text-red-400 font-bold" x-text="'−$'+fmt(Math.abs(bt.real_win_rate??0) > 0 ? 0 : 0)"></div></div>
-                    <div class="text-gray-600">→</div>
-                    <div><div class="text-gray-600 text-xs">simulated</div>
-                      <div class="text-emerald-400 font-bold" x-text="'−$'+fmt(Math.abs(bt.avg_loss??0))"></div></div>
-                  </div>
+                  <div class="text-blue-400 font-bold text-lg" x-text="btResult.nSkipped"></div>
+                  <div class="text-gray-500 mt-1">skipped (cash/cap)</div>
                 </div>
                 <div class="bg-gray-900 rounded-xl p-3">
-                  <div class="text-gray-500 mb-2">Win rate: actual vs simulated</div>
-                  <div class="flex justify-around items-center">
-                    <div class="font-bold text-gray-300" x-text="(bt.real_win_rate*100).toFixed(0)+'%'"></div>
-                    <div class="text-gray-600">→</div>
-                    <div class="font-bold text-emerald-400" x-text="(bt.win_rate*100).toFixed(0)+'%'"></div>
-                  </div>
+                  <div class="text-purple-400 font-bold text-lg" x-text="btResult.nCapped"></div>
+                  <div class="text-gray-500 mt-1">losses capped by stop</div>
                 </div>
               </div>
 
-              <!-- Trade-by-trade list — only show affected trades -->
-              <h3 class="text-gray-400 text-sm font-bold mb-2">Affected trades</h3>
-              <div class="space-y-1 text-xs">
-                <template x-for="t in (bt.trades||[]).filter(t=>t.sim_status!=='kept')" :key="t.ts+t.symbol+t.side">
-                  <div class="flex items-center justify-between bg-gray-900 rounded-lg px-3 py-2">
-                    <div class="flex items-center gap-2">
-                      <span :class="t.sim_status==='blocked'?'text-amber-400':'text-blue-400'"
-                            x-text="t.sim_status==='blocked'?'BLOCKED':'CAPPED'"></span>
-                      <span class="text-gray-300 font-mono" x-text="t.symbol"></span>
-                      <span class="text-gray-600" x-text="t.side"></span>
+              <!-- Best / Worst -->
+              <div class="grid grid-cols-2 gap-3 mb-3">
+                <div class="bg-gray-900 rounded-xl p-3">
+                  <div class="text-emerald-400 text-xs uppercase tracking-wider mb-2">Best trades</div>
+                  <template x-for="t in btResult.bestTrades" :key="t.sym+t.pnl">
+                    <div class="flex justify-between text-xs py-0.5">
+                      <span class="text-gray-300" x-text="t.sym"></span>
+                      <span class="text-emerald-400" x-text="'+$'+fmt(t.pnl)"></span>
                     </div>
-                    <div class="flex items-center gap-3">
-                      <span class="text-red-400" x-show="t.side==='sell' && t.pnl!=null"
-                            x-text="'actual: '+(t.pnl>=0?'+':'')+fmt(t.pnl??0)"></span>
-                      <span class="text-emerald-400" x-show="t.sim_status==='capped'"
-                            x-text="'→ capped: '+fmt(t.sim_pnl??0)"></span>
-                      <span class="text-gray-600" x-text="fmtTime(t.ts)"></span>
+                  </template>
+                </div>
+                <div class="bg-gray-900 rounded-xl p-3">
+                  <div class="text-red-400 text-xs uppercase tracking-wider mb-2">Worst trades</div>
+                  <template x-for="t in btResult.worstTrades" :key="t.sym+t.pnl">
+                    <div class="flex justify-between text-xs py-0.5">
+                      <span class="text-gray-300" x-text="t.sym"></span>
+                      <span class="text-red-400" x-text="'−$'+fmt(Math.abs(t.pnl))"></span>
                     </div>
-                  </div>
-                </template>
+                  </template>
+                </div>
               </div>
+
+              <!-- Quick presets -->
+              <div class="flex flex-wrap gap-2 mt-4">
+                <div class="text-gray-600 text-xs self-center mr-1">Quick presets:</div>
+                <button @click="btParams = {...btParams, size_mult:1.6, sl_pct:28}"
+                        class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-orange-400">degen</button>
+                <button @click="btParams = {...btParams, size_mult:1.3, sl_pct:18}"
+                        class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-blue-400">hype</button>
+                <button @click="btParams = {...btParams, size_mult:1.0, sl_pct:12}"
+                        class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-gray-400">default</button>
+                <button @click="btParams = {...btParams, size_mult:0.7, sl_pct:7}"
+                        class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-green-400">safe</button>
+                <button @click="btParams = {...btParams, per_token_cap:0}"
+                        class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-gray-500">no cap</button>
+                <button @click="btParams = {...btParams, cooldown_min:0}"
+                        class="text-xs bg-gray-800 hover:bg-gray-700 rounded px-3 py-1 text-gray-500">no cooldown</button>
+              </div>
+
             </div>
           </template>
+
         </div>
       </template>
     </div>
@@ -1388,6 +1428,8 @@ function app() {
     pos:     {},
     history: { trades: [], total_pnl: 0, win_rate: 0, avg_win: 0, avg_loss: 0 },
     sim100:  null,
+    btParams: { start: 100, size_mult: 1.3, sl_pct: 18, dollar_stop: 12, per_token_cap: 90, cooldown_min: 30, seed_pct: 40 },
+    btResult: null,
     histWindow: '100',     // '100' | 'week' | 'all'
     histSort:   'ts',
     histDir:    'desc',
@@ -1490,9 +1532,10 @@ function app() {
       if (savedTab && this.tabs.includes(savedTab)) this.tab = savedTab;
       this.$watch('tab', v => {
         localStorage.setItem('dash_tab', v);
-        // Redraw the chart when History becomes visible (Chart.js can't size a hidden canvas)
-        if (v === 'History') this.$nextTick(() => this.drawChart());
+        if (v === 'History')  this.$nextTick(() => this.drawChart());
+        if (v === 'Backtest') this.$nextTick(() => this.runBacktest());
       });
+      this.$watch('btParams', () => this.runBacktest(), { deep: true });
       await this.refresh();
       setInterval(() => this.refresh(), 3000);
     },
@@ -1514,7 +1557,7 @@ function app() {
         (!this.sim100 || needsHistory) ? this.get('/api/sim100') : Promise.resolve(null),
       ]);
       if (h !== null || s1 !== null) this._lastTradeCount = tradeCount;
-      if (s1) this.sim100 = s1;
+      if (s1) { this.sim100 = s1; this.runBacktest(); }
       if (sc) { this.scout = sc.scout || []; this.scoutCounts = sc.counts || {}; }
       if (s) {
         this.state = s;
@@ -1540,6 +1583,88 @@ function app() {
       if (al)  this.alerts  = al;
       if (rpc) this.rpc     = rpc;
       this.lastRefresh = new Date().toLocaleTimeString();
+    },
+
+    // ── Backtest Lab (client-side, instant) ──
+    runBacktest() {
+      const trades = this.sim100?.trades;
+      if (!trades?.length) return;
+      const p = this.btParams;
+      const REAL_MULT = 1.6;
+      const sl = p.sl_pct / 100;
+      const seedPct = p.seed_pct / 100;
+
+      let vault = p.start;
+      const open_pos = {};
+      const last_loss_exit = {};
+      const wins = [], losses = [];
+      let nBlocked = 0, nSkipped = 0, nCapped = 0;
+      let peak = p.start, trough = p.start;
+      const history = [{ ts: 0, v: p.start }];
+
+      for (const t of trades) {
+        const sym  = t.symbol || '?';
+        const side = t.side;
+        const tsEpoch = t.ts ? new Date(t.ts).getTime() / 1000 : 0;
+        const realUsd = t.usd  != null ? +t.usd  : 0;
+        const realPnl = t.pnl  != null ? +t.pnl  : 0;
+
+        if (side === 'buy') {
+          if (!sym || sym === '?') { nSkipped++; continue; }
+          const ll = last_loss_exit[sym] || 0;
+          if (ll && tsEpoch && tsEpoch - ll < p.cooldown_min * 60) { nBlocked++; continue; }
+          if (p.per_token_cap > 0) {
+            const room = Math.max(0, p.per_token_cap - (open_pos[sym] || 0));
+            if (room < 10) { nSkipped++; continue; }
+          }
+          const scaled  = realUsd * (p.size_mult / REAL_MULT);
+          const avail   = Math.max(0, vault);
+          let simUsd    = Math.min(scaled, avail * seedPct);
+          if (p.per_token_cap > 0) {
+            const room = Math.max(0, p.per_token_cap - (open_pos[sym] || 0));
+            simUsd = Math.min(simUsd, room);
+          }
+          if (simUsd < 10 || avail < simUsd * 1.5) { nSkipped++; continue; }
+          vault -= simUsd;
+          open_pos[sym] = (open_pos[sym] || 0) + simUsd;
+
+        } else if (side === 'sell') {
+          const simCost = open_pos[sym];
+          if (simCost == null) continue;
+          const costReal = Math.max(Math.abs(realUsd - realPnl), 1e-9);
+          let rawPnl     = realPnl * (simCost / costReal);
+          const effStop  = Math.max(p.dollar_stop, simCost * sl);
+          if (rawPnl < -effStop) { rawPnl = -effStop; nCapped++; }
+          vault += simCost + rawPnl;
+          delete open_pos[sym];
+          const total = vault + Object.values(open_pos).reduce((a, b) => a + b, 0);
+          if (total > peak)   peak   = total;
+          if (total < trough) trough = total;
+          if (realPnl < 0 && tsEpoch) last_loss_exit[sym] = tsEpoch;
+          if (rawPnl > 0) wins.push({ sym, pnl: rawPnl });
+          else           losses.push({ sym, pnl: rawPnl });
+          history.push({ ts: tsEpoch, v: +total.toFixed(2) });
+        }
+      }
+      const end = vault + Object.values(open_pos).reduce((a, b) => a + b, 0);
+      peak = Math.max(peak, end);
+      const n = wins.length + losses.length;
+      wins.sort((a, b) => b.pnl - a.pnl);
+      losses.sort((a, b) => a.pnl - b.pnl);
+      this.btResult = {
+        end: +end.toFixed(2),
+        pct: +((end / p.start - 1) * 100).toFixed(1),
+        peak: +peak.toFixed(2),
+        trough: +trough.toFixed(2),
+        nW: wins.length, nL: losses.length,
+        wr: n ? +(wins.length / n * 100).toFixed(1) : 0,
+        avgWin:  wins.length   ? +(wins.reduce((a, b)   => a + b.pnl, 0) / wins.length).toFixed(2)   : 0,
+        avgLoss: losses.length ? +(losses.reduce((a, b) => a + b.pnl, 0) / losses.length).toFixed(2) : 0,
+        nBlocked, nSkipped, nCapped,
+        bestTrades:  wins.slice(0, 5),
+        worstTrades: losses.slice(0, 5),
+        history,
+      };
     },
 
     // ── HTTP helpers ──
