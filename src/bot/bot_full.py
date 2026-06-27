@@ -2543,6 +2543,146 @@ def api_history():
     return resp
 
 
+_sim100_cache: Dict[str, Any] = {}
+
+@app.route("/api/sim100")
+@_dash_auth
+def api_sim100():
+    """Simulate: what would have happened going live at trade[0] with $100 + current fixed code.
+
+    Uses:
+    - Seed mode sizing: bet = min(real_bet, avail_cash × 40%), $10 floor, 1.5× buffer gate
+    - 30-min post-loss cooldown blocking re-entries on same token
+    - Dollar stop: cap any loss at max($12, 10% of sim deployed cost)
+    - Full compounding: all proceeds go back into the pool
+    """
+    trades = STATE.get("trade_log", [])
+    n = len(trades)
+    if _sim100_cache.get("n") == n and _sim100_cache.get("payload"):
+        return _sim100_cache["payload"]
+
+    dollar_stop = CONFIG["moonshot"].get("dollar_stop_usd", 12.0)
+
+    def _ts(t):
+        try:
+            return float(t.get("ts_epoch") or 0) or \
+                __import__("datetime").datetime.fromisoformat(
+                    t["ts"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    START       = 100.0
+    vault       = START
+    open_pos: Dict[str, float] = {}   # sym -> sim cost basis currently deployed
+    last_loss_exit: Dict[str, float] = {}  # sym -> exit ts (losses only)
+    running     = 0.0
+    skipped     = 0
+    blocked     = 0
+    capped      = 0
+    hist: List[Dict] = []
+    peak        = START
+    trough      = START
+    trades_out: List[Dict] = []
+
+    for t in trades:
+        sym  = t.get("symbol", "")
+        side = t.get("side")
+        usd  = float(t.get("usd") or 0)
+        pnl  = t.get("pnl")
+        ts   = _ts(t)
+
+        total_now = vault + sum(open_pos.values())
+
+        if side == "buy":
+            # 1. Post-loss cooldown check
+            last_loss = last_loss_exit.get(sym, 0)
+            if last_loss and ts - last_loss < 30 * 60:
+                blocked += 1
+                trades_out.append({**t, "sim_status": "blocked", "sim_usd": 0, "sim_pnl": None})
+                continue
+
+            # 2. Seed mode sizing
+            avail   = max(0.0, vault)          # only free cash, not deployed
+            sim_usd = min(usd, avail * 0.40)   # at most 40% of free cash
+            if sim_usd < 10.0 or avail < sim_usd * 1.5:
+                skipped += 1
+                trades_out.append({**t, "sim_status": "skipped", "sim_usd": 0, "sim_pnl": None})
+                continue
+
+            vault -= sim_usd
+            open_pos[sym] = open_pos.get(sym, 0.0) + sim_usd
+            total_now = vault + sum(open_pos.values())
+            peak   = max(peak, total_now)
+            trough = min(trough, total_now)
+            hist.append({"ts": t.get("ts", ""), "vault": round(total_now, 2)})
+            trades_out.append({**t, "sim_status": "kept", "sim_usd": round(sim_usd, 4), "sim_pnl": None})
+
+        elif side == "sell" and pnl is not None:
+            sim_cost = open_pos.get(sym)
+            if sim_cost is None or sim_cost <= 0:
+                trades_out.append({**t, "sim_status": "no_pos", "sim_usd": 0, "sim_pnl": None})
+                continue
+
+            # Scale pnl proportionally to sim position size vs real position size
+            cost_real = max(usd - pnl, 1e-9)
+            scale     = sim_cost / cost_real
+            raw_pnl   = pnl * scale
+
+            # 3. Dollar stop cap
+            eff_stop = max(dollar_stop, sim_cost * 0.10)
+            if raw_pnl < -eff_stop:
+                sim_pnl = -eff_stop
+                capped += 1
+                status  = "capped"
+            else:
+                sim_pnl = raw_pnl
+                status  = "kept"
+
+            sim_proc = sim_cost + sim_pnl   # cash back into vault
+            vault   += sim_proc
+            running += sim_pnl
+            open_pos.pop(sym, None)
+
+            if pnl < 0:
+                last_loss_exit[sym] = ts
+
+            total_now = vault + sum(open_pos.values())
+            peak   = max(peak, total_now)
+            trough = min(trough, total_now)
+            hist.append({"ts": t.get("ts", ""), "vault": round(total_now, 2)})
+            trades_out.append({**t, "sim_status": status,
+                                "sim_usd": round(sim_cost, 4),
+                                "sim_pnl": round(sim_pnl, 4)})
+        else:
+            trades_out.append({**t, "sim_status": "kept", "sim_usd": 0, "sim_pnl": None})
+
+    end_total = vault + sum(open_pos.values())
+    sim_sells = [t for t in trades_out if t.get("side") == "sell" and t.get("sim_pnl") is not None
+                 and t.get("sim_status") not in ("no_pos",)]
+    sim_wins  = [t for t in sim_sells if t["sim_pnl"] > 0]
+    sim_losses= [t for t in sim_sells if t["sim_pnl"] <= 0]
+
+    resp = jsonify({
+        "start":       START,
+        "end":         round(end_total, 2),
+        "peak":        round(peak, 2),
+        "trough":      round(trough, 2),
+        "pct":         round((end_total - START) / START * 100, 1),
+        "running_pnl": round(running, 2),
+        "n_blocked":   blocked,
+        "n_skipped":   skipped,
+        "n_capped":    capped,
+        "win_rate":    len(sim_wins) / max(1, len(sim_sells)),
+        "avg_win":     sum(t["sim_pnl"] for t in sim_wins)    / max(1, len(sim_wins)),
+        "avg_loss":    sum(t["sim_pnl"] for t in sim_losses)  / max(1, len(sim_losses)),
+        "hist":        hist,
+        "trades":      trades_out,
+    })
+    _sim100_cache["n"]       = n
+    _sim100_cache["payload"] = resp
+    return resp
+
+
 @app.route("/api/backtest")
 @_dash_auth
 def api_backtest():

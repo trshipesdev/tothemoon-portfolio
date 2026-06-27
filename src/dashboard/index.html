@@ -222,43 +222,67 @@
         </div>
       </div>
 
-      <!-- $100 runner comparison — real simulation, same bet sizes -->
-      <div class="bg-gray-900 rounded-xl p-4 mb-5">
-        <div class="text-emerald-400 text-xs uppercase tracking-wider mb-1">🏃 $100 runner</div>
-        <div class="text-gray-600 text-xs mb-3">same bets as real run, starting with $100 — profits go straight back in and compound</div>
-        <template x-if="history.runner_100">
+      <!-- $100 live simulation — current fixed code, seed mode sizing -->
+      <div class="bg-gray-900 rounded-xl p-4 mb-5"
+           x-data="{ sim: null, loading: false,
+             load() { this.loading=true; fetch('/api/sim100',{headers:authHeader()})
+               .then(r=>r.json()).then(d=>{this.sim=d;this.loading=false;})
+               .catch(()=>{this.loading=false;}); } }"
+           x-init="load()">
+        <div class="flex items-center justify-between mb-1">
+          <div class="text-emerald-400 text-xs uppercase tracking-wider">🏃 $100 live sim</div>
+          <button @click="load()" class="text-gray-600 hover:text-gray-400 text-xs">↻</button>
+        </div>
+        <div class="text-gray-600 text-xs mb-3">current fixed code · seed mode sizing · 30-min loss cooldown · dollar stop — what would have happened</div>
+        <template x-if="loading && !sim">
+          <div class="text-gray-600 text-sm py-2">calculating…</div>
+        </template>
+        <template x-if="sim">
           <div>
             <div class="flex items-end gap-3 mb-3">
               <div class="text-3xl font-bold"
-                   :class="(history.runner_100.end ?? 0) >= 100 ? 'text-emerald-400' : 'text-red-400'"
-                   x-text="'$' + fmt(history.runner_100.end ?? 0)"></div>
+                   :class="sim.end >= sim.start ? 'text-emerald-400' : 'text-red-400'"
+                   x-text="'$' + fmt(sim.end)"></div>
               <div class="text-sm pb-1"
-                   :class="(history.runner_100.end ?? 0) >= 100 ? 'text-emerald-500' : 'text-red-500'"
-                   x-text="(((history.runner_100.end ?? 0) / 100 - 1) * 100).toFixed(1) + '%'"></div>
+                   :class="sim.end >= sim.start ? 'text-emerald-500' : 'text-red-500'"
+                   x-text="(sim.pct >= 0 ? '+' : '') + sim.pct.toFixed(1) + '%'"></div>
             </div>
-            <div class="grid grid-cols-3 gap-2 text-center text-xs mb-2">
+            <div class="grid grid-cols-3 gap-2 text-center text-xs mb-3">
               <div class="bg-gray-800 rounded-lg p-2">
                 <div class="text-gray-500 mb-1">Started</div>
-                <div class="font-bold">$100.00</div>
+                <div class="font-bold">$<span x-text="sim.start.toFixed(2)"></span></div>
               </div>
               <div class="bg-gray-800 rounded-lg p-2">
-                <div class="text-gray-500 mb-1">Lowest point</div>
-                <div class="font-bold text-red-400" x-text="'$' + fmt(history.runner_100.min ?? 0)"></div>
+                <div class="text-gray-500 mb-1">Lowest</div>
+                <div class="font-bold text-red-400" x-text="'$' + fmt(sim.trough)"></div>
               </div>
               <div class="bg-gray-800 rounded-lg p-2">
                 <div class="text-gray-500 mb-1">Peak</div>
-                <div class="font-bold text-emerald-400" x-text="'$' + fmt(history.runner_100.max ?? 0)"></div>
+                <div class="font-bold text-emerald-400" x-text="'$' + fmt(sim.peak)"></div>
               </div>
             </div>
-            <div class="text-gray-500 text-xs" x-show="(history.runner_100.skipped ?? 0) > 0">
-              ⚠️ <span x-text="history.runner_100.skipped"></span> bets skipped — vault ran dry mid-run
+            <div class="grid grid-cols-3 gap-2 text-center text-xs mb-2">
+              <div class="bg-gray-800/60 rounded-lg p-2">
+                <div class="text-gray-500 mb-1">Blocked</div>
+                <div class="font-bold text-amber-400" x-text="sim.n_blocked + ' re-entries'"></div>
+              </div>
+              <div class="bg-gray-800/60 rounded-lg p-2">
+                <div class="text-gray-500 mb-1">Skipped</div>
+                <div class="font-bold text-gray-400" x-text="sim.n_skipped + ' (cash dry)'"></div>
+              </div>
+              <div class="bg-gray-800/60 rounded-lg p-2">
+                <div class="text-gray-500 mb-1">Loss capped</div>
+                <div class="font-bold text-blue-400" x-text="sim.n_capped + ' trades'"></div>
+              </div>
             </div>
-            <div class="text-gray-600 text-xs mt-1">
-              actual trade replay · <span x-text="'your real vault started at $' + fmt(state.vault_start ?? 0)"></span>
+            <div class="flex justify-between text-xs text-gray-600 mt-1">
+              <span>Win rate: <span class="text-gray-400" x-text="(sim.win_rate*100).toFixed(0)+'%'"></span></span>
+              <span>Avg win: <span class="text-green-500" x-text="'$'+fmt(sim.avg_win)"></span></span>
+              <span>Avg loss: <span class="text-red-500" x-text="'$'+fmt(Math.abs(sim.avg_loss))"></span></span>
             </div>
           </div>
         </template>
-        <template x-if="!history.runner_100">
+        <template x-if="!sim && !loading">
           <div class="text-gray-600 text-sm">No trade history yet</div>
         </template>
       </div>
