@@ -1219,7 +1219,7 @@ def _wallet_goal_check() -> Optional[float]:
     return payout
 
 
-def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[str, Any]:
+def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reason: str = "?") -> Dict[str, Any]:
     pos = STATE["positions"].get(symbol)
     if not pos or pos["usd"] <= 0:
         return {"sold": 0.0, "pnl": 0.0}
@@ -1270,6 +1270,7 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[s
         "side": "sell", "usd": proceeds, "price": price, "units": units, "gas": gas,
         "address": pos.get("address", ""), "pnl": pnl,
         "mode": pos.get("entry_mode", CONFIG.get("mode")),
+        "exit_reason": exit_reason,
     }
     STATE.setdefault("trade_log", []).append(_trade_entry)
     _append_trade(_trade_entry)
@@ -1668,9 +1669,9 @@ def exec_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float, 
     return shadow_buy(symbol, chain, usd, price, liq_usd, address) if SHADOW_MODE else live_buy(symbol, chain, usd, price, liq_usd, address)
 
 
-def exec_sell(symbol: str, usd: float, price: float, liq_usd: float) -> Dict[str, Any]:
+def exec_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reason: str = "?") -> Dict[str, Any]:
     if SHADOW_MODE:
-        return shadow_sell(symbol, usd, price, liq_usd)
+        return shadow_sell(symbol, usd, price, liq_usd, exit_reason)
     pos     = STATE["positions"].get(symbol, {})
     chain   = pos.get("chain", "sol")
     address = pos.get("address", "")
@@ -1869,7 +1870,7 @@ def manage_trusted_coins():
             trim_units = units - core
             trim_usd   = trim_units * price
             if trim_usd >= CONFIG["moonshot"]["min_ticket_usd"]:
-                shadow_sell(sym, trim_usd, price, liq)
+                shadow_sell(sym, trim_usd, price, liq, "trusted_trim")
                 log(f"TRUSTED trim {sym}: {trim_units:.0f} units @{price:.5f}")
                 send_alert(
                     f"🐕 TRIMMED {sym} @ {price:.5f} — it rose into your take-profit zone, so the bot sold "
@@ -3995,7 +3996,7 @@ def manage_positions():
             exit_reason = f"LIQ DRAIN {liq_ticks[0]:.0f}→{liq:.0f} over {len(liq_ticks)} ticks"
 
         if exit_reason:
-            res = exec_sell(s, p["usd"], price, liq)
+            res = exec_sell(s, p["usd"], price, liq, exit_reason)
             pnl = res.get("pnl", 0.0)
             log(f"EXIT {s} [{exit_reason}] pnl ${pnl:.2f}")
             send_alert(
@@ -4027,7 +4028,7 @@ def manage_positions():
                 sell_usd = min(frac * deployed, sellable)
                 p["tp_index"] = i + 1
                 if sell_usd > 0.01:
-                    res = exec_sell(s, sell_usd, price, liq)
+                    res = exec_sell(s, sell_usd, price, liq, f"TP rung {i+1} +{gain*100:.0f}%")
                     pnl = res.get("pnl", 0.0)
                     log(f"TP {s} rung {i+1}/{len(ladder)} +{gain*100:.0f}%: sold ${sell_usd:.2f} pnl ${pnl:.2f}")
                     last = (i + 1 >= len(ladder)) and moonbag_frac > 0
@@ -4042,7 +4043,7 @@ def manage_positions():
 
         # 7. Fixed SL fallback (for slow bleeds that don't trip velocity/trail)
         if not tp_hit and p.get("units", 0) > 0 and price <= p["avg"] * (1 - sl_level):
-            res = exec_sell(s, p["usd"], price, liq)
+            res = exec_sell(s, p["usd"], price, liq, "fixed_sl")
             pnl = res.get("pnl", 0.0)
             log(f"SL {s}: exit pnl ${pnl:.2f}")
             send_alert(
@@ -4050,6 +4051,7 @@ def manage_positions():
                 f"damage. Paper result: ${pnl:+.2f}. Better a small loss than a big one.", critical=True)
             _add_reentry_watch(s, p, liq, vol_h1, "fixed_sl")
             save_state()
+            continue
 
         # No-pump soft flag
         if p.get("units", 0) > 0 and should_exit_no_pump(entry_ts, time.time(), p["avg"], price, liq):
