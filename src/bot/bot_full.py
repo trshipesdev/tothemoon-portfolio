@@ -808,7 +808,10 @@ def fetch_positions_prices() -> Dict[str, Dict]:
             if p.get("chain") == "sol" and addr:
                 bd = fetch_birdeye_price(addr)
                 if bd and float(bd.get("value") or 0) > 0:
-                    result[sym] = _px_dict(float(bd["value"]), float(bd.get("liquidity") or 100000.0))
+                    # Use entry_liq as fallback — 100000 default would poison liq_prev
+                    # and trigger a false rug alarm on the next DexScreener tick.
+                    bd_liq = float(bd.get("liquidity") or 0) or p.get("entry_liq", 0) or 0
+                    result[sym] = _px_dict(float(bd["value"]), bd_liq)
                     continue
             result[sym] = _px_dict(p.get("avg", 1.0) * 1.02)
     return result
@@ -1141,6 +1144,11 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         pos["peak_price"] = filled_price
     if is_new_pos:
         STATE.setdefault("open_burst", []).append(time.time())
+        # Seed liq_prev with real entry liq so the first manage_positions tick
+        # has a truthful baseline. Without this, BirdEye fallback (default 100k)
+        # contaminates liq_prev and fires a false rug alarm on the next real tick.
+        if liq_usd > 0:
+            STATE.setdefault("liq_prev", {})[symbol] = liq_usd
     gas = _gas_usd(chain)   # network fee to enter — a sunk cost on top of the buy
     new_total_units = pos["units"] + units
     pos["avg"]      = (pos["avg"] * pos["units"] + filled_price * units) / max(1e-9, new_total_units)
