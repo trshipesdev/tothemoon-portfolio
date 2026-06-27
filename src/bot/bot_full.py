@@ -3896,7 +3896,28 @@ def engine_loop():
             except Exception:
                 pass
             last_ai_run = time.time()
-        time.sleep(CONFIG["scan"].get("position_poll_sec", 3))
+        # Adaptive poll: if any open position is in the danger zone (unrealized loss
+        # already past half the effective stop), switch to 0.5s checks so we catch
+        # rugs before they gap through the full stop.
+        _fast_poll = False
+        if STATE.get("positions"):
+            _mode_sl = CONFIG["modes"].get(CONFIG["mode"], {}).get("sl", 0.12)
+            _dollar_stop = CONFIG["moonshot"].get("dollar_stop_usd", 12.0)
+            for _s, _p in list(STATE["positions"].items()):
+                if _p.get("units", 0) <= 0:
+                    continue
+                _cur_price = _p.get("last_price", _p.get("avg", 0))
+                if _cur_price <= 0 or _p.get("avg", 0) <= 0:
+                    continue
+                _pct_loss = (_p["avg"] - _cur_price) / _p["avg"]
+                _deployed = _p.get("deployed_usd", _p.get("usd", 0)) or _p.get("usd", 0)
+                _eff_stop = max(_dollar_stop, _deployed * 0.10)
+                _unrealized = (_cur_price / _p["avg"] - 1) * _deployed
+                # "red zone": already used more than half the stop budget
+                if _pct_loss > _mode_sl * 0.5 or _unrealized < -(_eff_stop * 0.5):
+                    _fast_poll = True
+                    break
+        time.sleep(0.5 if _fast_poll else CONFIG["scan"].get("position_poll_sec", 3))
 
 # ---------------------------------------------------------------------------
 # Startup
