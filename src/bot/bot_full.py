@@ -145,7 +145,9 @@ CONFIG: Dict[str, Any] = {
         "liq_min":          15000,
         "liq_max":          250000,
         "hype_min":         80,         # 0–100
-        "buy_ratio_min":    0.45,       # reject if <45% of recent (h1) trades are buys (being dumped)
+        "buy_ratio_min":    0.40,       # reject if <40% of recent (h1) trades are buys (being dumped)
+                                        # was 0.45 — FRONT (+511%) and MASTERCOIN (+656%) were blocked at 40%/38%
+                                        # rugs are capped at dollar_stop anyway; see DECISIONS.md
         "dollar_stop_usd":  12.0,       # hard dollar stop — exit any position down more than this
         "dynamic_sizing":   False,      # True → bet = min(base_size, avail_cash × 40%) for seed/small vaults
         "price_impact_max": 0.02,
@@ -996,6 +998,7 @@ def _conviction_mult(hype: Optional[int], buy_ratio: Optional[float]) -> float:
     if buy_ratio is not None:
         if   buy_ratio >= 0.80: m += 0.15
         elif buy_ratio >= 0.65: m += 0.07
+        elif buy_ratio < 0.45:  m *= 0.75  # borderline sell pressure: 25% smaller bet
     return max(0.8, min(1.5, m))
 
 
