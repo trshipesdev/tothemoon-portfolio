@@ -3496,6 +3496,25 @@ def scan_candidates():
             _scout(symbol, chain, "rejected",
                    f"at max open positions ({CONFIG.get('max_open_positions', 12)})", sc, addr)
             continue
+        # Post-exit cooldown — applies to ALL tokens regardless of age.
+        # Pattern A: after a loss exit, block re-entry for 30 min (token is still dumping).
+        # Pattern B: after a profit exit, block re-entry unless price pulled back ≥8%.
+        # BUG FIXED: was inside `if is_new:` so older tokens bypassed the cooldown entirely.
+        _rex = STATE.get("recently_exited", {}).get(symbol)
+        if _rex:
+            _rex_elapsed = time.time() - _rex.get("ts", 0)
+            _rex_pnl     = _rex.get("pnl", 0)
+            _rex_price   = _rex.get("price", 0)
+            if _rex_pnl < 0 and _rex_elapsed < 30 * 60:
+                _scout(symbol, chain, "rejected",
+                       f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, pnl=${_rex_pnl:.2f})", sc, addr)
+                continue
+            if _rex_pnl >= 0 and _rex_elapsed < 15 * 60 and _rex_price > 0:
+                _pullback = (_rex_price - price) / _rex_price
+                if _pullback < 0.08:
+                    _scout(symbol, chain, "rejected",
+                           f"profit-chase block: price {_pullback*100:.1f}% below exit (need 8%)", sc, addr)
+                    continue
         if is_new:
             reject = moonshot_reject_reason(sc)
             if reject:
@@ -3517,7 +3536,7 @@ def scan_candidates():
                     f"audit yet (safety score {ps}/100). Too unproven to buy; just watching.\n{link}")
                 _scout(symbol, chain, "rejected", f"presale score {ps} < {ps_threshold} (no social/audit signal)", sc, addr)
                 continue
-            # Scam / rug safety gate — Reddit + X chatter + on-chain rug checks
+            # Scam / rug safety gate — on-chain rug checks
             safe, why = safety_gate(symbol, addr, chain)
             if not safe:
                 log(f"SAFETY GATE {symbol}: {why}")
@@ -3527,33 +3546,12 @@ def scan_candidates():
                 _scout(symbol, chain, "rejected", f"safety: {why}", sc, addr)
                 continue
             # Anti-churn: don't keep re-buying the same hyper-volatile token all day.
-            # Per-mode cap (degen cycles the few liquid tokens faster) → global fallback.
             entry_cap = CONFIG["modes"].get(CONFIG["mode"], {}).get(
                 "max_entries_per_token_day", CONFIG.get("max_entries_per_token_day", 4))
             if STATE.setdefault("entries_today", {}).get(symbol, 0) >= entry_cap:
                 _scout(symbol, chain, "rejected",
                        f"already entered {entry_cap}x today (anti-churn on volatile token)", sc, addr)
                 continue
-            # Post-exit cooldown: don't re-enter a token that was just fully closed.
-            # Pattern A (declining re-entry): after a loss exit, the scanner keeps finding
-            # the same token and buying back in while it continues to dump. Block for 30 min.
-            # Pattern B (profit chasing): after a win exit, bot re-enters at the same high
-            # price before the token pulls back. Block unless price is ≥8% below exit price.
-            _rex = STATE.get("recently_exited", {}).get(symbol)
-            if _rex:
-                _rex_elapsed = time.time() - _rex.get("ts", 0)
-                _rex_pnl     = _rex.get("pnl", 0)
-                _rex_price   = _rex.get("price", 0)
-                if _rex_pnl < 0 and _rex_elapsed < 30 * 60:
-                    _scout(symbol, chain, "rejected",
-                           f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, pnl=${_rex_pnl:.2f})", sc, addr)
-                    continue
-                if _rex_pnl >= 0 and _rex_elapsed < 15 * 60 and _rex_price > 0:
-                    _pullback = (_rex_price - price) / _rex_price
-                    if _pullback < 0.08:
-                        _scout(symbol, chain, "rejected",
-                               f"profit-chase block: price {_pullback*100:.1f}% below exit (need 8%)", sc, addr)
-                        continue
             if CONFIG["moonshot"]["mode"] == "enter":
                 usd = size_ticket_usd(chain, hype=sc.hype, buy_ratio=sc.buy_ratio)
                 _min_ticket = 10.0 if CONFIG["moonshot"].get("dynamic_sizing") else CONFIG["moonshot"]["min_ticket_usd"]
