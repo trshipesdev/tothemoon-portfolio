@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # crypto bot — shadow mode by default; see PENDING.md for live-trading TODOs
 
-import os, io, json, time, random, asyncio, threading, traceback
+import os, io, json, time, random, asyncio, threading, traceback, base64, struct, hashlib
 from collections import deque
 from datetime import datetime, timezone, timedelta
 import requests
@@ -61,11 +61,14 @@ CONFIG: Dict[str, Any] = {
         "evm_hex_key_env":          "WALLET_PK_EVM",
     },
 
-    "chains": ["sol", "eth", "base", "bsc"],
+    # TODO: re-enable EVM when bot is consistently profitable on SOL first.
+    # EVM data: SOL 47% WR vs EVM -$138 avg loss. Gas ($6+/trade ETH) eats small positions.
+    # "chains": ["sol", "eth", "base", "bsc"],
+    "chains": ["sol"],
     "scan": {
         "new_max_age_min":      120,  # pairs ≤ this age treated as NEW
         "hype_window_min":      240,
-        "dexscreener_poll_sec":  20,  # how often to scan for NEW candidates
+        "dexscreener_poll_sec":  8,   # how often to scan for NEW candidates
         "position_poll_sec":      3,  # how often to check OPEN positions (fast — catch quick pumps/dips)
     },
     "presale_min_score": 10,  # min presale_score to enter/suggest a new token (0=disabled, 10=social buzz only)
@@ -81,18 +84,60 @@ CONFIG: Dict[str, Any] = {
     },
 
     "modes": {
-        "safe":    {"tp": [0.15],      "sl": 0.07, "slip_bps": 60,  "liq_min": 50000, "max_age_min": 360, "max_entries_per_token_day": 2, "size_mult": 0.7},
-        "default": {"tp": [0.28],      "sl": 0.12, "slip_bps": 100, "liq_min": 30000, "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0},
-        "hype":    {"tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000, "max_age_min": 120, "max_entries_per_token_day": 4, "size_mult": 1.6},
-        "degen":   {"tp": [0.80, 1.5], "sl": 0.28, "slip_bps": 220, "liq_min": 10000, "max_age_min": 120, "max_entries_per_token_day": 6, "size_mult": 1.6,
-                    "no_pump": {"hurdle": 0.03, "min_sec": 240, "max_sec": 900},
-                    # Scalp-ladder + moon-bag: sell [fraction] of the original position at each
-                    # [gain]. Fractions sum to 0.70 → the remaining 0.30 is the MOON BAG, which
-                    # has no TP cap and rides a wide trailing stop to catch the rare +500% runners.
-                    "tp_ladder": [[0.30, 0.20], [0.80, 0.25], [1.50, 0.25]],
-                    "moonbag_trail_pct": 0.45},   # wide leash on the moon bag (vs 0.15 normal)
-        "seed":    {"tp": [0.50, 1.00], "sl": 0.14, "slip_bps": 120, "liq_min": 15000,
-                    "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0},
+        # Each mode owns its full personality: entry filters AND exit thresholds.
+        # Any key not set here falls back to CONFIG["moonshot"] global default.
+        "safe": {
+            "tp": [0.15], "sl": 0.07, "slip_bps": 60, "liq_min": 50000,
+            "max_age_min": 360, "max_entries_per_token_day": 2, "size_mult": 0.7,
+            # Entry: very selective
+            "m5_min": 2.0, "buy_ratio_min": 0.65,
+            # Exit: exit fast, protect capital
+            "velocity_exit_pct": 0.05, "rug_liq_drop": 0.20, "loss_cooldown_min": 30,
+        },
+        "default": {
+            "tp": [0.28], "sl": 0.12, "slip_bps": 100, "liq_min": 30000,
+            "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0,
+            # Entry: balanced
+            "m5_min": 0.5, "buy_ratio_min": 0.55,
+            # Exit: balanced
+            "velocity_exit_pct": 0.07, "rug_liq_drop": 0.30, "loss_cooldown_min": 15,
+        },
+        "hype": {
+            "tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000,
+            "max_age_min": 120, "max_entries_per_token_day": 4, "size_mult": 1.3,
+            # Entry: requires real momentum and majority buyers
+            "m5_min": 1.0, "buy_ratio_min": 0.55,
+            # Exit: fast — hype tokens dump fast when they turn
+            "velocity_exit_pct": 0.06, "rug_liq_drop": 0.25, "loss_cooldown_min": 10,
+        },
+        "degen": {
+            "tp": [0.80, 1.5], "sl": 0.28, "slip_bps": 220, "liq_min": 15000,
+            "max_age_min": 120, "max_entries_per_token_day": 6, "size_mult": 1.6,
+            "no_pump": {"hurdle": 0.03, "min_sec": 240, "max_sec": 900},
+            "tp_ladder": [[0.30, 0.20], [0.80, 0.25], [1.50, 0.25]],
+            "moonbag_trail_pct": 0.45,
+            # Entry: loose — degen rides volatility, enter anything moving
+            "m5_min": 0.0, "buy_ratio_min": 0.45,
+            # Exit: wide — degen holds through dips to catch moonshots
+            "velocity_exit_pct": 0.10, "rug_liq_drop": 0.40, "loss_cooldown_min": 5,
+        },
+        "seed": {
+            "tp": [0.50, 1.00], "sl": 0.14, "slip_bps": 120, "liq_min": 15000,
+            "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0,
+            # Entry: quality focused
+            "m5_min": 1.0, "buy_ratio_min": 0.60,
+            # Exit: fast exits to protect small vault
+            "velocity_exit_pct": 0.06, "rug_liq_drop": 0.25, "loss_cooldown_min": 15,
+        },
+        "micro": {
+            "tp": [0.35, 0.70], "sl": 0.12, "slip_bps": 100, "liq_min": 10000,
+            "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 0.083,
+            "min_ticket_usd": 3.0, "dollar_stop_usd": 1.50,
+            # Entry: moderate
+            "m5_min": 0.5, "buy_ratio_min": 0.55,
+            # Exit: very tight — tiny tickets can't absorb big losses
+            "velocity_exit_pct": 0.05, "rug_liq_drop": 0.20, "loss_cooldown_min": 20,
+        },
     },
     "mode": "default",
 
@@ -113,7 +158,7 @@ CONFIG: Dict[str, Any] = {
     # (found-but-not-bought). With a positive edge (75% win, wins > losses), smaller
     # tickets + a bigger daily budget capture more of that edge. Drawdown brake still
     # protects the downside. Tunable — re-evaluate each analysis.
-    "base_size_usd":        30.0,   # was 50 — smaller bets spread across more tokens
+    "base_size_usd":        60.0,   # raised 30→60: up to ~$100 bets with size_mult on $1k vault
     "reserve_pct":          0.25,   # keep 25% of vault untouched
     "per_token_cap_pct":    0.12,   # max 12% of deployable per token  ← real risk cap
     # Stop churning the same hyper-volatile token: cap fresh entries per symbol per day.
@@ -143,13 +188,17 @@ CONFIG: Dict[str, Any] = {
         # ~$10k almost all dumped AND are near-impossible to exit, so 15k is the
         # data-backed sweet spot. Momentum exits cap the downside on the misses.
         "liq_min":          15000,
-        "liq_max":          250000,
-        "hype_min":         80,         # 0–100
-        "buy_ratio_min":    0.40,       # reject if <40% of recent (h1) trades are buys (being dumped)
-                                        # was 0.45 — FRONT (+511%) and MASTERCOIN (+656%) were blocked at 40%/38%
-                                        # rugs are capped at dollar_stop anyway; see DECISIONS.md
+        "liq_max":          2000000,
+        "hype_min":         50,         # 0–100
+        "buy_ratio_min":    0.50,       # global fallback — each mode overrides this independently
+        "m5_min":           0.5,        # global fallback minimum m5% for entry — modes override
         "dollar_stop_usd":  12.0,       # hard dollar stop — exit any position down more than this
-        "loss_cooldown_min": 30,        # minutes to block re-entry after a loss exit on same token
+        # Gap-down safety: meme coins can crash 80-100% in a single poll window.
+        # Capping position size at (dollar_stop × mult) bounds worst-case gap-down loss.
+        # At mult=4 a 100% rug costs at most 4× the stop ($48 on $12 stop).
+        # Raise per-wallet via the safety.dollar_stop_pos_mult field for bigger bets.
+        "dollar_stop_pos_mult": 4.0,    # position hard cap = dollar_stop_usd × this
+        "loss_cooldown_min": 15,        # global fallback — each mode overrides independently
         "seed_pct":          0.40,      # max fraction of available cash per bet in dynamic_sizing mode
         "dynamic_sizing":   False,      # True → bet = min(base_size, avail_cash × seed_pct) for seed/small vaults
         "price_impact_max": 0.02,
@@ -158,11 +207,11 @@ CONFIG: Dict[str, Any] = {
         "tp":               [0.35, 0.60, 1.20],
         "sl":               0.22,
         "retries":          1,
-        "rug_liq_drop":     0.40,   # instant exit if liq drops > 40% in one tick
-        # Momentum exit params
+        "rug_liq_drop":     0.35,   # global fallback — each mode sets its own (degen 0.40, hype 0.25)
+        # Momentum exit params — global fallbacks, each mode overrides independently
         "trailing_stop_pct": 0.15,  # exit if price falls >15% from peak
-        "velocity_exit_pct": 0.08,  # exit if m5 price change < -8% (single tick crash)
-        "velocity_2m_pct":   0.12,  # exit if internal 2-min drop ≥ 12% (catches slow rugs early)
+        "velocity_exit_pct": 0.08,  # global fallback (hype/seed/micro use 0.06, degen uses 0.10)
+        "velocity_2m_pct":   0.10,  # global fallback internal 2-min drop threshold
         "vol_dry_pct":       0.20,  # alert if h1 vol < 20% of entry vol
         "liq_drain_ticks":   3,     # exit if liq declining for 3 consecutive ticks
         "liq_drain_pct":     0.05,  # each tick must drop >5% to count as drain
@@ -271,6 +320,8 @@ STATE: Dict[str, Any] = {
     "ts":               None,
     "vault_usd":        1000.0,
     "vault_start":      1000.0,
+    "take_home_usd":    0.0,
+    "take_home_log":    [],
     "deployable_usd":   750.0,
     "income_usd":       0.0,
     "positions":        {},
@@ -312,6 +363,8 @@ STATE: Dict[str, Any] = {
 _state_path_env = os.getenv("STATE_PATH", "")
 SAVEFILE        = _state_path_env if _state_path_env else f"state_{CONFIG['tenant']['name']}.json"
 TRADELOG_FILE   = os.path.join(os.path.dirname(SAVEFILE) or ".", "trades.jsonl")
+SCAN_LOG_FILE   = os.path.join(os.path.dirname(SAVEFILE) or ".", "scan_log.jsonl")
+_SCAN_LOG_MAX_LINES = 100_000   # rotate oldest half when exceeded
 
 
 def now_utc() -> datetime:
@@ -446,6 +499,7 @@ def load_state():
         STATE.setdefault("reentry_watch", {})
         STATE.setdefault("open_burst",    [])
         STATE.setdefault("brake_alerted", False)
+        STATE.setdefault("wallets",       {})
         STATE.setdefault("gas_paid_usd",  0.0)
         STATE.setdefault("scout_log",     [])
         STATE.setdefault("entries_today", {})
@@ -470,6 +524,11 @@ def load_state():
         # fix — otherwise they keep counting against the max-open-positions cap.
         STATE["positions"] = {s: p for s, p in STATE.get("positions", {}).items()
                               if p.get("units", 0) > 0}
+        # Recompute deployed capital from actual live positions so a stale value
+        # baked into state.json doesn't persist across restarts/deploys.
+        STATE["cur_deployed_usd"] = sum(
+            p.get("usd", 0.0) for p in STATE["positions"].values()
+        )
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -509,6 +568,337 @@ BIRDEYE_KEY_ENV      = "BIRDEYE_API_KEY"
 LUNARCRUSH_BASE      = "https://lunarcrush.com/api4/public"
 LUNARCRUSH_KEY_ENV   = "LUNARCRUSH_API_KEY"
 
+# ---------------------------------------------------------------------------
+# Solana WebSocket — real-time price feed via on-chain pool subscriptions
+# ---------------------------------------------------------------------------
+# Pump.fun bonding curve PDA derivation and data parsing.
+# Complements the 20s DexScreener poll — LP drains hit the WebSocket in ~1-2s.
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+# SOL_WSS_URL env overrides the default public endpoint (set to Helius/QuickNode for prod).
+SOL_WSS_URL = os.getenv("SOL_WSS_URL", "wss://api.mainnet-beta.solana.com")
+
+WS_PRICES: Dict[str, Dict] = {}     # symbol -> {price, liq, ts}
+_ws_subs:  Dict[str, Dict] = {}     # symbol -> {curve}
+_ws_lock   = threading.Lock()
+_ws_thread_obj: Optional[threading.Thread] = None
+_SOL_USD: Dict[str, Any] = {"price": 0.0, "ts": 0.0}
+
+
+def _sol_usd_cached() -> float:
+    """Return cached SOL/USD, refreshing from CoinGecko if stale (>60s)."""
+    if time.time() - _SOL_USD["ts"] > 60:
+        try:
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+                timeout=5
+            ).json()
+            p = float(r.get("solana", {}).get("usd") or 0)
+            if p > 0:
+                _SOL_USD["price"] = p
+                _SOL_USD["ts"] = time.time()
+        except Exception:
+            pass
+    return _SOL_USD["price"] or 180.0
+
+
+def _pf_curve_address(mint: str) -> Optional[str]:
+    """Derive the Pump.fun bonding curve PDA for a given token mint."""
+    try:
+        from solders.pubkey import Pubkey  # type: ignore
+        curve, _ = Pubkey.find_program_address(
+            [b"bonding-curve", bytes(Pubkey.from_string(mint))],
+            Pubkey.from_string(PUMP_PROGRAM),
+        )
+        return str(curve)
+    except Exception:
+        return None
+
+
+def _parse_pf_curve(data_b64: str) -> Optional[tuple]:
+    """Decode Pump.fun bonding curve account data.
+    Layout: discriminator[8] + virtual_token_reserves[8] + virtual_sol_reserves[8] + ...
+    Returns (price_usd, liq_usd) or None."""
+    try:
+        data = base64.b64decode(data_b64)
+        if len(data) < 25:
+            return None
+        vt = struct.unpack_from("<Q", data, 8)[0]   # virtual_token_reserves
+        vs = struct.unpack_from("<Q", data, 16)[0]  # virtual_sol_reserves
+        if vt == 0:
+            return None
+        # Price: (vs/1e9 SOL) / (vt/1e6 tokens) → SOL per token × USD per SOL
+        price_usd = (vs / vt / 1000) * _sol_usd_cached()
+        liq_usd   = (vs / 1e9) * _sol_usd_cached() * 2  # rough TVL (2× the SOL side)
+        return price_usd, liq_usd
+    except Exception:
+        return None
+
+
+def _ws_add(symbol: str, mint: str):
+    """Register a SOL token for live WebSocket price subscription."""
+    if not mint or len(mint) < 32:
+        return
+    curve = _pf_curve_address(mint)
+    if curve:
+        with _ws_lock:
+            _ws_subs[symbol] = {"curve": curve}
+        log(f"WS: registered {symbol} → curve {curve[:8]}…")
+    else:
+        log(f"WS: could not derive curve for {symbol} ({mint[:10]}…) — using DexScreener only")
+
+
+def _ws_remove(symbol: str):
+    """Deregister a symbol from WebSocket subscriptions on position close."""
+    with _ws_lock:
+        _ws_subs.pop(symbol, None)
+        WS_PRICES.pop(symbol, None)
+
+
+async def _ws_loop():
+    import websockets  # type: ignore
+    while True:
+        try:
+            async with websockets.connect(
+                SOL_WSS_URL, ping_interval=20, ping_timeout=30, max_size=10_000_000
+            ) as ws:
+                log(f"WS: connected to {SOL_WSS_URL}")
+                sub_to_sym: Dict[int, str] = {}   # subscription_id -> symbol
+                pending: Dict[int, str]    = {}   # req_id -> symbol (awaiting sub confirm)
+                req_id = 100
+                last_sync = 0.0
+
+                async def sync_subs():
+                    nonlocal req_id
+                    with _ws_lock:
+                        cur = dict(_ws_subs)
+                    subscribed_syms = set(sub_to_sym.values()) | set(pending.values())
+                    for sym, info in cur.items():
+                        if sym not in subscribed_syms:
+                            await ws.send(json.dumps({
+                                "jsonrpc": "2.0", "id": req_id,
+                                "method": "accountSubscribe",
+                                "params": [info["curve"],
+                                           {"encoding": "base64", "commitment": "confirmed"}],
+                            }))
+                            pending[req_id] = sym
+                            req_id += 1
+                    # Unsubscribe dropped symbols
+                    drop = [sid for sid, sym in sub_to_sym.items() if sym not in cur]
+                    for sid in drop:
+                        sym = sub_to_sym.pop(sid)
+                        await ws.send(json.dumps({
+                            "jsonrpc": "2.0", "id": req_id,
+                            "method": "accountUnsubscribe",
+                            "params": [sid],
+                        }))
+                        req_id += 1
+                        log(f"WS: unsubscribed {sym}")
+
+                await sync_subs()
+                last_sync = time.time()
+
+                async for raw in ws:
+                    msg = json.loads(raw)
+
+                    # Subscribe confirmation: map result (sub ID) to symbol
+                    if "result" in msg and isinstance(msg["result"], int):
+                        rid = msg.get("id")
+                        sym = pending.pop(rid, None)
+                        if sym:
+                            sub_to_sym[msg["result"]] = sym
+                            log(f"WS: subscribed {sym} (sub={msg['result']})")
+
+                    # Live account notification
+                    elif msg.get("method") == "accountNotification":
+                        params = msg.get("params", {})
+                        sym = sub_to_sym.get(params.get("subscription"))
+                        if sym:
+                            value = params.get("result", {}).get("value", {})
+                            d = value.get("data")
+                            if isinstance(d, list) and d:
+                                parsed = _parse_pf_curve(d[0])
+                                if parsed:
+                                    price_usd, liq_usd = parsed
+                                    with _ws_lock:
+                                        WS_PRICES[sym] = {
+                                            "price": price_usd,
+                                            "liq":   liq_usd,
+                                            "ts":    time.time(),
+                                        }
+
+                    # Sync subscriptions every 5s (picks up new positions, drops closed ones)
+                    if time.time() - last_sync > 5:
+                        await sync_subs()
+                        last_sync = time.time()
+
+        except Exception as e:
+            log(f"WS: error — {e}; reconnecting in 5s")
+            await asyncio.sleep(5)
+
+
+def _ws_thread_fn():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_ws_loop())
+
+
+def _start_ws_thread():
+    global _ws_thread_obj
+    if _ws_thread_obj and _ws_thread_obj.is_alive():
+        return
+    _ws_thread_obj = threading.Thread(target=_ws_thread_fn, name="ws-price", daemon=True)
+    _ws_thread_obj.start()
+
+
+# ---------------------------------------------------------------------------
+# Pump.fun on-chain new-token detector  (second WS conn, logsSubscribe)
+# ---------------------------------------------------------------------------
+# When a new token is minted on Pump.fun the program emits a CreateEvent in
+# the transaction logs.  We subscribe to those logs, parse the event, and
+# fire a DexScreener probe 4 s later so scan_candidates can evaluate the
+# token with an accurate on-chain creation timestamp — beating the 8 s poll.
+# ---------------------------------------------------------------------------
+
+_ONCHAIN_CREATES: Dict[str, Dict] = {}   # mint → {ts, symbol}
+_PROBE_QUEUE:     List[Dict]       = []   # DexScreener pair dicts ready to evaluate
+_ONCHAIN_LOCK     = threading.Lock()
+_CREATE_DISC: Optional[bytes]      = None
+_ws_create_thread: Optional[threading.Thread] = None
+
+
+def _pf_create_disc() -> bytes:
+    global _CREATE_DISC
+    if _CREATE_DISC is None:
+        _CREATE_DISC = hashlib.sha256(b"event:CreateEvent").digest()[:8]
+    return _CREATE_DISC
+
+
+def _parse_pf_create_event(data_b64: str) -> Optional[Dict]:
+    """Decode a Pump.fun CreateEvent from an Anchor 'Program data:' log line.
+    Layout after 8-byte discriminator: name(str) symbol(str) uri(str) mint(pk) curve(pk) user(pk)."""
+    try:
+        data = base64.b64decode(data_b64)
+        if len(data) < 8 or data[:8] != _pf_create_disc():
+            return None
+        from solders.pubkey import Pubkey
+        pos = 8
+
+        def read_str() -> str:
+            nonlocal pos
+            n = struct.unpack_from("<I", data, pos)[0]; pos += 4
+            s = data[pos:pos + n].decode("utf-8", errors="replace"); pos += n
+            return s
+
+        def read_pk() -> str:
+            nonlocal pos
+            pk = str(Pubkey.from_bytes(data[pos:pos + 32])); pos += 32
+            return pk
+
+        name   = read_str()
+        symbol = read_str()
+        _uri   = read_str()
+        mint   = read_pk()
+        curve  = read_pk()
+        return {"name": name, "symbol": symbol, "mint": mint, "bonding_curve": curve}
+    except Exception:
+        return None
+
+
+def _on_pumpfun_create(ev: Dict):
+    """Register a newly detected Pump.fun token and kick off a DexScreener probe."""
+    mint, symbol = ev["mint"], ev.get("symbol", "???")
+    with _ONCHAIN_LOCK:
+        if mint in _ONCHAIN_CREATES:
+            return
+        _ONCHAIN_CREATES[mint] = {"ts": time.time(), "symbol": symbol}
+        cutoff = time.time() - 600
+        for k in list(_ONCHAIN_CREATES):
+            if _ONCHAIN_CREATES[k]["ts"] < cutoff:
+                del _ONCHAIN_CREATES[k]
+    log(f"WS-create: ${symbol} ({mint[:8]}…) minted on-chain")
+    _ws_add(symbol, mint)   # subscribe price feed immediately
+    threading.Thread(target=_probe_new_token, args=(mint, symbol), daemon=True).start()
+
+
+def _probe_new_token(mint: str, symbol: str):
+    """Poll DexScreener until the token is indexed, then queue it for scan_candidates.
+    New Pump.fun mints typically appear on DexScreener within 30-120 seconds.
+    We retry with backoff for up to 3 minutes so we don't silently drop them.
+    """
+    delays = [10, 20, 30, 40, 50, 30]   # 10+20+30+40+50+30 = 180s total
+    for wait in delays:
+        time.sleep(wait)
+        try:
+            data      = fetch_dexscreener_token(mint)
+            sol_pairs = [p for p in ((data or {}).get("pairs") or []) if p.get("chainId") == "solana"]
+            if not sol_pairs:
+                continue
+            # Only consider pairs that have actual liquidity data. A new token may be
+            # indexed (pair exists) but liq=0 if no trades have settled yet.
+            # _pair_to_candidate() hard-rejects liq<=0, so queuing it would be a
+            # silent drop that empties the probe queue with no scout entry produced.
+            liq_pairs = [p for p in sol_pairs if float((p.get("liquidity") or {}).get("usd") or 0) > 0]
+            if not liq_pairs:
+                continue   # retry — waiting for liquidity to settle
+            pair = max(liq_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+            with _ONCHAIN_LOCK:
+                pair["_onchain_ts"] = _ONCHAIN_CREATES.get(mint, {}).get("ts", time.time())
+                _PROBE_QUEUE.append(pair)
+            log(f"WS-create: ${symbol} indexed by DexScreener — queued for scan")
+            return
+        except Exception as e:
+            log(f"WS-create: probe error {symbol}: {e}")
+            return
+    log(f"WS-create: ${symbol} never indexed by DexScreener after 3 min — dropped")
+
+
+async def _ws_create_loop():
+    """Subscribe to Pump.fun program logs to detect new token creation in real time."""
+    import websockets
+    while True:
+        try:
+            async with websockets.connect(
+                SOL_WSS_URL, ping_interval=20, ping_timeout=30, max_size=10_000_000
+            ) as ws:
+                log("WS-create: connected, subscribing to Pump.fun log events")
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "processed"}],
+                }))
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    if msg.get("method") != "logsNotification":
+                        continue
+                    logs = msg.get("params", {}).get("result", {}).get("value", {}).get("logs", [])
+                    if not any("Instruction: Create" in l for l in logs):
+                        continue
+                    for line in logs:
+                        if line.startswith("Program data: "):
+                            ev = _parse_pf_create_event(line[14:])
+                            if ev:
+                                _on_pumpfun_create(ev)
+                                break
+        except Exception as e:
+            log(f"WS-create: error — {e}; reconnecting in 5s")
+            await asyncio.sleep(5)
+
+
+def _ws_create_thread_fn():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_ws_create_loop())
+
+
+def _start_ws_create_thread():
+    global _ws_create_thread
+    if _ws_create_thread and _ws_create_thread.is_alive():
+        return
+    _ws_create_thread = threading.Thread(target=_ws_create_thread_fn, name="ws-create", daemon=True)
+    _ws_create_thread.start()
+    log("WS: Solana WebSocket price thread started")
+
+
 CHAIN_IDS: Dict[str, str] = {
     "sol":  "solana",
     "eth":  "ethereum",
@@ -539,8 +929,28 @@ def _get(url: str, timeout: int = 8, retries: int = 2) -> Optional[Any]:
     return None
 
 
+_dex_token_cache: Dict[str, Any] = {}   # addr → {ts, data}
+_dex_list_cache:  Dict[str, Any] = {}   # url → {ts, data}
+_DEX_TOKEN_TTL = 60   # seconds to reuse per-token data (price/liq don't change in <1 min)
+_DEX_LIST_TTL  = 60   # seconds to reuse boost/profile lists
+
 def fetch_dexscreener_token(addr: str) -> Optional[Dict[str, Any]]:
-    return _get(DEXSCREENER_TOKEN + addr)
+    cached = _dex_token_cache.get(addr)
+    if cached and time.time() - cached["ts"] < _DEX_TOKEN_TTL:
+        return cached["data"]
+    data = _get(DEXSCREENER_TOKEN + addr)
+    _dex_token_cache[addr] = {"ts": time.time(), "data": data}
+    return data
+
+
+def _get_dex_list(url: str) -> Optional[Any]:
+    """Cached fetch for DexScreener list endpoints (boosts, profiles) — max 1 call/min."""
+    cached = _dex_list_cache.get(url)
+    if cached and time.time() - cached["ts"] < _DEX_LIST_TTL:
+        return cached["data"]
+    data = _get(url)
+    _dex_list_cache[url] = {"ts": time.time(), "data": data}
+    return data
 
 
 def fetch_btc_dominance() -> Optional[float]:
@@ -622,13 +1032,18 @@ def fetch_birdeye_sol_candidates() -> List[Dict[str, Any]]:
             vol24 = float(t.get("v24h") or 0)
             addr  = t.get("address", "")
             age   = float(t.get("lastTradeUnixTime") or 0)
-            age_min = (time.time() - age) / 60 if age else 9999
+            # lastTradeUnixTime is NOT creation time — an old coin with a recent trade
+            # would appear as age_min=0.5, bypassing m5/trend checks. Clamp to at least
+            # 30 min so m5 checks always apply. Proxy m5 from 24h direction.
+            age_min = max(30.0, (time.time() - age) / 60 if age else 9999)
+            positive24h = float(t.get("v24hChangePercent") or 0) > 0
             if sym and price > 0 and liq > 0:
                 hype = min(100, int(vol24 / max(liq, 1) * 20) + _degen_hype_bonus(sym))
                 out.append({
                     "symbol": sym, "chain": "sol", "price": price,
                     "liq": liq, "age_min": age_min, "hype": hype,
-                    "positive": float(t.get("v24hChangePercent") or 0) > 0,
+                    "positive": positive24h,
+                    "price_chg_m5": 1.0 if positive24h else -1.0,
                     "address": addr, "source": "birdeye",
                 })
         return out
@@ -721,9 +1136,12 @@ def _pair_to_candidate(pair: Dict[str, Any], our_chain: str) -> Optional[Dict[st
         buys       = float(tx_h1.get("buys") or 0)
         sells      = float(tx_h1.get("sells") or 0)
         buy_ratio  = (buys / (buys + sells)) if (buys + sells) > 0 else None
-        price_chg  = float((pair.get("priceChange") or {}).get("h24") or 0)
+        price_chg    = float((pair.get("priceChange") or {}).get("h24") or 0)
+        price_chg_m5 = float((pair.get("priceChange") or {}).get("m5") or 0)
+        price_chg_h1 = float((pair.get("priceChange") or {}).get("h1") or 0)
         return {"symbol": symbol, "chain": our_chain, "price": price_usd,
                 "liq": liq, "age_min": age_min, "hype": hype, "positive": price_chg > 0,
+                "price_chg_m5": price_chg_m5, "price_chg_h1": price_chg_h1,
                 "vol_h1": vol_h1, "buy_ratio": buy_ratio,
                 "address": (pair.get("baseToken") or {}).get("address", "")}
     except Exception:
@@ -735,30 +1153,42 @@ def fetch_new_candidates() -> List[Dict[str, Any]]:
     seen: set = set()
     out: List[Dict[str, Any]] = []
 
-    def _ingest(token_address: str, dex_chain_id: str):
+    # Collect addresses per chain from boosts + profiles lists (both cached 60s).
+    # Then batch-fetch in groups of 30 — 1-2 API calls instead of 25+.
+    addrs_by_chain: Dict[str, List[str]] = {}
+    for item in (_get_dex_list(DEXSCREENER_BOOSTS) or []):
+        cid = item.get("chainId", "")
+        if cid in active_ids:
+            addrs_by_chain.setdefault(cid, []).append(item.get("tokenAddress", ""))
+    for item in (_get_dex_list(DEXSCREENER_PROFILES) or []):
+        cid = item.get("chainId", "")
+        if cid in active_ids:
+            addr = item.get("tokenAddress", "")
+            if addr not in addrs_by_chain.get(cid, []):
+                addrs_by_chain.setdefault(cid, []).append(addr)
+
+    for dex_chain_id, addrs in addrs_by_chain.items():
         our_chain = next((k for k, v in CHAIN_IDS.items() if v == dex_chain_id), None)
         if not our_chain:
-            return
-        data = fetch_dexscreener_token(token_address)
-        if not data:
-            return
-        for pair in (data.get("pairs") or []):
-            c = _pair_to_candidate(pair, our_chain)
-            if c:
-                key = (c["symbol"], c["chain"])
-                if key not in seen:
-                    seen.add(key)
-                    out.append(c)
-
-    for item in (_get(DEXSCREENER_BOOSTS) or []):
-        cid = item.get("chainId", "")
-        if cid in active_ids:
-            _ingest(item.get("tokenAddress", ""), cid)
-
-    for item in (_get(DEXSCREENER_PROFILES) or []):
-        cid = item.get("chainId", "")
-        if cid in active_ids:
-            _ingest(item.get("tokenAddress", ""), cid)
+            continue
+        # DexScreener batch endpoint supports up to 30 addresses per call.
+        for i in range(0, len(addrs), 30):
+            batch = addrs[i:i + 30]
+            batch_key = dex_chain_id + ":" + ",".join(sorted(batch))
+            cached = _dex_token_cache.get(batch_key)
+            if cached and time.time() - cached["ts"] < _DEX_TOKEN_TTL:
+                pairs_list = cached["data"]
+            else:
+                url = f"{DEXSCREENER_BASE}/tokens/v1/{dex_chain_id}/{','.join(batch)}"
+                pairs_list = _get(url) or []
+                _dex_token_cache[batch_key] = {"ts": time.time(), "data": pairs_list}
+            for pair in (pairs_list or []):
+                c = _pair_to_candidate(pair, our_chain)
+                if c:
+                    key = (c["symbol"], c["chain"])
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(c)
 
     # Birdeye — trending Solana tokens (only if API key set)
     for c in fetch_birdeye_sol_candidates():
@@ -767,78 +1197,149 @@ def fetch_new_candidates() -> List[Dict[str, Any]]:
             seen.add(key)
             out.append(c)
 
-    # CoinGecko — trending tokens across chains
-    for c in fetch_coingecko_trending():
-        if c.get("address"):
-            our_chain = c["chain"]
-            if our_chain in CONFIG["chains"]:
-                _ingest(c["address"], CHAIN_IDS.get(our_chain, our_chain))
-
     return out
 
-def _px_dict(price: float, liq: float = 100000.0, vol_h1: float = 0.0, change_m5: float = 0.0) -> Dict:
+def _px_dict(price: float, liq: float = 0.0, vol_h1: float = 0.0, change_m5: float = 0.0) -> Dict:
     return {"price": price, "liq": liq, "vol_h1": vol_h1, "change_m5": change_m5}
 
 
 def _parse_dex_pair(pair: Dict) -> Optional[Dict]:
     price     = float(pair.get("priceUsd") or 0)
-    liq       = float((pair.get("liquidity") or {}).get("usd") or 100000.0)
+    liq       = float((pair.get("liquidity") or {}).get("usd") or 0)
     vol_h1    = float((pair.get("volume")      or {}).get("h1") or 0)
     change_m5 = float((pair.get("priceChange") or {}).get("m5") or 0)
     return _px_dict(price, liq, vol_h1, change_m5) if price > 0 else None
 
 
+# Cache base prices from DexScreener/Birdeye — these sources only refresh every 5-30s
+# anyway, so re-fetching every 0.1s poll cycle burns 600+ req/min for zero benefit.
+# WS overlay (below) still runs every call so exits stay sub-second.
+_pos_price_cache: Dict[str, Any] = {"ts": 0.0, "data": {}, "open_pos_key": ""}
+_POS_PRICE_TTL = 2.0   # seconds between DexScreener/Birdeye refreshes
+
+
 def fetch_positions_prices() -> Dict[str, Dict]:
-    """Batch-fetch price, liq, vol_h1, change_m5 for all open positions."""
+    """Batch-fetch price, liq, vol_h1, change_m5 for all open positions.
+
+    Includes wallet-only open positions so wallet SL/TP keeps working even
+    after the main position for that symbol has already closed (and _ws_remove
+    was called). Without this, wallet positions lose their price feed and the
+    SL stub fallback (avg * 1.02) keeps them stuck open forever.
+    """
     open_pos = {s: p for s, p in STATE["positions"].items() if p.get("units", 0) > 0}
+    # Merge in any wallet positions for symbols not already in main open_pos
+    for w in STATE.get("wallets", {}).values():
+        for s, p in w.get("positions", {}).items():
+            if p.get("units", 0) > 0 and s not in open_pos and p.get("address"):
+                open_pos[s] = p
     if not open_pos:
         return {}
-    result:   Dict[str, Dict] = {}
-    addr_map: Dict[str, str]  = {p["address"].lower(): s
-                                  for s, p in open_pos.items() if p.get("address")}
-    if addr_map:
-        data    = _get(DEXSCREENER_TOKEN + ",".join(addr_map))
-        pairs   = (data or {}).get("pairs") or []
-        by_addr: Dict[str, Dict] = {}
-        for pair in pairs:
-            addr = ((pair.get("baseToken") or {}).get("address") or "").lower()
-            if addr and addr not in by_addr:
-                by_addr[addr] = pair
-        for addr, sym in addr_map.items():
-            px = _parse_dex_pair(by_addr[addr]) if addr in by_addr else None
-            if px:
-                result[sym] = px
-    for sym, p in open_pos.items():
-        if sym not in result:
-            addr = p.get("address", "")
-            if p.get("chain") == "sol" and addr:
-                bd = fetch_birdeye_price(addr)
-                if bd and float(bd.get("value") or 0) > 0:
-                    # Use entry_liq as fallback — 100000 default would poison liq_prev
-                    # and trigger a false rug alarm on the next DexScreener tick.
-                    bd_liq = float(bd.get("liquidity") or 0) or p.get("entry_liq", 0) or 0
-                    result[sym] = _px_dict(float(bd["value"]), bd_liq)
-                    continue
-            result[sym] = _px_dict(p.get("avg", 1.0) * 1.02)
+
+    now = time.time()
+    # Cache key captures which positions are open so we re-fetch when positions change.
+    open_key = ",".join(sorted(open_pos.keys()))
+    cache_fresh = (
+        now - _pos_price_cache["ts"] < _POS_PRICE_TTL
+        and _pos_price_cache["open_pos_key"] == open_key
+    )
+    if cache_fresh:
+        result = dict(_pos_price_cache["data"])
+    else:
+        result:   Dict[str, Dict] = {}
+        addr_map: Dict[str, str]  = {p["address"].lower(): s
+                                      for s, p in open_pos.items() if p.get("address")}
+        if addr_map:
+            data    = _get(DEXSCREENER_TOKEN + ",".join(addr_map))
+            pairs   = (data or {}).get("pairs") or []
+            by_addr: Dict[str, Dict] = {}
+            for pair in pairs:
+                addr = ((pair.get("baseToken") or {}).get("address") or "").lower()
+                if addr and addr not in by_addr:
+                    by_addr[addr] = pair
+            for addr, sym in addr_map.items():
+                px = _parse_dex_pair(by_addr[addr]) if addr in by_addr else None
+                if px:
+                    result[sym] = px
+        for sym, p in open_pos.items():
+            if sym not in result:
+                addr = p.get("address", "")
+                if p.get("chain") == "sol" and addr:
+                    bd = fetch_birdeye_price(addr)
+                    if bd and float(bd.get("value") or 0) > 0:
+                        # Use entry_liq as fallback — 100000 default would poison liq_prev
+                        # and trigger a false rug alarm on the next DexScreener tick.
+                        bd_liq = float(bd.get("liquidity") or 0) or p.get("entry_liq", 0) or 0
+                        result[sym] = _px_dict(float(bd["value"]), bd_liq)
+                        continue
+                result[sym] = _px_dict(p.get("avg", 1.0) * 1.02)
+        _pos_price_cache["ts"] = now
+        _pos_price_cache["data"] = dict(result)
+        _pos_price_cache["open_pos_key"] = open_key
+
+    # Overlay WebSocket prices where fresher than 3s — these come directly from the
+    # Pump.fun bonding curve on-chain and update in ~1-2s vs DexScreener's 5-30s lag.
+    with _ws_lock:
+        ws_snap = dict(WS_PRICES)
+    for sym, ws in ws_snap.items():
+        if sym in result and now - ws.get("ts", 0) < 3:
+            existing = result[sym]
+            result[sym] = _px_dict(
+                ws["price"],
+                ws.get("liq") or existing.get("liq", 0),
+                existing.get("vol_h1", 0),
+                existing.get("change_m5", 0),
+            )
+
     return result
+
+# ---------------------------------------------------------------------------
+# Per-mode effective moonshot settings
+# ---------------------------------------------------------------------------
+_MS_OVERRIDE_KEYS = (
+    "m5_min", "buy_ratio_min", "velocity_exit_pct", "velocity_2m_pct",
+    "rug_liq_drop", "loss_cooldown_min", "trailing_stop_pct",
+    "liq_drain_ticks", "liq_drain_pct",
+)
+
+def _effective_ms(mode_name: Optional[str] = None) -> Dict:
+    """Return CONFIG['moonshot'] merged with any per-mode overrides for mode_name.
+
+    Each built-in mode can set its own entry filters (m5_min, buy_ratio_min) and
+    exit thresholds (velocity_exit_pct, rug_liq_drop, etc.) independently.
+    Settings not set in the mode fall back to the global moonshot config.
+    """
+    ms = CONFIG["moonshot"]
+    m  = mode_name or CONFIG.get("mode", "default")
+    overrides = CONFIG["modes"].get(m, {})
+    if not overrides:
+        return ms
+    result = dict(ms)
+    for key in _MS_OVERRIDE_KEYS:
+        if key in overrides:
+            result[key] = overrides[key]
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 class Score:
     def __init__(self, hype: int, liq: float, age_min: float, positive: bool,
-                 buy_ratio: Optional[float] = None, price: float = 0.0):
-        self.hype      = hype
-        self.liq       = liq
-        self.age_min   = age_min
-        self.positive  = positive
-        self.buy_ratio = buy_ratio   # h1 buys/(buys+sells); None if unknown
-        self.price     = price
+                 buy_ratio: Optional[float] = None, price: float = 0.0,
+                 price_chg_m5: float = 0.0, price_chg_h1: float = 0.0):
+        self.hype          = hype
+        self.liq           = liq
+        self.age_min       = age_min
+        self.positive      = positive
+        self.buy_ratio     = buy_ratio   # h1 buys/(buys+sells); None if unknown
+        self.price         = price
+        self.price_chg_m5  = price_chg_m5  # DexScreener m5 price change %
+        self.price_chg_h1  = price_chg_h1  # DexScreener h1 price change %
 
 
 def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     """Return a human-readable reason the candidate fails the filters, or None if it passes."""
-    ms = CONFIG["moonshot"]
+    ms = _effective_ms(CONFIG.get("mode"))
     spray = STATE.get("spray_until")
     spraying = spray and now_utc().date().isoformat() <= spray
     # Use the ACTIVE MODE's liquidity floor so modes actually change aggressiveness
@@ -849,8 +1350,13 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     # Data: SOL 47% WR +$206 vs EVM chains -$138. Raise the bar, not the ban.
     _evm_mult = {"eth": 5.0, "base": 3.0, "bsc": 3.0}
     liq_min  = mode_liq * (0.7 if spraying else 1.0) * _evm_mult.get(chain, 1.0)
+    # Max-hype override (SOL only): if the community is at 100 hype, the early signal
+    # outweighs thin liquidity — lower the floor to 5k. $24 position on a 5k pool
+    # is 0.5% price impact, acceptable. This is what catches the early +1000% movers.
+    if chain == "sol" and sc.hype >= 100:
+        liq_min = min(liq_min, 5000)
     hype_min = max(50, ms["hype_min"] - (20 if spraying else 0))
-    if sc.liq < liq_min:
+    if sc.liq < liq_min * 0.90:
         return f"liquidity ${sc.liq:,.0f} below min ${liq_min:,.0f}"
     if sc.liq > ms["liq_max"]:
         return f"liquidity ${sc.liq:,.0f} above max ${ms['liq_max']:,.0f}"
@@ -858,8 +1364,18 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
         "max_age_min", CONFIG["scan"]["new_max_age_min"])
     if sc.age_min > max_age:
         return f"age {sc.age_min:.0f}m over {max_age:.0f}m limit"
-    if not sc.positive:
+    # Skip the 24h trend check for tokens under 5 minutes old — they have no 24h history
+    # so price_chg=0, which _pair_to_candidate() treats as non-positive. This false-rejects
+    # brand new mints that haven't had time to establish a directional trend.
+    if not sc.positive and sc.age_min >= 5:
         return "price trend is negative (24h)"
+    # Require active upward momentum in the last 5 minutes.
+    # h24 is useless for new tokens (compares to launch price, not the recent peak) — a token
+    # can show +300% h24 while actively crashing right now. Only enter when the recent candle
+    # is positive. Exempt tokens under 5 min: DexScreener has no 5m history yet for new mints.
+    m5_min = ms.get("m5_min", 0.5)
+    if sc.age_min >= 5 and sc.price_chg_m5 < m5_min:
+        return f"not trending up — m5 {sc.price_chg_m5:.1f}%"
     if sc.hype < hype_min:
         return f"hype {sc.hype} below min {hype_min}"
     # Buyer/seller pressure — skip tokens being actively dumped (more sells than buys).
@@ -875,13 +1391,21 @@ def passes_moonshot_filters(sc: Score, chain: str = "sol") -> bool:
 
 def _reject_spike_threshold(reason: str) -> float:
     """Return the price-spike multiplier required before re-evaluating a rejected token.
-    Higher = harder to get back on the radar. Safety flags need a bigger move than liq issues.
-    'hella spike' for safety = 3x. Liq-too-low just needs to actually grow (~50%).
-    Anti-churn / post-exit are handled by their own separate gates, not the reject cache.
+    Higher = harder to get back on the radar.
+    The TTL tiers (see reject_cache check):
+      threshold >= 3.0 → 4h  (hard scam: honeypot, freeze, mint authority)
+      threshold >= 2.0 → 2h  (soft safety: LP unlocked, whale concentration — common on
+                               legitimate pump.fun tokens, ~50% win rate when traded)
+      else             → 30m (liq/hype/generic)
     """
     r = reason.lower()
-    if "safety" in r or "honeypot" in r or "rug" in r or "flagged" in r:
-        return 3.0   # needs to 3x price before we look again — something dramatic changed
+    # Hard on-chain rug signals — needs 3x or 4h wait
+    if "honeypot" in r or "freeze" in r or "mint auth" in r:
+        return 3.0
+    # Soft rugcheck flags (LP unlocked, whale/holder concentration) — common on legit meme
+    # coins, ~50% win rate historically. Re-evaluate after 2h or a 2x move.
+    if "safety" in r or "rug" in r or "flagged" in r:
+        return 2.0
     if "liquidity" in r:
         return 1.5   # liq needs to grow substantially (price proxy) before re-checking
     if "selling pressure" in r or "buy_ratio" in r or "buy ratio" in r:
@@ -891,9 +1415,12 @@ def _reject_spike_threshold(reason: str) -> float:
     return 1.3       # generic gate: need a ~30% spike
 
 
+_scan_log_write_count = 0
+
 def _scout(symbol: str, chain: str, decision: str, reason: str,
            sc: Optional[Score] = None, address: str = ""):
     """Record why the scanner did (or didn't) act on a candidate, for the dashboard Scout log."""
+    global _scan_log_write_count
     log_list: List[Dict[str, Any]] = STATE.setdefault("scout_log", [])
     entry: Dict[str, Any] = {
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
@@ -904,19 +1431,75 @@ def _scout(symbol: str, chain: str, decision: str, reason: str,
     log_list.append(entry)
     if len(log_list) > 300:                # keep the most recent 300 evaluations
         del log_list[: len(log_list) - 300]
-    # Cache this rejection so the scanner can skip the token next scan unless price spikes.
-    # Only cache actual rejections, not entries/suggestions.
-    if decision == "rejected" and sc is not None and sc.price > 0:
-        threshold = _reject_spike_threshold(reason)
-        if threshold > 1.0:   # age-gate tokens re-evaluate every scan naturally
+
+    # Persist to disk: full record including price & buy_ratio for outcome analysis
+    disk_entry: Dict[str, Any] = {
+        "ts":   now_utc().isoformat(),
+        "sym":  symbol,
+        "ch":   chain,
+        "addr": address or "",
+        "dec":  decision,
+        "rsn":  reason[:120],
+    }
+    if sc is not None:
+        disk_entry.update({
+            "px":   sc.price,
+            "liq":  round(sc.liq, 0),
+            "hype": sc.hype,
+            "age":  round(sc.age_min, 1),
+            "br":   round(sc.buy_ratio, 3) if sc.buy_ratio is not None else None,
+            "m5":   round(sc.price_chg_m5, 2),
+        })
+    try:
+        with open(SCAN_LOG_FILE, "a") as _f:
+            _f.write(json.dumps(disk_entry, separators=(",", ":")) + "\n")
+        _scan_log_write_count += 1
+        # Rotate file if it's grown too large (keep newest half)
+        if _scan_log_write_count % 2000 == 0:
+            try:
+                with open(SCAN_LOG_FILE) as _rf:
+                    lines = _rf.readlines()
+                if len(lines) > _SCAN_LOG_MAX_LINES:
+                    with open(SCAN_LOG_FILE, "w") as _wf:
+                        _wf.writelines(lines[len(lines)//2:])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Cache this rejection (or size-blocked suggestion) so the scanner skips the token
+    # next scan. Without this, a token that passes filters but is too thin to size
+    # gets SUGGEST'd every 7 seconds and floods the 300-entry scout log.
+    if decision in ("rejected", "suggested") and sc is not None and sc.price > 0:
+        if decision == "suggested":
+            # Suggested = passed all filters but couldn't size (caps/budget).
+            # Block for 5 min unless a genuine 30% pump warrants a fresh look.
+            # threshold=1.3 + short TTL: stays silent at flat price, re-evals on spikes.
             STATE.setdefault("reject_cache", {})[symbol] = {
                 "ts":        time.time(),
                 "reason":    reason,
-                "threshold": threshold,
+                "threshold": 1.3,
+                "ttl":       300,   # re-evaluate after 5 minutes
                 "price":     sc.price,
-                "min_liq":   CONFIG["modes"].get(CONFIG["mode"], {}).get("liq_min",
-                             CONFIG["moonshot"].get("liq_min", 10000)),
+                "min_liq":   0,
             }
+        else:
+            threshold = _reject_spike_threshold(reason)
+            if threshold > 1.0:   # age-gate tokens re-evaluate every scan naturally
+                entry = {
+                    "ts":        time.time(),
+                    "reason":    reason,
+                    "threshold": threshold,
+                    "price":     sc.price,
+                    "min_liq":   CONFIG["modes"].get(CONFIG["mode"], {}).get("liq_min",
+                                 CONFIG["moonshot"].get("liq_min", 10000)),
+                }
+                if threshold < 2.0:
+                    # Non-safety reject: use shorter TTL for brand-new tokens.
+                    # New mints (< 30 min) can pump fast — re-check every 5 min.
+                    # Older tokens change more slowly — 10 min is enough.
+                    entry["ttl"] = 300 if sc.age_min < 30 else 600
+                STATE.setdefault("reject_cache", {})[symbol] = entry
 
 # ---------------------------------------------------------------------------
 # Objectives × strategy
@@ -976,12 +1559,45 @@ def drawdown_brake_active() -> bool:
 
 
 def deployable_now() -> float:
+    # Hard floor: if the vault has fallen to ≤25% of what it started at, stop trading
+    # entirely until the user tops it up. This is a separate concern from reserve_pct
+    # (which is a per-trade holdback); this is a total account stop-loss.
+    floor_pct   = CONFIG.get("absolute_floor_pct", 0.25)
+    vault_start = STATE.get("vault_start", STATE["vault_usd"])
+    if STATE["vault_usd"] <= vault_start * floor_pct:
+        return 0.0
     # Hold back MORE capital while the drawdown brake is on (bad streak) — protect the
     # bankroll when the edge has gone cold, lean in again when it recovers.
     reserve = CONFIG["reserve_pct"]
     if drawdown_brake_active():
         reserve = max(reserve, CONFIG.get("drawdown_brake", {}).get("reserve_pct", 0.40))
     return max(0.0, STATE["vault_usd"] * (1 - reserve))
+
+
+def _mode_min_ticket(mode_name: Optional[str] = None) -> float:
+    """Per-mode min ticket override; falls back to global moonshot config."""
+    m = mode_name or CONFIG["mode"]
+    return CONFIG["modes"].get(m, {}).get("min_ticket_usd") or CONFIG["moonshot"].get("min_ticket_usd", 15.0)
+
+
+# Hardcoded base — never mutated. _apply_custom_mode_globals can overwrite
+# CONFIG["moonshot"]["dollar_stop_usd"] (e.g. testing 3 sets it to $1), which
+# would produce absurd $2 position caps on ALL modes. We always fall back here.
+_BASE_DOLLAR_STOP = 12.0
+
+
+def _mode_dollar_stop(mode_name: Optional[str] = None) -> float:
+    """Per-mode dollar stop for exit checks and position sizing.
+
+    Priority: explicit mode field (e.g. micro: 1.50) → base default ($12).
+    Custom modes (backtest presets) skip the mutated global — their dollar_stop
+    is a backtest parameter, not a real per-trade limit.
+    """
+    m = mode_name or CONFIG["mode"]
+    explicit = CONFIG["modes"].get(m, {}).get("dollar_stop_usd")
+    if explicit:
+        return float(explicit)
+    return _BASE_DOLLAR_STOP
 
 
 def per_chain_room(chain: str) -> float:
@@ -1027,7 +1643,16 @@ def size_ticket_usd(chain: str, hype: Optional[int] = None,
         base = min(base, avail_cash * CONFIG["moonshot"].get("seed_pct", 0.40))
     base    = min(base, per_chain_room(chain), per_token_cap_room(symbol))
     day_cap = CONFIG["daily_deploy_cap_pct"] * deployable_now()
-    return max(0.0, min(base, day_cap - STATE["open_today_usd"]))
+    base    = max(0.0, min(base, day_cap - STATE["open_today_usd"]))
+    # For custom modes, the user sets size_mult and dollar_stop independently.
+    # dollar_stop is an EXIT threshold, not a position-size cap, so don't apply
+    # the pos_mult guard — it would silently cap bets to $2 with a $1 stop.
+    mode_cfg = CONFIG["modes"].get(CONFIG["mode"], {})
+    if not mode_cfg.get("_custom"):
+        d_stop = _mode_dollar_stop(CONFIG["mode"])
+        mult   = CONFIG["moonshot"].get("dollar_stop_pos_mult", 2.0)
+        base   = min(base, d_stop * mult)
+    return base
 
 # ---------------------------------------------------------------------------
 # Execution adapters
@@ -1128,7 +1753,9 @@ def refresh_gas_estimates():
         cache["ts"] = time.time()
 
 
-def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float, address: str = "") -> Dict[str, Any]:
+def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float, address: str = "",
+               entry_m5: Optional[float] = None, entry_br: Optional[float] = None,
+               entry_hype: Optional[float] = None) -> Dict[str, Any]:
     if symbol not in STATE["positions"] and not _stealth_ok():
         log(f"BURST GUARD: skipping new open for {symbol} (too many opens in 30s)")
         send_alert(
@@ -1186,9 +1813,17 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         "side": "buy", "usd": usd, "price": filled_price, "units": units, "gas": gas,
         "address": pos.get("address", ""), "pnl": None,
         "mode": pos.get("entry_mode", CONFIG.get("mode")),
+        "entry_m5":    entry_m5,
+        "entry_br":    entry_br,
+        "entry_hype":  entry_hype,
+        "entry_liq":   liq_usd,
     }
     STATE.setdefault("trade_log", []).append(_trade_entry)
     _append_trade(_trade_entry)
+    if is_new_pos:
+        _arena_enter(symbol, chain, filled_price)
+        if chain == "sol" and address:
+            _ws_add(symbol, address)
     return {"price": filled_price, "units": units}
 
 
@@ -1241,7 +1876,8 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
     order_val   = units * price
     exit_impact = min(0.30, order_val / max(liq_usd, 1.0) / 4.0)
     proceeds = units * price * (1 - 0.002) * (1 - exit_impact) - gas   # fee + impact out of proceeds
-    cost     = units * pos["avg"]
+    avg_entry = pos["avg"]                                  # capture before reset below
+    cost     = units * avg_entry
     pnl      = proceeds - cost - fee_share                  # entry gas folded into PnL
     pos["units"]       -= units
     pos["usd"]         -= cost
@@ -1270,6 +1906,7 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
         STATE["income_usd"] = STATE.get("income_usd", 0.0) + skim
         proceeds -= skim
     STATE["vault_usd"] += proceeds
+    _maybe_take_home(symbol, pnl)
     _wallet_goal_check()
     STATE["pnl_hist"].append(pnl)
     _trade_entry = {
@@ -1278,7 +1915,7 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
         "address": pos.get("address", ""), "pnl": pnl,
         "mode": pos.get("entry_mode", CONFIG.get("mode")),
         "exit_reason": exit_reason,
-        "entry_price": pos.get("avg"),
+        "entry_price": avg_entry,
         "min_price":   pos.get("trough_price"),
     }
     STATE.setdefault("trade_log", []).append(_trade_entry)
@@ -1288,15 +1925,725 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
     # the bot at 12 phantom "positions", blocking every new entry).
     if pos.get("units", 0) <= 0:
         STATE["positions"].pop(symbol, None)
+        # Recompute deployed capital so the cash-buffer check isn't stale
+        # until the next buy. shadow_buy() also recomputes, but there can be
+        # minutes between the last close and the next entry.
+        STATE["cur_deployed_usd"] = sum(
+            q.get("usd", 0.0) for q in STATE["positions"].values() if q.get("units", 0) > 0
+        )
         # Record the full close so the entry loop can enforce a cool-down.
         # Pattern blocked: re-entering a declining token within minutes of a stop exit,
         # or chasing back in at the same high price after a profitable exit.
         STATE.setdefault("recently_exited", {})[symbol] = {
-            "ts":    time.time(),
-            "price": price,
-            "pnl":   pnl,
+            "ts":          time.time(),
+            "price":       price,
+            "pnl":         pnl,
+            "exit_reason": exit_reason,
         }
+        if pnl < 0:
+            # Accumulate per-token daily losses so repeated small losses escalate cooldowns.
+            t_pnl = STATE.setdefault("token_pnl_today", {})
+            t_pnl[symbol] = t_pnl.get(symbol, 0.0) + pnl
+        if pnl <= -30:
+            send_alert(
+                f"🚨 HARD STOP ${symbol} — lost ${abs(pnl):.0f} on this trade. "
+                f"Blacklisting for 4 hours to prevent re-entry."
+            )
+            STATE.setdefault("reject_cache", {})[symbol] = {
+                "ts":        time.time(),
+                "reason":    f"hard-stop: ${pnl:.0f} loss — blacklisted 4h",
+                "threshold": 99.0,   # effectively never clears early on price alone
+                "ttl":       4 * 3600,
+                "price":     price,
+                "min_liq":   0,
+            }
+        _arena_close(symbol, price, exit_reason)
+        if pos.get("chain") == "sol":
+            # Only drop the WS subscription when no wallet still holds the symbol.
+            # If we unsubscribe while a wallet position remains open, the wallet
+            # loses its price feed and its SL/TP stub falls back to avg*1.02.
+            wallet_still_open = any(
+                w.get("positions", {}).get(symbol, {}).get("units", 0) > 0
+                for w in STATE.get("wallets", {}).values()
+            )
+            if not wallet_still_open:
+                _ws_remove(symbol)
     return {"sold": proceeds, "pnl": pnl}
+
+
+# ---------------------------------------------------------------------------
+# Mode Arena — parallel shadow-trading across all modes simultaneously
+# ---------------------------------------------------------------------------
+
+def _arena_mode_params(mode_name: str) -> Optional[Dict]:
+    """Return {sl, dollar_stop, size_mult, start} for any built-in or custom mode."""
+    custom = STATE.get("custom_modes", {}).get(mode_name)
+    if custom:
+        return {
+            "sl":           custom.get("sl_pct", 12) / 100.0,
+            "dollar_stop":  float(custom.get("dollar_stop", 5)),
+            "size_mult":    float(custom.get("size_mult", 1.0)),
+            "start":        100.0,
+        }
+    builtin = CONFIG["modes"].get(mode_name)
+    if builtin:
+        return {
+            "sl":           builtin.get("sl", 0.12),
+            "dollar_stop":  float(builtin.get("dollar_stop_usd", _BASE_DOLLAR_STOP)),
+            "size_mult":    float(builtin.get("size_mult", 1.0)),
+            "start":        100.0,
+        }
+    return None
+
+
+def _arena_ensure(mode_name: str, params: Dict) -> Dict:
+    """Create arena state for a mode if it doesn't exist yet."""
+    arenas = STATE.setdefault("arenas", {})
+    if mode_name not in arenas:
+        arenas[mode_name] = {
+            "vault":       params["start"],
+            "start_vault": params["start"],
+            "positions":   {},
+            "trades":      [],
+            "started":     now_utc().isoformat(),
+        }
+    return arenas[mode_name]
+
+
+def _arena_enter(symbol: str, chain: str, price: float):
+    """Paper-buy a new entry across every known mode in parallel."""
+    all_modes: Dict[str, str] = {}
+    for k in CONFIG["modes"]:
+        all_modes[k] = k
+    for k in STATE.get("custom_modes", {}):
+        all_modes[k] = k
+
+    for mode_name in all_modes:
+        params = _arena_mode_params(mode_name)
+        if not params:
+            continue
+        arena = _arena_ensure(mode_name, params)
+        if symbol in arena["positions"]:
+            continue
+        bet = CONFIG["base_size_usd"] * params["size_mult"]
+        bet = min(bet, arena["vault"] * 0.20)
+        if bet < 3:
+            continue
+        units     = bet / price if price > 0 else 0
+        buy_gas   = _gas_usd(chain)
+        arena["vault"] -= bet + buy_gas
+        arena["positions"][symbol] = {
+            "entry_price": price,
+            "units":       units,
+            "cost":        bet + buy_gas,
+            "peak_price":  price,
+            "chain":       chain,
+            "entry_ts":    now_utc().isoformat(),
+        }
+
+
+def _arena_close(symbol: str, price: float, exit_reason: str):
+    """When the main bot fully exits a symbol, push the final price into each arena's
+    position so _manage_arenas can close it on the next tick using each mode's own params.
+    We do NOT force-close here — that made every mode exit at the exact same moment/price,
+    making their results identical and defeating the purpose of the comparison."""
+    for mode_name, arena in STATE.get("arenas", {}).items():
+        pos = arena.get("positions", {}).get(symbol)
+        if pos:
+            # Update peak so trail logic has the latest reference, then let
+            # _manage_arenas close it independently on the next manage_positions tick.
+            if price > pos.get("peak_price", 0):
+                pos["peak_price"] = price
+            # Store the main bot's exit price as a sentinel so we know the token
+            # is done trading and won't be re-entered by _arena_enter.
+            pos["main_bot_exited"] = True
+            pos["main_exit_price"] = price
+
+
+# ---------------------------------------------------------------------------
+# Multi-wallet engine — one scanner, N independent vaults
+# ---------------------------------------------------------------------------
+# Each wallet lives in STATE["wallets"][wid] with its own vault_usd, positions,
+# trade_log, and optional mode override. The main scanner runs once; after each
+# successful entry it "offers" the same candidate to every active wallet so they
+# can independently decide whether to enter based on their own guards and sizing.
+
+_wallet_keypairs: Dict[str, Any] = {}  # wid -> solders.keypair.Keypair (live wallets only)
+
+
+def _load_wallet_keypairs():
+    """Scan env for W_<wid>_PK vars and load keypairs for any live-eligible wallets."""
+    try:
+        import base58                           # type: ignore
+        from solders.keypair import Keypair     # type: ignore
+    except ImportError:
+        return
+    for wid in list(STATE.get("wallets", {})):
+        raw = os.getenv(f"W_{wid}_PK", "").strip()
+        if raw and wid not in _wallet_keypairs:
+            try:
+                _wallet_keypairs[wid] = Keypair.from_bytes(base58.b58decode(raw))
+                log(f"[W:{wid}] keypair loaded ({str(_wallet_keypairs[wid].pubkey())[:8]}…)")
+            except Exception as e:
+                log(f"[W:{wid}] keypair load failed — {e}")
+
+
+def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict:
+    """Submit a real Jupiter buy for a live wallet. Returns {price, units, sig} or {error}."""
+    kp = _wallet_keypairs.get(wid)
+    if not kp:
+        return {"error": "no_keypair — set W_<wid>_PK in .env"}
+    try:
+        mode_name  = w.get("mode") or CONFIG["mode"]
+        slip_bps   = CONFIG["modes"].get(mode_name, {}).get("slip_bps", 150)
+        usdc_units = int(usd * 10 ** USDC_DECIMALS)
+        quote      = _jupiter_get_quote(USDC_MINT_SOL, addr, usdc_units, slip_bps)
+        if not quote or not quote.get("outAmount"):
+            return {"error": "no_jupiter_route"}
+        tx_b64 = _jupiter_get_swap_tx(quote, str(kp.pubkey()))
+        if not tx_b64:
+            return {"error": "jupiter_swap_build_failed"}
+        sig       = _sol_submit_tx(tx_b64, kp)
+        tok_dec   = _sol_token_decimals(addr)
+        out_units = int(quote["outAmount"]) / 10 ** tok_dec
+        filled_px = usd / out_units if out_units else 0
+        return {"price": filled_px, "units": out_units, "sig": sig}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float) -> Dict:
+    """Submit a real Jupiter sell for a live wallet. Returns {proceeds, units_sold, sig} or {error}."""
+    kp = _wallet_keypairs.get(wid)
+    if not kp:
+        return {"error": "no_keypair — set W_<wid>_PK in .env"}
+    try:
+        addr     = pos.get("address", "")
+        if not addr:
+            return {"error": "no_token_address"}
+        mode_name  = w.get("mode") or CONFIG["mode"]
+        slip_bps   = CONFIG["modes"].get(mode_name, {}).get("slip_bps", 150)
+        tok_dec    = _sol_token_decimals(addr)
+        pos_units  = pos.get("units", 0)
+        frac       = min(1.0, usd / max(pos_units * price, 1e-9))
+        sell_units = int(pos_units * frac * 10 ** tok_dec)
+        if sell_units <= 0:
+            return {"error": "zero_units"}
+        quote = _jupiter_get_quote(addr, USDC_MINT_SOL, sell_units, slip_bps)
+        if not quote or not quote.get("outAmount"):
+            return {"error": "no_jupiter_route"}
+        tx_b64    = _jupiter_get_swap_tx(quote, str(kp.pubkey()))
+        if not tx_b64:
+            return {"error": "jupiter_swap_build_failed"}
+        sig       = _sol_submit_tx(tx_b64, kp)
+        proceeds  = int(quote["outAmount"]) / 10 ** USDC_DECIMALS
+        return {"proceeds": proceeds, "units_sold": pos_units * frac, "sig": sig}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _wlt_init(label: str, starting_usd: float, mode: Optional[str] = None,
+               address: str = "") -> Dict:
+    return {
+        "label":          label,
+        "address":        address,
+        "starting_usd":   starting_usd,
+        "vault_usd":      starting_usd,
+        "mode":           mode,        # None → inherit global CONFIG["mode"]
+        "active":         True,
+        "live":           False,       # True → submit real Jupiter swaps using W_<wid>_PK
+        "sweep_address":  "",          # cold wallet address for profit sweep (overrides global)
+        "ticket_cap_usd": 0.0,         # if > 0, caps ticket size (e.g. 5.0 to run testing 3 at $5/trade)
+        # Per-wallet safety overrides — None means use the global/mode default
+        "safety": {
+            "dollar_stop_usd":      None,  # None → _mode_dollar_stop() ($12 default)
+            "dollar_stop_pos_mult": None,  # None → global (4.0); raise for bigger bets, lower for tighter risk
+            "velocity_m5_pct":      None,  # None → global (0.08 = 8% drop triggers velocity exit)
+            "rug_liq_drop_pct":     None,  # None → global (0.25 = 25% single-tick liq drop)
+            "liq_drain_pct":        None,  # None → global (0.05 per tick, 3 ticks = drain exit)
+            "reserve_pct":          None,  # None → global (0.25 = 25% of vault always held back)
+            "drawdown_brake":       True,  # False → skip drawdown brake for this wallet
+        },
+        "created":        now_utc().isoformat(),
+        "positions":      {},
+        "trade_log":      [],
+        "entries_today":  {},
+        "recently_exited":{},
+        "pnl_hist":       [],
+        "liq_prev":       {},
+        "open_today_usd":    0.0,
+        "cur_deployed_usd":  0.0,
+    }
+
+
+def _wlt_deployable(w: Dict) -> float:
+    floor_pct = CONFIG.get("absolute_floor_pct", 0.25)
+    if w["vault_usd"] <= w.get("starting_usd", w["vault_usd"]) * floor_pct:
+        return 0.0
+    reserve = w.get("safety", {}).get("reserve_pct") or CONFIG["reserve_pct"]
+    return max(0.0, w["vault_usd"] * (1 - reserve))
+
+
+def _wlt_size(w: Dict, symbol: str, chain: str, liq: float,
+              hype: Optional[int] = None, buy_ratio: Optional[float] = None) -> float:
+    mode_name = w.get("mode") or CONFIG["mode"]
+    mode_cfg  = CONFIG["modes"].get(mode_name, CONFIG["modes"].get(CONFIG["mode"], {}))
+    base = CONFIG["base_size_usd"] * mode_cfg.get("size_mult", 1.0)
+    base *= _conviction_mult(hype, buy_ratio)
+    dep  = _wlt_deployable(w)
+    # Per-token cap and chain cap (same fractions as main bot)
+    per_token = CONFIG["per_token_cap_pct"] * dep
+    per_chain = CONFIG["per_chain_cap_pct"].get(chain, 0.25) * dep
+    usd = min(base, per_token, per_chain)
+    # Don't deploy more than what's actually in the wallet
+    usd = min(usd, max(0.0, w["vault_usd"] - w.get("cur_deployed_usd", 0.0)))
+    # Per-wallet ticket cap — lets a wallet run any mode at a smaller scale
+    # (e.g. "testing 3" at $5 tickets for a live go-live test)
+    cap = float(w.get("ticket_cap_usd") or 0)
+    if cap > 0:
+        usd = min(usd, cap)
+    # Gap-down safety: cap position so a 100% token crash can't exceed dollar_stop × mult.
+    # Per-wallet override lets individual wallets take bigger bets if desired.
+    d_stop = _mode_dollar_stop(mode_name)
+    mult   = float(w.get("safety", {}).get("dollar_stop_pos_mult") or
+                   CONFIG["moonshot"].get("dollar_stop_pos_mult", 4.0))
+    usd = min(usd, d_stop * mult)
+    return usd
+
+
+def _wlt_can_enter(w: Dict, symbol: str, chain: str) -> bool:
+    MS = CONFIG["moonshot"]
+    mode_name = w.get("mode") or CONFIG["mode"]
+    # Max open positions
+    open_pos = sum(1 for p in w.get("positions", {}).values() if p.get("units", 0) > 0)
+    if open_pos >= MS.get("max_open_positions", 8):
+        return False
+    # Daily entry count per token
+    max_per_day = CONFIG.get("max_entries_per_token_day", 4)
+    if w.get("entries_today", {}).get(symbol, 0) >= max_per_day:
+        return False
+    # Loss cooldown (same as main bot: 30 min after a losing sell)
+    rex = w.get("recently_exited", {}).get(symbol)
+    if rex and rex.get("pnl", 0) < 0:
+        elapsed = time.time() - rex.get("ts", 0)
+        cooldown = int(CONFIG["moonshot"].get("loss_cooldown_min") or 30) * 60
+        if elapsed < cooldown:
+            return False
+    # Don't double-enter a symbol already open in this wallet
+    pos = w.get("positions", {}).get(symbol)
+    if pos and pos.get("units", 0) > 0:
+        return False
+    return True
+
+
+def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
+             usd: float, price: float, liq: float, addr: str):
+    if w.get("live") and chain == "sol" and addr:
+        result = _wlt_live_buy(wid, w, symbol, usd, addr)
+        if "error" in result:
+            log(f"[W:{wid}] LIVE BUY FAILED {symbol}: {result['error']}")
+            return
+        filled = result["price"]
+        units  = result["units"]
+        log(f"[W:{wid}] LIVE BUY {symbol} sig={result.get('sig','')[:16]}…")
+    else:
+        slip   = _jitter_slip(0.5 * est_price_impact(usd, liq))
+        filled = price * (1 + slip)
+        units  = usd / filled
+    mode_name    = w.get("mode") or CONFIG["mode"]
+    pos = w["positions"].setdefault(symbol, {
+        "chain": chain, "units": 0.0, "usd": 0.0, "avg": 0.0,
+        "time":  now_utc().isoformat(), "address": addr,
+        "peak_price": filled, "trough_price": filled,
+        "entry_liq": liq, "liq_ticks": [],
+        "deployed_usd": 0.0, "entry_mode": mode_name, "tp_index": 0,
+    })
+    new_total    = pos["units"] + units
+    pos["avg"]   = (pos["avg"] * pos["units"] + filled * units) / max(1e-9, new_total)
+    pos["units"]  = new_total
+    pos["usd"]   += usd
+    pos["deployed_usd"] = pos.get("deployed_usd", 0.0) + usd
+    if filled > pos.get("peak_price", 0):
+        pos["peak_price"] = filled
+
+    gas = _gas_usd(chain)
+    w["vault_usd"]        -= usd + gas
+    w["open_today_usd"]    = w.get("open_today_usd", 0.0) + usd
+    w["cur_deployed_usd"]  = w.get("cur_deployed_usd", 0.0) + usd
+    w.setdefault("entries_today", {})[symbol] = w["entries_today"].get(symbol, 0) + 1
+
+    entry = {
+        "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
+        "side": "buy", "usd": usd, "price": filled, "units": units,
+        "gas": gas, "address": addr, "pnl": None, "mode": mode_name,
+    }
+    w.setdefault("trade_log", []).append(entry)
+    log(f"[W:{wid}] BUY {symbol} ${usd:.2f} @ {filled:.6f}")
+
+
+def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
+              exit_reason: str, sell_usd: Optional[float] = None):
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        return
+    if w.get("live") and pos.get("chain") == "sol" and pos.get("address"):
+        target_usd = sell_usd or (pos["units"] * price)
+        result     = _wlt_live_sell(wid, w, pos, target_usd, price)
+        if "error" in result:
+            log(f"[W:{wid}] LIVE SELL FAILED {symbol}: {result['error']}")
+            return
+        # Use actual proceeds to derive the effective exit price
+        units_sold = result.get("units_sold", pos["units"])
+        price      = result["proceeds"] / units_sold if units_sold else price
+        log(f"[W:{wid}] LIVE SELL {symbol} sig={result.get('sig','')[:16]}…")
+    deployed = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
+    # Full exit by default; partial exit if sell_usd provided
+    if sell_usd and sell_usd < pos["usd"] * 0.99:
+        frac   = sell_usd / max(pos["usd"], 1e-9)
+        s_units = pos["units"] * frac
+        s_cost  = deployed * frac
+        pos["units"] -= s_units
+        pos["usd"]   -= sell_usd
+        pos["deployed_usd"] = deployed - s_cost
+        proceeds = s_units * price
+        pnl      = proceeds - s_cost
+        gas      = _gas_usd(pos.get("chain", "sol"))
+        w["vault_usd"]       += proceeds - gas
+        w["cur_deployed_usd"] = max(0.0, w.get("cur_deployed_usd", 0.0) - sell_usd)
+    else:
+        proceeds = pos["units"] * price
+        pnl      = proceeds - deployed
+        gas      = _gas_usd(pos.get("chain", "sol"))
+        w["vault_usd"]       += proceeds - gas
+        w["cur_deployed_usd"] = max(0.0, w.get("cur_deployed_usd", 0.0) - pos.get("usd", 0))
+        w["positions"].pop(symbol, None)
+        w.setdefault("recently_exited", {})[symbol] = {
+            "ts": time.time(), "price": price, "pnl": pnl,
+        }
+        # Cross-wallet cooldown: a loss in any wallet blocks ALL wallets and the main
+        # scanner from re-entering the same token. Prevents the BOGE/DUVAL pattern where
+        # wallet A exits at a loss but wallet B immediately re-enters the same dumper.
+        if pnl < 0:
+            STATE.setdefault("recently_exited", {})[symbol] = {
+                "ts": time.time(), "price": price, "pnl": pnl, "source": f"wallet:{wid}",
+            }
+        w.setdefault("liq_prev", {}).pop(symbol, None)
+
+    w.setdefault("pnl_hist", []).append(pnl)
+    sell_rec = {
+        "ts": now_utc().isoformat(), "symbol": symbol,
+        "chain": pos.get("chain", "sol") if pos else "sol",
+        "side": "sell", "usd": sell_usd or proceeds, "price": price,
+        "units": (sell_usd / max(price, 1e-12)) if sell_usd else (proceeds / max(price, 1e-12)),
+        "gas": gas, "address": pos.get("address", "") if pos else "",
+        "pnl": pnl, "exit_reason": exit_reason,
+        "entry_price": pos.get("avg", 0) if pos else 0,
+        "mode": (pos.get("entry_mode") if pos else None) or w.get("mode") or CONFIG["mode"],
+    }
+    w.setdefault("trade_log", []).append(sell_rec)
+    log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
+    save_state()
+
+
+def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
+    """Run the exit loop for one wallet's open positions using its mode's params."""
+    MS        = CONFIG["moonshot"]
+    liq_prev  = w.setdefault("liq_prev", {})
+
+    for symbol, pos in list(w.get("positions", {}).items()):
+        if pos.get("units", 0) <= 0:
+            continue
+        px        = live_prices.get(symbol, _px_dict(pos.get("avg", 1.0) * 1.02))
+        price     = px["price"]
+        liq       = px["liq"]
+        change_m5 = px.get("change_m5", 0)
+        if price <= 0:
+            continue
+
+        # Track peak
+        if price > pos.get("peak_price", 0):
+            pos["peak_price"] = price
+        peak = pos.get("peak_price", pos["avg"])
+
+        # Liq history for drain detection
+        liq_ticks: List[float] = pos.setdefault("liq_ticks", [])
+        liq_ticks.append(liq)
+        if len(liq_ticks) > MS["liq_drain_ticks"] + 1:
+            liq_ticks[:] = liq_ticks[-(MS["liq_drain_ticks"] + 1):]
+
+        mode_name = pos.get("entry_mode") or w.get("mode") or CONFIG["mode"]
+        mode_cfg  = CONFIG["modes"].get(mode_name, CONFIG["modes"][CONFIG["mode"]])
+
+        # Build TP ladder (same logic as main bot)
+        ladder = mode_cfg.get("tp_ladder") or [[t, 0.5] for t in mode_cfg.get("tp", MS["tp"])]
+        moonbag_frac = max(0.0, 1.0 - sum(f for _, f in ladder))
+        in_moonbag   = pos.get("tp_index", 0) >= len(ladder) and moonbag_frac > 0
+        trail_pct    = MS["trailing_stop_pct"]
+        gain_now     = (price / max(pos.get("avg") or 1e-9, 1e-9)) - 1
+        if   gain_now >= 1.0 and not in_moonbag: trail_pct = min(trail_pct, 0.10)
+        elif gain_now >= 0.5 and not in_moonbag: trail_pct = min(trail_pct, 0.12)
+
+        exit_reason: Optional[str] = None
+        _sf = w.get("safety", {})  # per-wallet safety overrides
+
+        # Dollar stop — wallet override → mode default → base $12
+        _dollar_stop = _sf.get("dollar_stop_usd") or _mode_dollar_stop(mode_name)
+        _cost        = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
+        _cur_val     = pos["units"] * price
+        _eff_stop    = max(_dollar_stop, _cost * 0.10)
+        if _dollar_stop > 0 and (_cur_val - _cost) < -_eff_stop:
+            exit_reason = f"DOLLAR STOP -${abs(_cur_val - _cost):.2f}"
+
+        # Rug liq drop — wallet override → global
+        _rug_drop = _sf.get("rug_liq_drop_pct") or MS["rug_liq_drop"]
+        prev_liq = liq_prev.get(symbol, liq)
+        if liq < prev_liq * (1 - _rug_drop):
+            exit_reason = f"RUG liq {prev_liq:.0f}→{liq:.0f}"
+        liq_prev[symbol] = liq
+
+        # Velocity — wallet override → global
+        _vel_pct = _sf.get("velocity_m5_pct") or MS["velocity_exit_pct"]
+        if exit_reason is None and change_m5 < -(_vel_pct * 100):
+            exit_reason = f"VELOCITY {change_m5:.1f}% in 5m"
+
+        # Slow liq drain — wallet override → global
+        _drain_pct = _sf.get("liq_drain_pct") or MS["liq_drain_pct"]
+        if (exit_reason is None and len(liq_ticks) >= MS["liq_drain_ticks"]
+                and all(liq_ticks[i] < liq_ticks[i-1] * (1 - _drain_pct)
+                        for i in range(1, len(liq_ticks)))):
+            exit_reason = f"LIQ DRAIN {liq_ticks[0]:.0f}→{liq:.0f}"
+
+        # Trailing stop
+        if exit_reason is None and price <= peak * (1 - trail_pct):
+            exit_reason = f"TRAIL STOP {((price/peak)-1)*100:.1f}% from peak"
+
+        if exit_reason:
+            _wlt_sell(wid, w, symbol, price, exit_reason)
+            continue
+
+        # TP ladder (partial sells)
+        deployed     = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
+        moonbag_floor = moonbag_frac * deployed
+        tp_index      = pos.get("tp_index", 0)
+        for i, (gain, frac) in enumerate(ladder):
+            if i < tp_index:
+                continue
+            if price >= pos["avg"] * (1 + gain):
+                sellable  = max(0.0, pos["usd"] - moonbag_floor)
+                sell_usd  = min(frac * deployed, sellable)
+                pos["tp_index"] = i + 1
+                if sell_usd > 0.01:
+                    _wlt_sell(wid, w, symbol, price, f"TP rung {i+1}", sell_usd=sell_usd)
+                break
+
+        # Fixed SL fallback
+        sl_level = pos.get("sl_override") or mode_cfg.get("sl", 0.18)
+        if pos.get("units", 0) > 0 and price <= pos["avg"] * (1 - sl_level):
+            _wlt_sell(wid, w, symbol, price, "fixed_sl")
+
+
+def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
+                         addr: str, scan_entered: Dict,
+                         hype: Optional[int] = None, buy_ratio: Optional[float] = None):
+    """After the main bot enters a candidate, offer it to each active additional wallet.
+
+    Each wallet gets independent humanization so on-chain transactions don't look like
+    a coordinated bot fleet: entry probability (not all wallets always enter), size jitter
+    (±8% on ticket size), and a per-wallet random delay offset stored for reference.
+    In live mode these delays must be honored by the real tx submission layer.
+    """
+    for wid, w in STATE.get("wallets", {}).items():
+        if not w.get("active"):
+            continue
+        if symbol in scan_entered.get(wid, set()):
+            continue
+        if not _wlt_can_enter(w, symbol, chain):
+            continue
+
+        # Entry probability — each wallet independently decides whether to enter.
+        # Default 85%: wallets don't always mirror each other, reducing on-chain correlation.
+        entry_prob = float(w.get("entry_prob", 0.85))
+        if random.random() > entry_prob:
+            log(f"[W:{wid}] SKIP {symbol} — skipped by entry_prob ({entry_prob:.0%})")
+            continue
+
+        usd = _wlt_size(w, symbol, chain, liq, hype=hype, buy_ratio=buy_ratio)
+        # ticket_cap_usd wallets bypass the global min-ticket check (cap itself is the floor)
+        cap = float(w.get("ticket_cap_usd") or 0)
+        _min_t = max(1.0, cap * 0.5) if cap > 0 else _mode_min_ticket(w.get("mode") or CONFIG["mode"])
+        if usd < _min_t:
+            continue
+
+        # Size jitter ±8% so each wallet's position size differs (not identical clone bets).
+        jitter = 1.0 + random.uniform(-0.08, 0.08)
+        usd = max(_min_t, usd * jitter)
+
+        _wlt_buy(wid, w, symbol, chain, usd, price, liq, addr)
+        scan_entered.setdefault(wid, set()).add(symbol)
+
+
+_followup_last_run: float = 0.0
+
+def _run_price_followup():
+    """Every 30 min, check what happened to recently-scanned tokens.
+    Appends {type:'px_followup'} records to SCAN_LOG_FILE so the Audit tab can
+    compute filter accuracy, missed gains, and exit-quality metrics over time."""
+    global _followup_last_run
+    if time.time() - _followup_last_run < 1800:
+        return
+    _followup_last_run = time.time()
+
+    if not os.path.exists(SCAN_LOG_FILE):
+        return
+
+    now_ts   = time.time()
+    cutoff6h = now_ts - 6 * 3600  # only follow up tokens seen in last 6h
+
+    # Read initial scan entries (not follow-up records) from last 6 hours
+    by_addr: Dict[str, Dict] = {}
+    try:
+        with open(SCAN_LOG_FILE) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    if e.get("type") == "px_followup":
+                        continue
+                    addr = e.get("addr", "").strip()
+                    if not addr or not e.get("px", 0):
+                        continue
+                    try:
+                        ts_sec = datetime.fromisoformat(
+                            e["ts"].replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        continue
+                    if ts_sec < cutoff6h:
+                        continue
+                    # Keep earliest occurrence per address (first scan of token)
+                    if addr not in by_addr or ts_sec < by_addr[addr]["ts_sec"]:
+                        by_addr[addr] = {**e, "ts_sec": ts_sec}
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+    if not by_addr:
+        return
+
+    # Batch DexScreener lookups (30 addresses per call)
+    addrs = list(by_addr.keys())
+    lines_to_append: List[str] = []
+
+    for i in range(0, len(addrs), 30):
+        batch = addrs[i:i+30]
+        try:
+            data  = _get(DEXSCREENER_TOKEN + ",".join(batch)) or {}
+            pairs = data.get("pairs") or []
+            by_pair: Dict[str, Dict] = {}
+            for pair in pairs:
+                a = ((pair.get("baseToken") or {}).get("address") or "").lower()
+                if a and a not in by_pair:
+                    by_pair[a] = pair
+
+            for addr in batch:
+                orig = by_addr[addr]
+                pair = by_pair.get(addr.lower())
+                if not pair:
+                    continue
+                px_now = float(pair.get("priceUsd") or 0)
+                if px_now <= 0:
+                    continue
+                px_orig = orig.get("px", 0)
+                elapsed_min = (now_ts - orig["ts_sec"]) / 60
+                pct = round((px_now / px_orig - 1) * 100, 2) if px_orig > 0 else 0
+                liq_now = float((pair.get("liquidity") or {}).get("usd") or 0)
+                record = {
+                    "type":        "px_followup",
+                    "ts":          now_utc().isoformat(),
+                    "addr":        addr,
+                    "sym":         orig.get("sym", ""),
+                    "dec":         orig.get("dec", ""),
+                    "rsn":         orig.get("rsn", ""),
+                    "px_orig":     round(px_orig, 10),
+                    "px_now":      round(px_now, 10),
+                    "elapsed_min": round(elapsed_min, 1),
+                    "pct":         pct,
+                    "liq_now":     round(liq_now, 0),
+                }
+                lines_to_append.append(json.dumps(record, separators=(",", ":")))
+        except Exception as exc:
+            log(f"price_followup batch error: {exc}")
+        time.sleep(0.3)
+
+    if lines_to_append:
+        try:
+            with open(SCAN_LOG_FILE, "a") as f:
+                f.write("\n".join(lines_to_append) + "\n")
+        except Exception:
+            pass
+
+
+def _manage_arenas(live_prices: Dict):
+    """Check every arena position for SL / trailing-stop exit each price tick."""
+    arenas = STATE.get("arenas", {})
+    trail_pct = CONFIG["moonshot"].get("trailing_stop_pct", 0.15)
+
+    for mode_name, arena in arenas.items():
+        params = _arena_mode_params(mode_name)
+        if not params:
+            continue
+        sl           = params["sl"]
+        dollar_stop  = params["dollar_stop"]
+
+        for symbol, pos in list(arena["positions"].items()):
+            px_data = live_prices.get(symbol)
+            if not px_data:
+                continue
+            price = px_data["price"] if isinstance(px_data, dict) else float(px_data)
+
+            entry = pos["entry_price"]
+            if entry <= 0:
+                continue
+            change = (price - entry) / entry
+
+            if price > pos.get("peak_price", 0):
+                pos["peak_price"] = price
+            peak = pos["peak_price"]
+
+            exit_reason: Optional[str] = None
+            # If the main bot already exited this token, close the arena position
+            # at the main bot's exit price so we're not holding a stale position
+            # with no live price feed. Each mode still got to apply its own params
+            # up to this point — that's the comparison value.
+            if pos.get("main_bot_exited"):
+                price = pos.get("main_exit_price", price)
+                exit_reason = "main_bot_exit"
+            else:
+                loss_usd = pos["cost"] - pos["units"] * price
+                # Mirror the main bot's effective stop: max(dollar_stop, 10% of position).
+                # Without this, a $20 arena position with dollar_stop=1 exits on a $1 dip
+                # (5%), while the main bot on $84 uses max($1, $8.40) = $8.40 — a 10% stop.
+                eff_dollar_stop = max(dollar_stop, pos["cost"] * 0.10)
+                if sl and change <= -sl:
+                    exit_reason = "sl"
+                elif loss_usd >= eff_dollar_stop:
+                    exit_reason = "dollar_stop"
+                elif peak > entry and (price / peak - 1) < -trail_pct:
+                    exit_reason = "trail"
+
+            if exit_reason:
+                sell_gas = _gas_usd(pos.get("chain", "sol"))
+                proceeds = pos["units"] * price - sell_gas
+                pnl      = proceeds - pos["cost"]
+                arena["vault"] += proceeds
+                arena["positions"].pop(symbol, None)
+                arena["trades"].append({
+                    "ts":          now_utc().isoformat(),
+                    "symbol":      symbol,
+                    "pnl":         pnl,
+                    "exit_reason": exit_reason,
+                    "entry_price": entry,
+                    "exit_price":  price,
+                })
 
 
 # ---------------------------------------------------------------------------
@@ -1746,6 +3093,41 @@ def refresh_vault_balance():
 
 
 # ---------------------------------------------------------------------------
+# Take-home tracker — bank 50% of big wins above the vault baseline
+# ---------------------------------------------------------------------------
+_TAKE_HOME_MIN_PNL  = 40.0  # only trigger on big wins > $40
+_TAKE_HOME_PCT      = 0.50  # fraction of that trade's PnL to bank
+
+def _maybe_take_home(symbol: str, pnl: float):
+    """After a profitable sell: if pnl is big enough AND vault > baseline,
+    move 50% of the trade profit to the take-home tracker and shrink the vault.
+    This banks real gains so they don't get re-risked."""
+    if pnl < _TAKE_HOME_MIN_PNL:
+        return
+    vault   = STATE["vault_usd"]
+    baseline = STATE.get("vault_start", vault)
+    if vault <= baseline:
+        return   # still below starting point overall — nothing to bank yet
+    amount = round(pnl * _TAKE_HOME_PCT, 2)
+    if amount < 1.0:
+        return
+    STATE["vault_usd"]    = round(vault - amount, 4)
+    STATE["take_home_usd"] = round(STATE.get("take_home_usd", 0.0) + amount, 2)
+    log_list = STATE.setdefault("take_home_log", [])
+    log_list.append({
+        "ts":          now_utc().isoformat(),
+        "symbol":      symbol,
+        "trade_pnl":   round(pnl, 2),
+        "banked":      amount,
+        "vault_after": round(STATE["vault_usd"], 2),
+        "total":       STATE["take_home_usd"],
+    })
+    if len(log_list) > 200:
+        del log_list[:len(log_list) - 200]
+    log(f"TAKE HOME +${amount:.2f} from {symbol} (trade pnl ${pnl:.2f}) → total ${STATE['take_home_usd']:.2f}")
+    save_state()
+
+
 # Profit sweep — transfer excess USDC to cold wallet after each sell
 # ---------------------------------------------------------------------------
 _SOL_TOKEN_PROG    = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -1869,11 +3251,12 @@ def adaptive_no_pump_window(liq_usd: float) -> int:
     return ms["low_liq_sec"] if liq_usd < 50000 else ms["high_liq_sec"]
 
 
-def should_exit_no_pump(entry_ts: float, now_ts: float, entry_price: float, cur_price: float, liq_usd: float) -> bool:
+def should_exit_no_pump(entry_ts: float, now_ts: float, entry_price: float, cur_price: float, liq_usd: float,
+                        mode_name: str = "") -> bool:
     if now_ts - entry_ts < adaptive_no_pump_window(liq_usd):
         return False
-    # Use current mode's no_pump config; fall back to degen for modes that don't define it
-    mode_cfg = CONFIG["modes"].get(CONFIG["mode"], {})
+    m        = mode_name or CONFIG["mode"]
+    mode_cfg = CONFIG["modes"].get(m, {})
     hurdle   = mode_cfg.get("no_pump", CONFIG["modes"]["degen"]["no_pump"])["hurdle"]
     return (cur_price - entry_price) / entry_price < hurdle
 
@@ -2010,7 +3393,7 @@ def manage_trusted_coins():
 # ---------------------------------------------------------------------------
 # Exit reasons that mean the token FAILED (dumped) — don't chase these back in.
 # Only cooled-off winners (TRAIL STOP) qualify for re-entry.
-_HARD_EXIT_PREFIXES = ("RUG", "VELOCITY", "LIQ DRAIN", "fixed_sl")
+_HARD_EXIT_PREFIXES = ("RUG", "VELOCITY", "LIQ DRAIN", "fixed_sl", "DOLLAR STOP")
 
 
 def _add_reentry_watch(sym: str, pos: Dict, cur_liq: float, cur_vol_h1: float, reason: str):
@@ -2223,9 +3606,27 @@ def fetch_x_buzz(symbol: str) -> Dict[str, Any]:
     return out
 
 
+# Holder-concentration flags that are normal on brand-new pump.fun launches.
+# These are overridden when hype >= 90 — concentrated early holders ≠ rug intent.
+# Hard structural flags (mint auth, freeze auth, honeypot, LP not locked) are NOT here
+# and will still block the trade regardless of hype.
+_HOLDER_CONCENTRATION_FLAGS = {
+    "top 10 holders high ownership",
+    "single holder ownership",
+    "high holder concentration",
+    "holder concentration",
+}
+
+_rugcheck_cache: Dict[str, Any] = {}
+_RUGCHECK_TTL = 300  # 5 minutes — results don't change that fast
+
 def fetch_rugcheck(address: str) -> Dict[str, Any]:
     """rugcheck.xyz Solana rug/scam report. Flags danger-level risks or a high risk score."""
-    out: Dict[str, Any] = {"flagged": False, "reason": "", "score": None}
+    now = time.time()
+    cached = _rugcheck_cache.get(address)
+    if cached and now - cached["_ts"] < _RUGCHECK_TTL:
+        return cached
+    out: Dict[str, Any] = {"flagged": False, "reason": "", "score": None, "dangers": []}
     try:
         r = requests.get(
             f"https://api.rugcheck.xyz/v1/tokens/{address}/report/summary",
@@ -2235,6 +3636,7 @@ def fetch_rugcheck(address: str) -> Dict[str, Any]:
         data = r.json() or {}
         out["score"] = data.get("score_normalised")
         dangers = [x.get("name") for x in (data.get("risks") or []) if x.get("level") == "danger"]
+        out["dangers"] = [d for d in dangers if d]
         if dangers:
             out["flagged"] = True
             out["reason"]  = "rugcheck flags " + ", ".join(d for d in dangers[:2] if d)
@@ -2243,12 +3645,14 @@ def fetch_rugcheck(address: str) -> Dict[str, Any]:
             out["reason"]  = f"rugcheck risk score {out['score']}/100 (high)"
     except Exception:
         pass
+    out["_ts"] = now
+    _rugcheck_cache[address] = out
     return out
 
 
 def fetch_onchain_safety(address: str, chain: str) -> Dict[str, Any]:
     """On-chain rug checks: Solana rugcheck.xyz + holder concentration, EVM honeypot/sell-tax."""
-    out: Dict[str, Any] = {"flagged": False, "reason": ""}
+    out: Dict[str, Any] = {"flagged": False, "reason": "", "dangers": []}
     if not address:
         return out
     if chain == "sol":
@@ -2256,7 +3660,7 @@ def fetch_onchain_safety(address: str, chain: str) -> Dict[str, Any]:
         # holder distribution, known scams). Fall back to raw holder concentration if it's down.
         rc = fetch_rugcheck(address)
         if rc["flagged"]:
-            return {"flagged": True, "reason": rc["reason"]}
+            return {"flagged": True, "reason": rc["reason"], "dangers": rc.get("dangers", [])}
         if rc["score"] is not None:
             return out   # rugcheck ran and cleared it — trust it over the rough RPC heuristic
         try:
@@ -2295,8 +3699,10 @@ def fetch_onchain_safety(address: str, chain: str) -> Dict[str, Any]:
     return out
 
 
-def safety_gate(symbol: str, address: str, chain: str) -> "tuple[bool, str]":
-    """Combined scam/rug check for a token the bot is about to buy. Returns (ok, reason_if_blocked)."""
+def safety_gate(symbol: str, address: str, chain: str, hype: int = 0) -> "tuple[bool, str]":
+    """Combined scam/rug check for a token the bot is about to buy. Returns (ok, reason_if_blocked).
+    When hype >= 90: holder-concentration-only flags are overridden — new pump.fun launches
+    almost always have concentrated holders; high hype signals real community demand."""
     S = CONFIG["safety"]
     scam_hits = 0
     parts: List[str] = []
@@ -2316,6 +3722,14 @@ def safety_gate(symbol: str, address: str, chain: str) -> "tuple[bool, str]":
     if S.get("onchain_enabled"):
         oc = fetch_onchain_safety(address, chain)
         if oc["flagged"]:
+            # Hype override: if the ONLY dangers are holder concentration flags and
+            # hype is 90+, allow it through — concentrated holders are normal on new launches.
+            if hype >= 90 and oc.get("dangers"):
+                non_conc = [d for d in oc["dangers"]
+                            if d.lower() not in _HOLDER_CONCENTRATION_FLAGS]
+                if not non_conc:
+                    log(f"SAFETY OVERRIDE {symbol}: hype {hype} overrides holder-concentration flags ({oc['dangers']})")
+                    return True, ""
             return False, "on-chain risk — " + oc["reason"]
     return True, ""
 
@@ -2388,6 +3802,9 @@ def _ai_market_context() -> Dict[str, Any]:
         "btc_dominance":    STATE["signals"].get("btc_d"),
         "market_heat":      STATE["signals"].get("heat"),
         "vault_usd":        round(STATE.get("vault_usd", 0), 2),
+        "vault_start":      round(STATE.get("vault_start", 0), 2),
+        "take_home_usd":    round(STATE.get("take_home_usd", 0), 2),
+        "take_home_log":    (STATE.get("take_home_log") or [])[-20:],
         "open_positions":   sum(1 for p in STATE.get("positions", {}).values() if p.get("units", 0) > 0),
         "recent_trades":    len(hist),
         "recent_win_rate":  round(wr, 2),
@@ -2425,7 +3842,6 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
             max_tokens=400,
             system=AI_SYSTEM,
             messages=[{"role": "user", "content": json.dumps(ctx)}],
-            output_config={"format": {"type": "json_schema", "schema": AI_DECISION_SCHEMA}},
         )
         text = next((b.text for b in resp.content if b.type == "text"), "")
         decision = json.loads(text)
@@ -2450,6 +3866,7 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
             and rec != CONFIG["mode"] and decision["confidence"] >= A.get("min_confidence", 0.6)):
         old = CONFIG["mode"]
         CONFIG["mode"] = rec
+        STATE["active_mode"] = rec
         applied = True
         log(f"AI auto-switched mode {old} → {rec} (conf {decision['confidence']:.2f})")
         send_alert(
@@ -2492,8 +3909,10 @@ def _dash_auth(fn):
 @app.route("/status")
 def http_status():
     return jsonify({
-        "vault_usd":   STATE["vault_usd"],
-        "deployable":  deployable_now(),
+        "vault_usd":      STATE["vault_usd"],
+        "vault_start":    STATE.get("vault_start", STATE["vault_usd"]),
+        "take_home_usd":  round(STATE.get("take_home_usd", 0.0), 2),
+        "deployable":     deployable_now(),
         "positions":   len([p for p in STATE["positions"].values() if p.get("units", 0) > 0]),
         "mode":        CONFIG["mode"],
         "shadow_mode": SHADOW_MODE,
@@ -3050,6 +4469,7 @@ def _register_custom_mode(name: str, p: dict):
     CONFIG["modes"][name] = {
         "tp":                       list(base.get("tp", [0.45, 0.9])),
         "sl":                       float(p.get("sl_pct", 18)) / 100.0,
+        "dollar_stop_usd":          float(p.get("dollar_stop", _BASE_DOLLAR_STOP)),
         "slip_bps":                 int(base.get("slip_bps", 150)),
         "liq_min":                  int(base.get("liq_min", 20000)),
         "max_age_min":              int(base.get("max_age_min", 120)),
@@ -3060,9 +4480,13 @@ def _register_custom_mode(name: str, p: dict):
 
 
 def _apply_custom_mode_globals(p: dict):
-    """Apply the non-mode-dict params (dollar_stop, cooldown, etc.) from a custom mode."""
-    if "dollar_stop" in p:
-        CONFIG["moonshot"]["dollar_stop_usd"] = float(p["dollar_stop"])
+    """Apply the non-mode-dict params (cooldown, per_token_cap, etc.) from a custom mode.
+
+    dollar_stop is intentionally NOT written to CONFIG["moonshot"]["dollar_stop_usd"] —
+    exit logic uses _BASE_DOLLAR_STOP / _mode_dollar_stop(), and the arena reads it
+    directly from the custom mode dict via _arena_mode_params(). Mutating the global
+    would corrupt the dashboard display and the position cap for all other modes.
+    """
     if "per_token_cap" in p:
         cap = float(p["per_token_cap"])
         CONFIG["per_token_cap_pct"] = (cap / (STATE.get("vault_usd", 1000) * 10)) if cap > 0 else 1.0
@@ -3110,6 +4534,530 @@ def api_delete_custom_mode(name):
     return jsonify({"ok": True})
 
 
+@app.route("/api/mode/push", methods=["POST"])
+@_dash_auth
+def api_mode_push():
+    """Push backtester parameters onto an existing built-in mode's config.
+    Only touches fields that are explicitly sent — doesn't clobber unrelated settings."""
+    data = request.get_json() or {}
+    mode = data.get("mode", "").strip()
+    BUILT_INS = {"hype", "degen", "default", "seed", "safe", "micro"}
+    if mode not in BUILT_INS:
+        return jsonify({"error": f"unknown mode '{mode}' — must be one of {sorted(BUILT_INS)}"}), 400
+
+    m = CONFIG["modes"].setdefault(mode, {})
+    ALLOWED = {
+        "sl", "size_mult", "dollar_stop_usd", "loss_cooldown_min",
+        "m5_min", "buy_ratio_min", "velocity_exit_pct", "rug_liq_drop",
+    }
+    updated = {}
+    for key in ALLOWED:
+        if key in data:
+            val = data[key]
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                continue
+            m[key] = val
+            updated[key] = val
+
+    save_state()
+    log(f"PUSH mode '{mode}': {updated}")
+    return jsonify({"ok": True, "mode": mode, "updated": updated})
+
+
+@app.route("/api/arenas", methods=["GET"])
+@_dash_auth
+def api_arenas():
+    arenas  = STATE.get("arenas", {})
+    result  = {}
+    all_names = set(CONFIG["modes"].keys()) | set(STATE.get("custom_modes", {}).keys())
+    for mode_name in all_names:
+        arena  = arenas.get(mode_name, {})
+        trades = arena.get("trades", [])
+        wins   = [t for t in trades if t.get("pnl", 0) > 0]
+        losses = [t for t in trades if t.get("pnl", 0) <= 0]
+        net    = sum(t.get("pnl", 0) for t in trades)
+        sv     = arena.get("start_vault", arena.get("vault", 0))
+        open_p = len(arena.get("positions", {}))
+        # unrealized PnL on open positions (approx: value at entry price since we don't have live price here)
+        result[mode_name] = {
+            "vault":         arena.get("vault", None),
+            "start_vault":   sv,
+            "net_pnl":       round(net, 2),
+            "pct_return":    round(net / sv * 100, 2) if sv else 0,
+            "trade_count":   len(trades),
+            "win_count":     len(wins),
+            "loss_count":    len(losses),
+            "win_rate":      round(len(wins) / len(trades) * 100, 1) if trades else 0,
+            "avg_win":       round(sum(t["pnl"] for t in wins)   / len(wins),   2) if wins   else 0,
+            "avg_loss":      round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0,
+            "open_positions": open_p,
+            "started":       arena.get("started", None),
+            "is_custom":     mode_name in STATE.get("custom_modes", {}),
+        }
+    return jsonify(result)
+
+
+@app.route("/api/arenas/<name>/reset", methods=["POST"])
+@_dash_auth
+def api_arena_reset(name):
+    arenas = STATE.setdefault("arenas", {})
+    arenas.pop(name, None)
+    save_state()
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Manual override / reset controls
+# ---------------------------------------------------------------------------
+
+@app.route("/api/blocks", methods=["GET"])
+@_dash_auth
+def api_blocks():
+    """Return status + reasoning for every active trading block."""
+    now_ts = time.time()
+    db     = CONFIG["drawdown_brake"]
+    hist   = STATE["pnl_hist"][-db["lookback"]:]
+    gains  = sum(x for x in hist if x > 0)
+    losses = sum(x for x in hist if x < 0)
+    net    = gains + losses
+    brake_active = drawdown_brake_active()
+
+    # Per-token cooldowns — main bot
+    cooldown_sec = int(CONFIG["moonshot"].get("loss_cooldown_min", 30)) * 60
+    main_cooldowns = []
+    for sym, ex in STATE.get("recently_exited", {}).items():
+        elapsed = now_ts - ex.get("ts", now_ts)
+        remaining = cooldown_sec - elapsed
+        if remaining > 0:
+            main_cooldowns.append({
+                "symbol":    sym,
+                "pnl":       round(ex.get("pnl", 0), 2),
+                "exit_ts":   ex.get("ts", 0),
+                "remaining_sec": int(remaining),
+                "reason":    ex.get("exit_reason", "loss exit"),
+            })
+
+    # Per-wallet cooldowns
+    wallet_cooldowns = []
+    for wid, w in STATE.get("wallets", {}).items():
+        for sym, ex in w.get("recently_exited", {}).items():
+            elapsed   = now_ts - ex.get("ts", now_ts)
+            remaining = cooldown_sec - elapsed
+            if remaining > 0:
+                wallet_cooldowns.append({
+                    "wid":     wid,
+                    "label":   w.get("label", wid),
+                    "symbol":  sym,
+                    "pnl":     round(ex.get("pnl", 0), 2),
+                    "remaining_sec": int(remaining),
+                    "reason":  ex.get("exit_reason", "loss exit"),
+                })
+
+    # Vault floor
+    vault_start = STATE.get("vault_start", STATE["vault_usd"])
+    floor_usd   = vault_start * CONFIG.get("absolute_floor_pct", 0.25)
+    at_floor    = STATE["vault_usd"] <= floor_usd
+    wallet_floors = []
+    for wid, w in STATE.get("wallets", {}).items():
+        w_start = w.get("starting_usd", w["vault_usd"])
+        w_floor = w_start * CONFIG.get("absolute_floor_pct", 0.25)
+        if w["vault_usd"] <= w_floor:
+            wallet_floors.append({
+                "wid":         wid,
+                "label":       w.get("label", wid),
+                "vault_usd":   round(w["vault_usd"], 2),
+                "floor_usd":   round(w_floor, 2),
+                "topup_needed": round(w_floor - w["vault_usd"] + 1, 2),
+            })
+
+    return jsonify({
+        "brake": {
+            "active":       brake_active,
+            "net_pnl":      round(net, 2),
+            "gains":        round(gains, 2),
+            "losses":       round(losses, 2),
+            "threshold_pct": db["dd"] * 100,
+            "lookback":     db["lookback"],
+            "trades_in_window": len(hist),
+            "reason": (
+                f"Net loss ${abs(net):.2f} across last {len(hist)} trades "
+                f"({abs(net)/max(gains,0.01)*100:.0f}% of gains — threshold {db['dd']*100:.0f}%)"
+                if brake_active else
+                f"Net P&L ${net:+.2f} across last {len(hist)} trades — below {db['dd']*100:.0f}% drawdown threshold"
+            ),
+        },
+        "cooldowns": {
+            "main_bot": sorted(main_cooldowns, key=lambda x: -x["remaining_sec"]),
+            "wallets":  sorted(wallet_cooldowns, key=lambda x: -x["remaining_sec"]),
+        },
+        "vault_floors": {
+            "main_at_floor": at_floor,
+            "main_vault":    round(STATE["vault_usd"], 2),
+            "main_floor":    round(floor_usd, 2),
+            "wallets":       wallet_floors,
+        },
+    })
+
+
+@app.route("/api/reset/brake", methods=["POST"])
+@_dash_auth
+def api_reset_brake():
+    """Clear pnl_hist so the drawdown brake deactivates immediately."""
+    STATE["pnl_hist"] = []
+    for w in STATE.get("wallets", {}).values():
+        w["pnl_hist"] = []
+    save_state()
+    log("MANUAL: drawdown brake reset — pnl_hist cleared on main bot + all wallets")
+    return jsonify({"ok": True, "msg": "Drawdown brake cleared"})
+
+
+@app.route("/api/reset/cooldowns", methods=["POST"])
+@_dash_auth
+def api_reset_cooldowns():
+    """Clear all per-token loss cooldowns on the main bot and every wallet."""
+    STATE["recently_exited"] = {}
+    for w in STATE.get("wallets", {}).values():
+        w["recently_exited"] = {}
+    save_state()
+    log("MANUAL: all loss cooldowns cleared (main bot + wallets)")
+    return jsonify({"ok": True, "msg": "All cooldowns cleared"})
+
+
+@app.route("/api/wallets/<wid>/reset/cooldowns", methods=["POST"])
+@_dash_auth
+def api_wallet_reset_cooldowns(wid):
+    """Clear loss cooldowns for one wallet only."""
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "wallet not found"}), 404
+    w["recently_exited"] = {}
+    save_state()
+    log(f"MANUAL: cooldowns cleared for wallet {w.get('label', wid)}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/wallets/bulk", methods=["POST"])
+@_dash_auth
+def api_wallets_bulk():
+    """Bulk actions applied to all wallets + main bot state at once."""
+    data   = flask_request.get_json() or {}
+    action = data.get("action", "")
+    wallets = STATE.get("wallets", {})
+
+    if action in ("clear_cooldowns", "clear_all"):
+        STATE["recently_exited"]  = {}
+        STATE["entries_today"]    = {}
+        STATE["token_pnl_today"]  = {}
+        for w in wallets.values():
+            w["recently_exited"] = {}
+            w["entries_today"]   = {}
+        if action == "clear_all":
+            STATE["reject_cache"] = {}
+        save_state()
+        log("MANUAL: all cooldowns + entry caps cleared (bulk)")
+        return jsonify({"ok": True, "action": action})
+
+    if action == "clear_entry_caps":
+        # Reset daily entry counts and cumulative loss tally — lets the bot re-enter tokens
+        # it hit the per-day cap on, without touching the loss cooldown timers.
+        STATE["entries_today"]   = {}
+        STATE["token_pnl_today"] = {}
+        for w in wallets.values():
+            w["entries_today"] = {}
+        save_state()
+        log("MANUAL: entry caps + loss tallies reset (bulk)")
+        return jsonify({"ok": True, "action": action})
+
+    if action == "clear_reject_cache":
+        STATE["reject_cache"] = {}
+        save_state()
+        log("MANUAL: reject cache cleared — all tokens get a fresh look")
+        return jsonify({"ok": True, "action": action})
+
+    if action == "set_mode":
+        mode = data.get("mode", "")
+        if mode not in CONFIG["modes"]:
+            return jsonify({"error": f"unknown mode '{mode}'"}), 400
+        for w in wallets.values():
+            w["mode"] = mode
+        save_state()
+        log(f"MANUAL: all wallet modes set to '{mode}' (bulk)")
+        return jsonify({"ok": True, "action": action, "mode": mode})
+
+    return jsonify({"error": f"unknown action '{action}'"}), 400
+
+
+@app.route("/api/reset/vault_floor", methods=["POST"])
+@_dash_auth
+def api_reset_vault_floor():
+    """Reset vault_start so the 25% hard floor recalculates from current balance.
+    Use after topping up a wallet or after a code change that changes vault accounting."""
+    data = flask_request.get_json() or {}
+    wid  = data.get("wid")  # optional — if set, reset only that wallet
+    if wid:
+        w = STATE.get("wallets", {}).get(wid)
+        if not w:
+            return jsonify({"error": "wallet not found"}), 404
+        w["starting_usd"] = w["vault_usd"]
+        save_state()
+        log(f"MANUAL: vault floor reset for {w.get('label', wid)} → starting_usd={w['vault_usd']:.2f}")
+        return jsonify({"ok": True, "new_floor": w["vault_usd"] * 0.25})
+    else:
+        STATE["vault_start"] = STATE["vault_usd"]
+        save_state()
+        log(f"MANUAL: main-bot vault floor reset → vault_start={STATE['vault_usd']:.2f}")
+        return jsonify({"ok": True, "new_floor": STATE["vault_usd"] * 0.25})
+
+
+# ---------------------------------------------------------------------------
+# Multi-wallet API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/wallets", methods=["GET"])
+@_dash_auth
+def api_wallets_list():
+    result = {}
+    for wid, w in STATE.get("wallets", {}).items():
+        open_pos = {s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0}
+        sells    = [t for t in w.get("trade_log", []) if t.get("side") == "sell" and t.get("pnl") is not None]
+        wins     = [t for t in sells if (t.get("pnl") or 0) > 0]
+        net_pnl  = sum(t.get("pnl") or 0 for t in sells)
+        floor_pct    = CONFIG.get("absolute_floor_pct", 0.25)
+        at_floor     = w.get("vault_usd", 0) <= w.get("starting_usd", 1) * floor_pct
+        result[wid] = {
+            "wid":          wid,
+            "label":        w.get("label", wid),
+            "address":      w.get("address", ""),
+            "sweep_address":  w.get("sweep_address", ""),
+            "ticket_cap_usd": w.get("ticket_cap_usd", 0.0),
+            "safety":         w.get("safety", {}),
+            "mode":           w.get("mode") or CONFIG["mode"],
+            "active":       w.get("active", True),
+            "live":         w.get("live", False),
+            "keypair_loaded": wid in _wallet_keypairs,
+            "at_floor":     at_floor,
+            "starting_usd": w.get("starting_usd", 0),
+            "vault_usd":    round(w.get("vault_usd", 0), 2),
+            "net_pnl":      round(net_pnl, 2),
+            "trade_count":  len(sells),
+            "win_rate":     round(len(wins) / max(1, len(sells)) * 100, 1),
+            "open_positions": len(open_pos),
+            "open_pos_names": list(open_pos.keys()),
+            "created":      w.get("created", ""),
+        }
+    return jsonify(result)
+
+
+@app.route("/api/wallets", methods=["POST"])
+@_dash_auth
+def api_wallets_create():
+    data         = flask_request.get_json() or {}
+    label        = (data.get("label") or "Wallet").strip()[:40]
+    starting_usd = float(data.get("starting_usd") or 100.0)
+    mode         = data.get("mode") or None
+    if mode and mode not in CONFIG["modes"]:
+        mode = None
+    address = (data.get("address") or "").strip()
+    wid = f"w_{int(time.time())}_{random.randint(1000, 9999)}"
+    STATE.setdefault("wallets", {})[wid] = _wlt_init(label, starting_usd, mode, address)
+    save_state()
+    log(f"Wallet created: {wid} '{label}' ${starting_usd} mode={mode or 'global'}")
+    return jsonify({"wid": wid}), 201
+
+
+@app.route("/api/wallets/<wid>", methods=["PATCH"])
+@_dash_auth
+def api_wallet_update(wid):
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "not found"}), 404
+    data = flask_request.get_json() or {}
+    if "label" in data:
+        w["label"]   = str(data["label"])[:40]
+    if "mode" in data:
+        m = data["mode"]
+        w["mode"] = m if (m and m in CONFIG["modes"]) else None
+    if "active" in data:
+        w["active"]   = bool(data["active"])
+    if "address" in data:
+        w["address"] = str(data["address"]).strip()
+    if "starting_usd" in data:
+        w["starting_usd"] = float(data["starting_usd"])
+    if "sweep_address" in data:
+        w["sweep_address"] = str(data["sweep_address"]).strip()
+    if "ticket_cap_usd" in data:
+        cap = float(data["ticket_cap_usd"])
+        w["ticket_cap_usd"] = max(0.0, cap)
+    if "safety" in data and isinstance(data["safety"], dict):
+        sf = w.setdefault("safety", {})
+        allowed = {"dollar_stop_usd", "dollar_stop_pos_mult", "velocity_m5_pct",
+                   "rug_liq_drop_pct", "liq_drain_pct", "reserve_pct", "drawdown_brake"}
+        for k, v in data["safety"].items():
+            if k in allowed:
+                sf[k] = None if v in (None, "", "null") else (bool(v) if k == "drawdown_brake" else float(v))
+    if "live" in data:
+        want_live = bool(data["live"])
+        if want_live and wid not in _wallet_keypairs:
+            # Try loading the keypair now (user may have added the env var since startup)
+            _load_wallet_keypairs()
+        if want_live and wid not in _wallet_keypairs:
+            return jsonify({"error": f"No keypair found. Add W_{wid}_PK to .env and restart."}), 400
+        w["live"] = want_live
+    save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/wallets/<wid>", methods=["DELETE"])
+@_dash_auth
+def api_wallet_delete(wid):
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "not found"}), 404
+    open_pos = [s for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0]
+    if open_pos:
+        return jsonify({"error": f"close positions first: {open_pos}"}), 400
+    STATE["wallets"].pop(wid, None)
+    save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/wallets/<wid>/trades", methods=["GET"])
+@_dash_auth
+def api_wallet_trades(wid):
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(w.get("trade_log", []))
+
+
+@app.route("/api/wallets/<wid>/positions", methods=["GET"])
+@_dash_auth
+def api_wallet_positions(wid):
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0})
+
+
+@app.route("/api/opportunity-audit", methods=["GET"])
+@_dash_auth
+def api_opportunity_audit():
+    """Read SCAN_LOG_FILE and return filter accuracy + missed-gain analysis."""
+    if not os.path.exists(SCAN_LOG_FILE):
+        return jsonify({"stats": {}, "top_misses": [], "entries": []})
+
+    initial: Dict[str, Dict]       = {}   # addr → first-scan record
+    followups: Dict[str, List]     = {}   # addr → list of px_followup records
+
+    try:
+        with open(SCAN_LOG_FILE) as _f:
+            for _line in _f:
+                try:
+                    e = json.loads(_line)
+                    addr = (e.get("addr") or "").strip()
+                    if not addr:
+                        continue
+                    if e.get("type") == "px_followup":
+                        followups.setdefault(addr, []).append(e)
+                    else:
+                        ts = e.get("ts", "")
+                        if addr not in initial or ts < initial[addr].get("ts", ""):
+                            initial[addr] = e
+                except Exception:
+                    pass
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    # Merge initial + follow-up data
+    results: List[Dict] = []
+    for addr, e in initial.items():
+        fps = sorted(followups.get(addr, []), key=lambda x: x.get("elapsed_min", 0))
+        pcts    = [fp["pct"] for fp in fps if "pct" in fp]
+        best    = max(pcts) if pcts else None
+        worst   = min(pcts) if pcts else None
+        latest  = fps[-1] if fps else {}
+        results.append({
+            "ts":      e.get("ts"),
+            "sym":     e.get("sym"),
+            "addr":    addr,
+            "dec":     e.get("dec"),
+            "rsn":     e.get("rsn", ""),
+            "px":      e.get("px", 0),
+            "liq":     e.get("liq", 0),
+            "hype":    e.get("hype"),
+            "age":     e.get("age"),
+            "br":      e.get("br"),
+            "best_pct":    round(best, 1)  if best  is not None else None,
+            "worst_pct":   round(worst, 1) if worst is not None else None,
+            "latest_pct":  round(latest.get("pct", 0), 1) if latest else None,
+            "elapsed_min": latest.get("elapsed_min"),
+            "fp_count":    len(fps),
+        })
+
+    rejected  = [r for r in results if r["dec"] == "rejected"]
+    entered   = [r for r in results if r["dec"] == "entered"]
+    suggested = [r for r in results if r["dec"] == "suggested"]
+
+    def _pct_over(items: List, thr: float) -> Optional[float]:
+        tracked = [r for r in items if r.get("best_pct") is not None]
+        if not tracked:
+            return None
+        return round(len([r for r in tracked if r["best_pct"] > thr]) / len(tracked) * 100, 1)
+
+    # Bucket rejections by filter category
+    CATS = {
+        "hype_low":    lambda r: "hype" in r["rsn"].lower() and "below" in r["rsn"].lower(),
+        "liq_low":     lambda r: "liquid" in r["rsn"].lower() and "below" in r["rsn"].lower(),
+        "liq_high":    lambda r: "liquid" in r["rsn"].lower() and "above" in r["rsn"].lower(),
+        "too_old":     lambda r: "age" in r["rsn"].lower(),
+        "cooldown":    lambda r: "cooldown" in r["rsn"].lower(),
+        "pos_cap":     lambda r: "max open" in r["rsn"].lower(),
+        "anti_churn":  lambda r: "anti-churn" in r["rsn"].lower() or "entered" in r["rsn"].lower(),
+        "buy_ratio":   lambda r: "buy_ratio" in r["rsn"].lower() or "buy ratio" in r["rsn"].lower(),
+        "safety":      lambda r: "safety" in r["rsn"].lower() or "scam" in r["rsn"].lower() or "rug" in r["rsn"].lower(),
+    }
+    by_cat: Dict[str, Dict] = {}
+    for r in rejected:
+        cat = "other"
+        for name, test in CATS.items():
+            try:
+                if test(r):
+                    cat = name
+                    break
+            except Exception:
+                pass
+        bucket = by_cat.setdefault(cat, {"count": 0, "tracked": 0, "o50": 0, "o100": 0, "o500": 0})
+        bucket["count"] += 1
+        bp = r.get("best_pct")
+        if bp is not None:
+            bucket["tracked"] += 1
+            if bp > 50:   bucket["o50"]  += 1
+            if bp > 100:  bucket["o100"] += 1
+            if bp > 500:  bucket["o500"] += 1
+
+    top_misses = sorted(
+        [r for r in rejected if r.get("best_pct") is not None and r["best_pct"] > 20],
+        key=lambda x: x["best_pct"], reverse=True
+    )[:100]
+
+    stats = {
+        "total":      len(results),
+        "entered":    len(entered),
+        "rejected":   len(rejected),
+        "suggested":  len(suggested),
+        "rej_o50_pct":  _pct_over(rejected, 50),
+        "rej_o100_pct": _pct_over(rejected, 100),
+        "ent_o50_pct":  _pct_over(entered,  50),
+        "ent_o100_pct": _pct_over(entered,  100),
+        "by_filter": by_cat,
+    }
+
+    recent = sorted(results, key=lambda x: x.get("ts") or "", reverse=True)[:500]
+    return jsonify({"stats": stats, "top_misses": top_misses, "entries": recent})
+
+
 @app.route("/api/shadow", methods=["POST"])
 @_dash_auth
 def api_set_shadow():
@@ -3124,6 +5072,7 @@ def api_set_moonshot():
     if m not in ("enter", "suggest"):
         return jsonify({"error": "invalid mode"}), 400
     CONFIG["moonshot"]["mode"] = m
+    STATE["moonshot_mode"] = m   # persist across restarts
     return jsonify({"ok": True})
 
 
@@ -3921,13 +5870,19 @@ def scan_candidates():
     # Daily reset at the top of the first tick after midnight
     today = now_utc().date().isoformat()
     if STATE.get("last_daily_reset") != today:
-        STATE["open_today_usd"]  = 0.0
-        STATE["entries_today"]   = {}
-        STATE["recently_exited"] = {}   # clear cooldowns at midnight — fresh day, fresh tokens
-        STATE["reject_cache"]    = {}   # clear reject cache — tokens get a fresh look each day
+        STATE["open_today_usd"]    = 0.0
+        STATE["entries_today"]     = {}
+        STATE["recently_exited"]   = {}   # clear cooldowns at midnight — fresh day, fresh tokens
+        STATE["reject_cache"]      = {}   # clear reject cache — tokens get a fresh look each day
+        STATE["token_pnl_today"]   = {}   # cumulative PnL per symbol today (loss escalation)
         STATE["peak_deployed_usd"] = 0.0
         STATE["peak_open_count"]   = 0
         STATE["last_daily_reset"] = today
+        # Reset daily counters in additional wallets too
+        for w in STATE.get("wallets", {}).values():
+            w["entries_today"]   = {}
+            w["recently_exited"] = {}
+            w["open_today_usd"]  = 0.0
         save_state()
         log("Daily reset: open_today_usd → 0, entries_today cleared, capital peaks reset")
 
@@ -3936,18 +5891,51 @@ def scan_candidates():
     STATE["signals"]["heat"]  = compute_heat(btc_d)
 
     candidates = fetch_new_candidates()
+    log(f"SCAN: {len(candidates)} candidates from feeds (probe_q={len(_PROBE_QUEUE)})")
     if CONFIG["stealth"]["candidate_shuffle"]:
         random.shuffle(candidates)
+
+    # Drain on-chain probed tokens: these were detected at mint time, so their age
+    # is already accurate and they front-run the 8s DexScreener poll.
+    with _ONCHAIN_LOCK:
+        probe_batch, _PROBE_QUEUE[:] = list(_PROBE_QUEUE), []
+    existing_keys = {(c["symbol"], c["chain"]) for c in candidates}
+    for pair in probe_batch:
+        onchain_ts = pair.pop("_onchain_ts", None)
+        if onchain_ts:
+            pair["pairCreatedAt"] = int(onchain_ts * 1000)
+        c = _pair_to_candidate(pair, "sol")
+        if c and (c["symbol"], c["chain"]) not in existing_keys:
+            c["_onchain"] = True
+            candidates.insert(0, c)   # evaluate on-chain finds first
+            existing_keys.add((c["symbol"], c["chain"]))
+
+    # Track symbols entered this scan cycle so duplicate pool addresses for the
+    # same symbol (e.g. two DexScreener pairs for TJR) don't stack two full-size
+    # entries in one pass — that's what caused TJR/BULL to reach $280 deployed
+    # when the per-token cap was supposed to stop them at ~$85.
+    _entered_this_scan: set = set()
+    _wallet_scan_entered: Dict[str, set] = {}  # wid -> set of symbols entered this cycle
 
     for c in candidates:
         symbol = c["symbol"]
         if not symbol or symbol == "?":
             continue  # skip tokens with no symbol — position dict collision risk
+        if symbol in _entered_this_scan:
+            _scout(symbol, c["chain"], "rejected", "duplicate pair in scan — already entered this cycle", None, c.get("address",""))
+            continue
+        # Don't re-enter tokens already in an open position — autoscale handles additions,
+        # not the scanner. Without this the bot stacks a second full-size entry on the next
+        # 20s scan cycle whenever the same hot token reappears in the feed.
+        if STATE["positions"].get(symbol, {}).get("units", 0) > 0:
+            continue
         chain  = c["chain"]
         price  = c["price"]
         liq    = c["liq"]
         sc     = Score(c.get("hype", 0), liq, c["age_min"], c.get("positive", True),
-                       buy_ratio=c.get("buy_ratio"), price=price)
+                       buy_ratio=c.get("buy_ratio"), price=price,
+                       price_chg_m5=c.get("price_chg_m5", 0.0),
+                       price_chg_h1=c.get("price_chg_h1", 0.0))
         is_new = c["age_min"] <= CONFIG["scan"]["new_max_age_min"]
 
         addr = c.get("address", "")
@@ -3955,12 +5943,17 @@ def scan_candidates():
 
         # Reject cache: skip re-evaluation unless price has spiked enough since last reject.
         # Saves API calls and stops the scanner from asking the same question 20+ times.
+        # TTL: safety flags expire after 8 h; liq/generic flags expire after 2 h.
         _rc = STATE.get("reject_cache", {}).get(symbol)
         if _rc and _rc.get("price", 0) > 0 and price > 0:
-            _price_ok = price >= _rc["price"] * _rc.get("threshold", 1.3)
-            _liq_ok   = liq   >= _rc.get("min_liq", 0)
-            if not (_price_ok and _liq_ok):
-                continue   # silent skip — price hasn't spiked enough OR liq still dead
+            _rc_age   = time.time() - _rc.get("ts", 0)
+            _thr = _rc.get("threshold", 1.3)
+            _rc_ttl   = _rc.get("ttl") or (14400 if _thr >= 3.0 else 7200 if _thr >= 2.0 else 600)
+            if _rc_age < _rc_ttl:
+                _price_ok = price >= _rc["price"] * _rc.get("threshold", 1.3)
+                _liq_ok   = liq   >= _rc.get("min_liq", 0)
+                if not (_price_ok and _liq_ok):
+                    continue   # silent skip — price hasn't spiked enough AND cache not expired
 
         # Manual blacklist — never buy these (by symbol or address), dashboard-editable
         bl = {str(x).lower() for x in CONFIG.get("blacklist", [])}
@@ -3985,10 +5978,38 @@ def scan_candidates():
             _rex_elapsed = time.time() - _rex.get("ts", 0)
             _rex_pnl     = _rex.get("pnl", 0)
             _rex_price   = _rex.get("price", 0)
-            if _rex_pnl < 0 and _rex_elapsed < CONFIG["moonshot"].get("loss_cooldown_min", 30) * 60:
-                _scout(symbol, chain, "rejected",
-                       f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, pnl=${_rex_pnl:.2f})", sc, addr)
-                continue
+            if _rex_pnl < 0:
+                # Use the worse of: single trade loss OR cumulative losses today on this token.
+                # Prevents "$4 drain" — bot losing $4 repeatedly on the same token.
+                # e.g. two -$4 trades = -$8 cumulative → escalates to 15-min tier automatically.
+                _cumul_pnl = STATE.get("token_pnl_today", {}).get(symbol, _rex_pnl)
+                _eff_pnl   = min(_rex_pnl, _cumul_pnl)   # whichever is more negative
+                if _eff_pnl <= -50:
+                    # Catastrophic loss ($50+): 8h hard stop. TJR lost $89 then re-entered
+                    # at exactly 4h05m and lost $42 more — the 4h window was too narrow.
+                    if _rex_elapsed < 8 * 3600:
+                        _scout(symbol, chain, "rejected",
+                               f"hard-stop: lost ${abs(_eff_pnl):.0f} here today, paused 8h ({_rex_elapsed/60:.0f}min ago)", sc, addr)
+                        continue
+                elif _eff_pnl <= -30:
+                    # Major loss ($30–50): 4h hard stop.
+                    if _rex_elapsed < 4 * 3600:
+                        _scout(symbol, chain, "rejected",
+                               f"hard-stop: lost ${abs(_eff_pnl):.0f} here today, paused 4h ({_rex_elapsed/60:.0f}min ago)", sc, addr)
+                        continue
+                elif _eff_pnl <= -15:
+                    # Significant loss: 30 min cooldown
+                    if _rex_elapsed < 30 * 60:
+                        _scout(symbol, chain, "rejected",
+                               f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, cumul=${_eff_pnl:.2f})", sc, addr)
+                        continue
+                elif _eff_pnl <= -5:
+                    # Moderate loss: 15 min cooldown
+                    if _rex_elapsed < 15 * 60:
+                        _scout(symbol, chain, "rejected",
+                               f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, cumul=${_eff_pnl:.2f})", sc, addr)
+                        continue
+                # eff_pnl in (-5, 0): no cooldown — small losses re-enter freely
             if _rex_pnl >= 0 and _rex_elapsed < 15 * 60:
                 # Hard minimum: never re-enter within 60s of a profit exit regardless of price.
                 # TOPDOG re-bought 0s after selling — no time for price to have pulled back.
@@ -4006,7 +6027,10 @@ def scan_candidates():
         # Without this, tokens older than new_max_age_min had no per-day entry cap from the scanner.
         entry_cap = CONFIG["modes"].get(CONFIG["mode"], {}).get(
             "max_entries_per_token_day", CONFIG.get("max_entries_per_token_day", 4))
-        if STATE.setdefault("entries_today", {}).get(symbol, 0) >= entry_cap:
+        # Anti-churn cap only blocks re-entries on net-losing tokens.
+        # If the last exit was profitable, no daily cap — keep riding winners.
+        _last_was_win = _rex is not None and _rex.get("pnl", -1) > 0
+        if not _last_was_win and STATE.setdefault("entries_today", {}).get(symbol, 0) >= entry_cap:
             _scout(symbol, chain, "rejected",
                    f"already entered {entry_cap}x today (anti-churn)", sc, addr)
             continue
@@ -4015,6 +6039,36 @@ def scan_candidates():
             if reject:
                 _scout(symbol, chain, "rejected", reject, sc, addr)
                 continue
+
+            # Escalating entry bar: as cumulative losses on this token grow today,
+            # raise the hype/liq/buy_ratio floor before allowing another entry.
+            # Keeps the bot from re-entering the same bad bet with loose filters.
+            _cumul_today = STATE.get("token_pnl_today", {}).get(symbol, 0.0)
+            if _cumul_today <= -15:
+                _bar_hype = 30; _bar_liq_mult = 1.5; _bar_br = 0.58
+            elif _cumul_today <= -5:
+                _bar_hype = 20; _bar_liq_mult = 1.3; _bar_br = 0.52
+            else:
+                _bar_hype = 0; _bar_liq_mult = 1.0; _bar_br = 0.0
+            if _bar_hype > 0:
+                _mode_hype = max(50, CONFIG["moonshot"].get("hype_min", 50))
+                _req_hype  = min(100, _mode_hype + _bar_hype)
+                _mode_liq  = CONFIG["modes"].get(CONFIG["mode"], {}).get("liq_min", CONFIG["moonshot"].get("liq_min", 15000))
+                _req_liq   = _mode_liq * _bar_liq_mult
+                _label     = f"(${abs(_cumul_today):.0f} lost today — raised bar)"
+                if sc.hype < _req_hype:
+                    _scout(symbol, chain, "rejected",
+                           f"hype {sc.hype} below elevated min {_req_hype} {_label}", sc, addr)
+                    continue
+                if sc.liq < _req_liq:
+                    _scout(symbol, chain, "rejected",
+                           f"liq ${sc.liq:,.0f} below elevated min ${_req_liq:,.0f} {_label}", sc, addr)
+                    continue
+                if sc.buy_ratio is not None and sc.buy_ratio < _bar_br:
+                    _scout(symbol, chain, "rejected",
+                           f"buy ratio {sc.buy_ratio*100:.0f}% below elevated min {_bar_br*100:.0f}% {_label}", sc, addr)
+                    continue
+
             # Presale safety gate — for very new tokens score for audit/social signals
             ps_meta = {
                 "audit":     False,
@@ -4032,7 +6086,7 @@ def scan_candidates():
                 _scout(symbol, chain, "rejected", f"presale score {ps} < {ps_threshold} (no social/audit signal)", sc, addr)
                 continue
             # Scam / rug safety gate — on-chain rug checks
-            safe, why = safety_gate(symbol, addr, chain)
+            safe, why = safety_gate(symbol, addr, chain, hype=sc.hype if sc else 0)
             if not safe:
                 log(f"SAFETY GATE {symbol}: {why}")
                 send_alert(
@@ -4042,7 +6096,7 @@ def scan_candidates():
                 continue
             if CONFIG["moonshot"]["mode"] == "enter":
                 usd = size_ticket_usd(chain, hype=sc.hype, buy_ratio=sc.buy_ratio, symbol=symbol)
-                _min_ticket = 10.0 if CONFIG["moonshot"].get("dynamic_sizing") else CONFIG["moonshot"]["min_ticket_usd"]
+                _min_ticket = 10.0 if CONFIG["moonshot"].get("dynamic_sizing") else _mode_min_ticket()
                 if CONFIG["moonshot"].get("dynamic_sizing"):
                     _avail = max(0.0, STATE["vault_usd"] - STATE.get("cur_deployed_usd", 0.0))
                     if _avail < usd * 1.5:
@@ -4050,7 +6104,13 @@ def scan_candidates():
                                f"cash buffer thin (avail ${_avail:.0f} < 1.5× bet ${usd:.0f})", sc, addr)
                         continue
                 if usd >= _min_ticket and est_price_impact(usd, liq) <= CONFIG["moonshot"]["price_impact_max"]:
-                    shadow_buy(symbol, chain, usd, price, liq, addr)
+                    shadow_buy(symbol, chain, usd, price, liq, addr,
+                               entry_m5=sc.price_chg_m5 if sc else None,
+                               entry_br=sc.buy_ratio if sc else None,
+                               entry_hype=sc.hype if sc else None)
+                    _entered_this_scan.add(symbol)
+                    _wallets_offer_entry(symbol, chain, price, liq, addr, _wallet_scan_entered,
+                                         hype=sc.hype, buy_ratio=sc.buy_ratio)
                     STATE["entries_today"][symbol] = STATE["entries_today"].get(symbol, 0) + 1
                     _record({"ev": "entry", "symbol": symbol, "chain": chain, "address": addr,
                              "price": price, "liq": liq, "hype": sc.hype,
@@ -4079,6 +6139,8 @@ def scan_candidates():
                     usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(chain, symbol=symbol))
                     if usd >= CONFIG["moonshot"]["min_ticket_usd"]:
                         shadow_buy(symbol, chain, usd, price, liq, addr)
+                        _entered_this_scan.add(symbol)
+                        _wallets_offer_entry(symbol, chain, price, liq, addr, _wallet_scan_entered)
                         log(f"AUTO-JOIN tiny {symbol} ${usd:.2f}")
                         send_alert(
                             f"⚡ BOUGHT a tiny ${usd:.0f} of {symbol} ({chain}) — an older coin whose "
@@ -4113,6 +6175,7 @@ def scan_candidates():
             usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(w_chain, symbol=sym))
             if usd >= CONFIG["moonshot"]["min_ticket_usd"]:
                 shadow_buy(sym, w_chain, usd, w_price, w_liq, addr)
+                _wallets_offer_entry(sym, w_chain, w_price, w_liq, addr, _wallet_scan_entered)
                 log(f"AUTO-JOIN watchlist {sym} ${usd:.2f}")
                 send_alert(
                     f"⚡ BOUGHT a tiny ${usd:.0f} of {sym} ({w_chain}) — a coin on your watchlist just "
@@ -4146,10 +6209,13 @@ def manage_positions():
         STATE["brake_alerted"] = False
 
     live_prices = fetch_positions_prices()
-    MS          = CONFIG["moonshot"]
     for s, p in list(STATE["positions"].items()):
         if p.get("units", 0) <= 0:
             continue
+        # Use the mode this position was entered under for all exit thresholds.
+        # degen rides wider stops; hype exits fast; safe exits very fast. Each is independent.
+        entry_mode = p.get("entry_mode", CONFIG["mode"])
+        MS         = _effective_ms(entry_mode)
         px        = live_prices.get(s, _px_dict(p.get("avg", 1.0) * 1.02))
         price     = px["price"]
         liq       = px["liq"]
@@ -4181,7 +6247,6 @@ def manage_positions():
         # adds a moon bag = the unsold remainder, which rides a wide trailing stop.
         # Use the mode this position was ENTERED under (locked at buy), so an AI
         # mode-switch mid-trade can't retroactively change its stop-loss/TP.
-        entry_mode = p.get("entry_mode", CONFIG["mode"])
         mode_cfg = CONFIG["modes"].get(entry_mode, CONFIG["modes"][CONFIG["mode"]])
         if p.get("tp_override"):
             ladder = [[t, 0.5] for t in p["tp_override"]]
@@ -4198,13 +6263,13 @@ def manage_positions():
         elif gain_now >= 3.0:                    trail_pct = min(trail_pct, 0.28)
         elif gain_now >= 1.0 and not in_moonbag: trail_pct = min(trail_pct, 0.10)
         elif gain_now >= 0.5 and not in_moonbag: trail_pct = min(trail_pct, 0.12)
+        elif gain_now >= 0.20 and not in_moonbag: trail_pct = min(trail_pct, 0.08)
 
         # ── EXIT PRIORITY ORDER ────────────────────────────────────────────
         exit_reason: Optional[str] = None
 
-        # 0. Hard dollar stop — never lose more than $12 on any single position.
-        #    Fires before everything else. Unrealized loss = current value vs cost.
-        _dollar_stop = CONFIG["moonshot"].get("dollar_stop_usd", 12.0)
+        # 0. Hard dollar stop — fires before everything else.
+        _dollar_stop = _mode_dollar_stop(entry_mode)
         _cur_val     = p.get("units", 0) * price
         _cost        = p.get("deployed_usd", p.get("usd", 0)) or p.get("usd", 0)
         _unrealized  = _cur_val - _cost
@@ -4217,8 +6282,13 @@ def manage_positions():
 
         # 1. Instant rug guard — liq craters in one tick
         prev_liq = STATE["liq_prev"].get(s, liq)
+        liq_drop_pct = (prev_liq - liq) / max(prev_liq, 1) if prev_liq > 0 else 0
         if liq < prev_liq * (1 - MS["rug_liq_drop"]):
             exit_reason = f"RUG liq {prev_liq:.0f}→{liq:.0f}"
+        # Protect profitable positions: exit on a smaller liq drain (15%) when in the green.
+        # No reason to hold through liquidity leaving when you're already up.
+        elif gain_now > 0.05 and liq_drop_pct > 0.15:
+            exit_reason = f"LIQ PROTECT +{gain_now*100:.0f}% gain, liq -{liq_drop_pct*100:.0f}%"
         STATE["liq_prev"][s] = liq
 
         # 2. Velocity exit — sharp price drop signals rug unfolding or panic sell.
@@ -4273,15 +6343,20 @@ def manage_positions():
                 f"{_dex_link(p.get('chain', 'sol'), p.get('address', ''))}", critical=True)
             _add_reentry_watch(s, p, liq, vol_h1, exit_reason)
             STATE["liq_prev"].pop(s, None)
+            STATE.get("vol_dry_alerted", {}).pop(s, None)
+            STATE.get("no_pump_alerted", {}).pop(s, None)
             save_state()
             continue
 
         # 5. Volume dry-up — soft alert only (not a standalone exit)
         entry_vol = p.get("entry_vol_h1", 0)
         if vol_h1 > 0 and entry_vol > 0 and vol_h1 < entry_vol * MS["vol_dry_pct"]:
-            send_alert(
-                f"⚠️ {s} is going quiet — trading volume dropped to ${vol_h1:,.0f} (was ${entry_vol:,.0f} "
-                f"when you bought in). Interest is fading; the bot is watching but not selling yet.")
+            _vda = STATE.setdefault("vol_dry_alerted", {})
+            if time.time() - _vda.get(s, 0) > 1800:  # max once per 30 min per symbol
+                _vda[s] = time.time()
+                send_alert(
+                    f"⚠️ {s} is going quiet — trading volume dropped to ${vol_h1:,.0f} (was ${entry_vol:,.0f} "
+                    f"when you bought in). Interest is fading; the bot is watching but not selling yet.")
 
         # 6. TP ladder — scalp a chunk at each rung, but never sell into the moon bag
         tp_hit        = False
@@ -4322,15 +6397,28 @@ def manage_positions():
             save_state()
             continue
 
-        # No-pump soft flag
-        if p.get("units", 0) > 0 and should_exit_no_pump(entry_ts, time.time(), p["avg"], price, liq):
-            send_alert(
-                f"⏱ {s} has been flat since you bought it — it isn't taking off. Heads-up so you can "
-                f"decide whether to cut it loose; the bot is still holding for now.")
+        # No-pump soft flag — alert at most once per 60 min per symbol
+        if p.get("units", 0) > 0 and should_exit_no_pump(
+                entry_ts, time.time(), p["avg"], price, liq,
+                mode_name=p.get("entry_mode", CONFIG["mode"])):
+            _npa = STATE.setdefault("no_pump_alerted", {})
+            if time.time() - _npa.get(s, 0) > 3600:
+                _npa[s] = time.time()
+                send_alert(
+                    f"⏱ {s} has been flat since you bought it — it isn't taking off. Heads-up so you can "
+                    f"decide whether to cut it loose; the bot is still holding for now.")
 
         # Autoscale after grace
         if p.get("units", 0) > 0 and time.time() - entry_ts >= CONFIG["autoscale"]["grace_sec"]:
             autoscale_maybe(s, p["chain"], price, liq, velocity_ok=(price > p["avg"]))
+
+    # Run the exit loop for each additional wallet
+    for _wid, _wlt in STATE.get("wallets", {}).items():
+        if _wlt.get("active") and _wlt.get("positions"):
+            _manage_wallet_positions(_wid, _wlt, live_prices)
+
+    _manage_arenas(live_prices)
+    _run_price_followup()
 
 
 def engine_once():
@@ -4402,28 +6490,9 @@ def engine_loop():
             except Exception:
                 pass
             last_ai_run = time.time()
-        # Adaptive poll: if any open position is in the danger zone (unrealized loss
-        # already past half the effective stop), switch to 0.5s checks so we catch
-        # rugs before they gap through the full stop.
-        _fast_poll = False
-        if STATE.get("positions"):
-            _mode_sl = CONFIG["modes"].get(CONFIG["mode"], {}).get("sl", 0.12)
-            _dollar_stop = CONFIG["moonshot"].get("dollar_stop_usd", 12.0)
-            for _s, _p in list(STATE["positions"].items()):
-                if _p.get("units", 0) <= 0:
-                    continue
-                _cur_price = _p.get("last_price", _p.get("avg", 0))
-                if _cur_price <= 0 or _p.get("avg", 0) <= 0:
-                    continue
-                _pct_loss = (_p["avg"] - _cur_price) / _p["avg"]
-                _deployed = _p.get("deployed_usd", _p.get("usd", 0)) or _p.get("usd", 0)
-                _eff_stop = max(_dollar_stop, _deployed * 0.10)
-                _unrealized = (_cur_price / _p["avg"] - 1) * _deployed
-                # "red zone": already used more than half the stop budget
-                if _pct_loss > _mode_sl * 0.5 or _unrealized < -(_eff_stop * 0.5):
-                    _fast_poll = True
-                    break
-        time.sleep(0.5 if _fast_poll else CONFIG["scan"].get("position_poll_sec", 3))
+        # Position checks read WS_PRICES (in-memory) — no API cost.
+        # 0.1s = 10 checks/sec; catches gap-downs ~5× faster than 0.5s.
+        time.sleep(0.1)
 
 # ---------------------------------------------------------------------------
 # Startup
@@ -4502,9 +6571,15 @@ def main():
                 CONFIG["mode"] = env_mode
             else:
                 log(f"WARN BOT_MODE='{env_mode}' invalid — keeping '{CONFIG['mode']}'")
-    env_moon = os.getenv("MOONSHOT_MODE", "").strip().lower()
-    if env_moon in ("enter", "suggest"):
-        CONFIG["moonshot"]["mode"] = env_moon
+    # Restore moonshot mode from STATE first (set via dashboard), then fall back to env.
+    saved_moon = STATE.get("moonshot_mode", "")
+    if saved_moon in ("enter", "suggest"):
+        CONFIG["moonshot"]["mode"] = saved_moon
+        log(f"Restored moonshot mode '{saved_moon}' from state")
+    else:
+        env_moon = os.getenv("MOONSHOT_MODE", "").strip().lower()
+        if env_moon in ("enter", "suggest"):
+            CONFIG["moonshot"]["mode"] = env_moon
     # AI auto-pilot on/off survives restarts via env
     if os.getenv("AI_ENABLED", "").strip().lower() in ("1", "true", "on", "yes"):
         CONFIG["ai"]["enabled"] = True
@@ -4540,6 +6615,13 @@ def main():
 
     log(f"Starting (shadow={SHADOW_MODE} mode={CONFIG['mode']})")
     refresh_vault_balance()
+    _load_wallet_keypairs()
+    _start_ws_thread()
+    _start_ws_create_thread()
+    # Re-subscribe open SOL positions that existed before this restart.
+    for sym, p in STATE.get("positions", {}).items():
+        if p.get("chain") == "sol" and p.get("address") and p.get("units", 0) > 0:
+            _ws_add(sym, p["address"])
     start_flask()
     threading.Thread(target=engine_loop, daemon=True).start()
     start_telegram()
