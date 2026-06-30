@@ -112,7 +112,7 @@ CONFIG: Dict[str, Any] = {
         },
         "degen": {
             "tp": [0.80, 1.5], "sl": 0.28, "slip_bps": 220, "liq_min": 15000,
-            "max_age_min": 120, "max_entries_per_token_day": 6, "size_mult": 1.6,
+            "max_age_min": 120, "max_entries_per_token_day": 6, "size_mult": 1.4,
             "no_pump": {"hurdle": 0.03, "min_sec": 240, "max_sec": 900},
             "tp_ladder": [[0.30, 0.20], [0.80, 0.25], [1.50, 0.25]],
             "moonbag_trail_pct": 0.45,
@@ -307,7 +307,10 @@ CONFIG: Dict[str, Any] = {
         "model":          "claude-haiku-4-5",
         "interval_min":   12,      # how often to consult the AI (was 30 — too slow for
                                    # fast memecoin regimes; also event-triggered on drawdown)
-        "min_confidence": 0.6,     # only auto-apply at/above this confidence
+        "min_confidence": 0.7,     # only auto-apply at/above this confidence (raised 0.6→0.7)
+        # Whitelist: AI may ONLY recommend these modes. Keeps it off custom modes with
+        # tight SLs (e.g. "testing 3" at 3% SL produced 0% WR on 63 trades).
+        "allowed_modes":  ["safe", "default", "hype", "degen"],
     },
 }
 
@@ -3759,25 +3762,26 @@ AI_DECISION_SCHEMA = {
 }
 
 AI_SYSTEM = (
-    "You are the risk-mode controller for a multi-chain crypto memecoin scalping bot (paper-trading). "
-    "You pick ONE risk profile for the next ~30 minutes.\n\n"
-    "Modes, least to most aggressive (TP = take-profit targets, SL = stop-loss):\n"
-    "- safe:    TP +15%, SL -7%, needs $50k+ liquidity. CAPS winners early.\n"
-    "- default: TP +28%, SL -12%, $30k+ liquidity.\n"
-    "- hype:    TP +45%/+90%, SL -18%, $20k+ liquidity. Lets winners run further.\n"
-    "- degen:   TP +80%/+150%, SL -28%, $10k+ liquidity. Lets the wildest moonshots run; more rugs.\n\n"
+    "You are the risk-mode controller for a crypto memecoin scalping bot (paper-trading). "
+    "You pick ONE of four builtin risk profiles for the next ~30 minutes.\n\n"
+    "Modes, least to most aggressive (TP = take-profit, SL = stop-loss, liq = min pool liquidity):\n"
+    "- safe:    TP +15%,       SL -7%,  liq $50k+. Smallest bets (0.7×). Strict entry filter. Caps winners early.\n"
+    "- default: TP +28%,       SL -12%, liq $30k+. Standard bets (1.0×). Balanced.\n"
+    "- hype:    TP +45%/+90%,  SL -18%, liq $20k+. Larger bets (1.3×). Lets winners run further.\n"
+    "- degen:   TP +80%/+150%, SL -28%, liq $15k+. Large bets (1.4×). Rides volatility; more rugs.\n\n"
     "CRITICAL — how this strategy makes money: it is ASYMMETRIC. Most trades lose a little, a FEW win big. "
-    "A 40-55% win rate is NORMAL and HEALTHY here — do NOT turn conservative just because win rate looks 'low'. "
-    "What matters is EXPECTANCY (per-trade expected value) and whether big winners are being captured. "
-    "If avg_win is much larger than avg_loss and expectancy is positive, the strategy is working — stay in "
-    "default/hype/degen to LET WINNERS RUN.\n\n"
-    "Beware: 'safe' mode's tight +15% take-profit CAPS the big winners that this strategy depends on, which "
-    "destroys the edge. Only choose 'safe' when expectancy is genuinely NEGATIVE or the drawdown brake is active. "
-    "Otherwise prefer default (balanced) or hype/degen (when momentum is strong and fresh launches are passing). "
-    "Lean MORE aggressive when expectancy is positive and alt momentum is strong; pull back toward 'default' "
-    "(not 'safe') when the market is BTC-dominated or candidates are thin. Per-trade size is capped elsewhere — "
-    "you ONLY choose the risk profile; you cannot oversize.\n\n"
-    "Return strict JSON: recommended_mode, confidence (0-1), aggressive (bool), one-sentence reasoning."
+    "A 40-55% win rate is NORMAL and HEALTHY — do NOT go conservative just because win rate looks low. "
+    "What matters is EXPECTANCY. If avg_win >> avg_loss and expectancy is positive, stay in hype/degen.\n\n"
+    "Read exit_reason_breakdown carefully:\n"
+    "- high fixed_sl rate + low avg_loss → noise stops (SL too tight for the market, move to hype/degen)\n"
+    "- high dollar_stop rate + big avg_loss → rug events on thin tokens (liq filter helps; stay hype/degen)\n"
+    "- low TP_hit rate → entries too early or market weak (consider default/safe)\n"
+    "- positive expectancy + any win rate → stay aggressive\n\n"
+    "'safe' mode's +15% TP CAPS the big winners this strategy depends on. Only choose 'safe' when "
+    "expectancy is genuinely negative AND it's not explained by noise stops. "
+    "Otherwise prefer default or hype/degen. Pull back to 'default' (not 'safe') when market is BTC-dominated "
+    "or candidates are thin.\n\n"
+    "Return strict JSON only: {recommended_mode, confidence (0-1), aggressive (bool), reasoning (one sentence)}"
 )
 
 
@@ -3789,6 +3793,37 @@ def _scout_reason_summary(n: int = 40) -> Dict[str, int]:
     return out
 
 
+def _ai_exit_breakdown(n: int = 50) -> Dict[str, Any]:
+    """Summarize recent exit reasons so the AI understands WHY trades are winning/losing."""
+    log_list = STATE.get("trade_log", [])
+    recent_sells = [r for r in log_list if r.get("side") == "sell"][-n:]
+    breakdown: Dict[str, Dict] = {}
+    for r in recent_sells:
+        reason_raw = r.get("exit_reason", "unknown") or "unknown"
+        # Bucket into clean categories
+        if reason_raw.startswith("TP"):
+            key = "TP_hit"
+        elif reason_raw.startswith("RUG"):
+            key = "RUG_guard"
+        elif reason_raw.startswith("fixed_sl"):
+            key = "fixed_sl"
+        elif reason_raw.startswith("DOLLAR STOP"):
+            key = "dollar_stop"
+        elif reason_raw.startswith("VELOCITY"):
+            key = "velocity"
+        elif reason_raw.startswith("TRAIL"):
+            key = "trail_stop"
+        else:
+            key = "other"
+        b = breakdown.setdefault(key, {"count": 0, "total_pnl": 0.0})
+        b["count"] += 1
+        b["total_pnl"] = round(b["total_pnl"] + (r.get("pnl") or 0), 2)
+    # Add avg_pnl per bucket
+    for b in breakdown.values():
+        b["avg_pnl"] = round(b["total_pnl"] / b["count"], 2) if b["count"] else 0
+    return breakdown
+
+
 def _ai_market_context() -> Dict[str, Any]:
     hist     = STATE.get("pnl_hist", [])[-30:]
     wins_l   = [x for x in hist if x > 0]
@@ -3796,25 +3831,26 @@ def _ai_market_context() -> Dict[str, Any]:
     wr       = (len(wins_l) / len(hist)) if hist else 0.0
     avg_win  = (sum(wins_l) / len(wins_l)) if wins_l else 0.0
     avg_loss = (sum(losses_l) / len(losses_l)) if losses_l else 0.0
-    expectancy = wr * avg_win + (1 - wr) * avg_loss   # expected $ per trade
+    expectancy = wr * avg_win + (1 - wr) * avg_loss
     return {
-        "current_mode":     CONFIG["mode"],
-        "btc_dominance":    STATE["signals"].get("btc_d"),
-        "market_heat":      STATE["signals"].get("heat"),
-        "vault_usd":        round(STATE.get("vault_usd", 0), 2),
-        "vault_start":      round(STATE.get("vault_start", 0), 2),
-        "take_home_usd":    round(STATE.get("take_home_usd", 0), 2),
-        "take_home_log":    (STATE.get("take_home_log") or [])[-20:],
-        "open_positions":   sum(1 for p in STATE.get("positions", {}).values() if p.get("units", 0) > 0),
-        "recent_trades":    len(hist),
-        "recent_win_rate":  round(wr, 2),
-        "avg_win":          round(avg_win, 2),
-        "avg_loss":         round(avg_loss, 2),
-        "expectancy_per_trade": round(expectancy, 2),   # positive = profitable even at low win rate
+        "current_mode":         CONFIG["mode"],
+        "allowed_modes":        CONFIG["ai"].get("allowed_modes", ["safe", "default", "hype", "degen"]),
+        "btc_dominance":        STATE["signals"].get("btc_d"),
+        "market_heat":          STATE["signals"].get("heat"),
+        "vault_usd":            round(STATE.get("vault_usd", 0), 2),
+        "vault_start":          round(STATE.get("vault_start", 0), 2),
+        "take_home_usd":        round(STATE.get("take_home_usd", 0), 2),
+        "open_positions":       sum(1 for p in STATE.get("positions", {}).values() if p.get("units", 0) > 0),
+        "recent_trades":        len(hist),
+        "recent_win_rate":      round(wr, 2),
+        "avg_win":              round(avg_win, 2),
+        "avg_loss":             round(avg_loss, 2),
+        "expectancy_per_trade": round(expectancy, 2),
         "biggest_recent_win":   round(max(hist), 2) if hist else 0,
-        "recent_pnl":       round(sum(hist), 2),
-        "scout_last_40":    _scout_reason_summary(40),
-        "drawdown_brake":   drawdown_brake_active(),
+        "recent_pnl":           round(sum(hist), 2),
+        "exit_reason_breakdown": _ai_exit_breakdown(50),
+        "scout_last_40":        _scout_reason_summary(40),
+        "drawdown_brake":       drawdown_brake_active(),
     }
 
 
@@ -3861,9 +3897,17 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
         del aistate["history"][:len(aistate["history"]) - 100]
 
     rec = decision["recommended_mode"]
+    _allowed = A.get("allowed_modes", ["safe", "default", "hype", "degen"])
+    # Enforce whitelist — AI must not switch into custom modes with unknown/tight SL params
+    if rec not in _allowed:
+        log(f"AI recommended '{rec}' but it's not in allowed_modes {_allowed} — ignored")
+        rec = CONFIG["mode"]   # stay put
+        decision["recommended_mode"] = rec
+        decision["applied"] = False
+        return decision
     applied = False
     if (A.get("auto_apply") and rec in CONFIG["modes"]
-            and rec != CONFIG["mode"] and decision["confidence"] >= A.get("min_confidence", 0.6)):
+            and rec != CONFIG["mode"] and decision["confidence"] >= A.get("min_confidence", 0.7)):
         old = CONFIG["mode"]
         CONFIG["mode"] = rec
         STATE["active_mode"] = rec
