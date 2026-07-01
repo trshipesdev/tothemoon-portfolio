@@ -5140,6 +5140,9 @@ def api_wallets_list():
             "open_positions": len(open_pos),
             "open_pos_names": list(open_pos.keys()),
             "created":      w.get("created", ""),
+            "take_home_usd":  round(w.get("take_home_usd", 0.0), 2),
+            "total_swept_usd": round(w.get("total_swept_usd", 0.0), 2),
+            "sweep_log":    (w.get("sweep_log") or [])[-20:],
         }
     return jsonify(result)
 
