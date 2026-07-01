@@ -3108,23 +3108,18 @@ def refresh_vault_balance():
 # ---------------------------------------------------------------------------
 # Take-home tracker — bank 50% of big wins above the vault baseline
 # ---------------------------------------------------------------------------
-_TAKE_HOME_MIN_PNL  = 40.0  # only trigger on big wins > $40
+_TAKE_HOME_MIN_PNL  = 15.0  # bank 50% of any win >= $15
 _TAKE_HOME_PCT      = 0.50  # fraction of that trade's PnL to bank
 
 def _maybe_take_home(symbol: str, pnl: float):
-    """After a profitable sell: if pnl is big enough AND vault > baseline,
-    move 50% of the trade profit to the take-home tracker and shrink the vault.
-    This banks real gains so they don't get re-risked."""
+    """After a profitable sell: if pnl >= $15, move 50% to the take-home tracker.
+    No vault-vs-baseline gate — bank gains regardless of overall vault level."""
     if pnl < _TAKE_HOME_MIN_PNL:
         return
-    vault   = STATE["vault_usd"]
-    baseline = STATE.get("vault_start", vault)
-    if vault <= baseline:
-        return   # still below starting point overall — nothing to bank yet
     amount = round(pnl * _TAKE_HOME_PCT, 2)
     if amount < 1.0:
         return
-    STATE["vault_usd"]    = round(vault - amount, 4)
+    STATE["vault_usd"]    = round(STATE["vault_usd"] - amount, 4)
     STATE["take_home_usd"] = round(STATE.get("take_home_usd", 0.0) + amount, 2)
     log_list = STATE.setdefault("take_home_log", [])
     log_list.append({
