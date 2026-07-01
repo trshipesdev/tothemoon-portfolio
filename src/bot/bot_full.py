@@ -2560,13 +2560,15 @@ def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
             })
             save_state()
             return
-        filled = result["price"]
-        units  = result["units"]
-        log(f"[W:{wid}] LIVE BUY {symbol} sig={result.get('sig','')[:16]}…")
+        filled   = result["price"]
+        units    = result["units"]
+        _buy_sig = result.get("sig", "")
+        log(f"[W:{wid}] LIVE BUY {symbol} sig={_buy_sig[:16]}…")
     else:
-        slip   = _jitter_slip(0.5 * est_price_impact(usd, liq))
-        filled = price * (1 + slip)
-        units  = usd / filled
+        slip     = _jitter_slip(0.5 * est_price_impact(usd, liq))
+        filled   = price * (1 + slip)
+        units    = usd / filled
+        _buy_sig = ""
     mode_name    = w.get("mode") or CONFIG["mode"]
     pos = w["positions"].setdefault(symbol, {
         "chain": chain, "units": 0.0, "usd": 0.0, "avg": 0.0,
@@ -2593,6 +2595,7 @@ def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
         "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
         "side": "buy", "usd": usd, "price": filled, "units": units,
         "gas": gas, "address": addr, "pnl": None, "mode": mode_name,
+        "sig": _buy_sig,
     }
     w.setdefault("trade_log", []).append(entry)
     log(f"[W:{wid}] BUY {symbol} ${usd:.2f} @ {filled:.6f}")
@@ -2620,7 +2623,10 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         # Use actual proceeds to derive the effective exit price
         units_sold = result.get("units_sold", pos["units"])
         price      = result["proceeds"] / units_sold if units_sold else price
-        log(f"[W:{wid}] LIVE SELL {symbol} sig={result.get('sig','')[:16]}…")
+        _sell_sig  = result.get("sig", "")
+        log(f"[W:{wid}] LIVE SELL {symbol} sig={_sell_sig[:16]}…")
+    else:
+        _sell_sig  = ""
     deployed = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
     # Full exit by default; partial exit if sell_usd provided
     if sell_usd and sell_usd < pos["usd"] * 0.99:
@@ -2664,6 +2670,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         "pnl": pnl, "exit_reason": exit_reason,
         "entry_price": pos.get("avg", 0) if pos else 0,
         "mode": (pos.get("entry_mode") if pos else None) or w.get("mode") or CONFIG["mode"],
+        "sig": _sell_sig,
     }
     w.setdefault("trade_log", []).append(sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")

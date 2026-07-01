@@ -1680,14 +1680,30 @@
                           class="font-mono w-16 text-right"
                           x-text="(t.pnl != null ? ((t.pnl >= 0 ? '+$' : '-$') + Math.abs(t.pnl).toFixed(2)) : '—')"></span>
                     <span class="text-gray-500 truncate flex-1" x-text="t.exit_reason || ''"></span>
-                    <span class="text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+                    <template x-if="t.sig">
+                      <a :href="'https://solscan.io/tx/' + t.sig" target="_blank"
+                         class="text-indigo-500 hover:text-indigo-300 font-mono shrink-0"
+                         x-text="t.sig.slice(0,8) + '…'" title="View on Solscan"></a>
+                    </template>
+                    <template x-if="!t.sig">
+                      <span class="text-red-700 font-semibold shrink-0 text-xs">UNVERIFIED</span>
+                    </template>
+                    <span class="text-gray-600 shrink-0" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
                   </div>
                   <!-- buy row -->
                   <div x-show="t.side === 'buy'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-gray-800/40 text-xs border-l-2 border-blue-900">
                     <span class="text-gray-500 w-14 truncate" x-text="t.symbol"></span>
                     <span class="text-blue-500 font-mono w-16 text-right" x-text="'in $' + (t.usd || 0).toFixed(2)"></span>
                     <span class="text-gray-700 flex-1">entry</span>
-                    <span class="text-gray-700" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+                    <template x-if="t.sig">
+                      <a :href="'https://solscan.io/tx/' + t.sig" target="_blank"
+                         class="text-indigo-500 hover:text-indigo-300 font-mono shrink-0"
+                         x-text="t.sig.slice(0,8) + '…'" title="View on Solscan"></a>
+                    </template>
+                    <template x-if="!t.sig">
+                      <span class="text-red-700 font-semibold shrink-0 text-xs">UNVERIFIED</span>
+                    </template>
+                    <span class="text-gray-700 shrink-0" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
                   </div>
                   <!-- buy failed row -->
                   <div x-show="t.side === 'buy_failed'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-red-950/40 text-xs border-l-2 border-red-700">
