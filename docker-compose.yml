@@ -8,6 +8,11 @@ services:
     volumes:
       # Persist state between container restarts
       - ./data:/app/data
+    # Oracle VCN DNS (169.254.169.254) can't resolve .ag TLD (Jupiter API).
+    # Force Google + Cloudflare DNS so quote-api.jup.ag resolves correctly.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     # Flask status endpoint — remove or restrict if exposed publicly
     ports:
       - "127.0.0.1:8787:8787"
