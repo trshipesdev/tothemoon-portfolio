@@ -487,8 +487,11 @@ def _load_tradelog_file() -> List[Dict]:
 
 def save_state():
     try:
+        # Exclude trade_log — it's always rebuilt from trades.jsonl on load_state(),
+        # so persisting it only bloats state.json (was growing to 300k+ lines).
+        payload = {k: v for k, v in STATE.items() if k != "trade_log"}
         with open(SAVEFILE, "w") as f:
-            json.dump(STATE, f, indent=2, default=str)
+            json.dump(payload, f, indent=2, default=str)
     except Exception as e:
         log(f"WARN save_state failed: {e}")
 
@@ -1823,8 +1826,6 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
     }
     tl = STATE.setdefault("trade_log", [])
     tl.append(_trade_entry)
-    if len(tl) > 500:
-        del tl[:len(tl) - 500]
     _append_trade(_trade_entry)
     if is_new_pos:
         _arena_enter(symbol, chain, filled_price)
@@ -1926,8 +1927,6 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
     }
     tl = STATE.setdefault("trade_log", [])
     tl.append(_trade_entry)
-    if len(tl) > 500:
-        del tl[:len(tl) - 500]
     _append_trade(_trade_entry)
     # Purge a fully-closed position so its empty shell doesn't linger in the
     # positions dict and count against the max-open-positions cap (which had jammed
@@ -6326,8 +6325,22 @@ def manage_positions():
         # 0. Hard dollar stop — fires before everything else.
         _dollar_stop = _mode_dollar_stop(entry_mode)
         _cur_val     = p.get("units", 0) * price
-        _cost        = p.get("deployed_usd", p.get("usd", 0)) or p.get("usd", 0)
+        # Use p["usd"] (cost basis of REMAINING units, reduced on each partial sell)
+        # NOT deployed_usd (which only resets at full close). Using deployed_usd caused
+        # dollar_stop to fire after every TP rung because the moon-bag's current value
+        # was compared against the full original cost → looked like a massive loss → 19k
+        # ghost sells in one BITBOY trade.
+        _cost        = p.get("usd", 0) or 1e-9
         _unrealized  = _cur_val - _cost
+        # Ghost-position guard: if remaining value is < $0.01, the position is effectively
+        # closed (floating-point dust after sequential partial TP sells). Purge it now
+        # rather than letting dollar_stop fire on it every 0.1s forever.
+        if _cur_val < 0.01:
+            STATE["positions"].pop(s, None)
+            STATE["cur_deployed_usd"] = sum(
+                q.get("usd", 0.0) for q in STATE["positions"].values() if q.get("units", 0) > 0
+            )
+            continue
         # Scale the stop with position size: $12 floor, 10% ceiling.
         # A $40 entry stops at $12 (30%); a $400 scaled position stops at $40 (10%).
         # Flat $12 on large positions would fire on a 2-3% sneeze and kill runners.
