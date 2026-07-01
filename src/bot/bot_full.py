@@ -696,11 +696,13 @@ def _ws_remove(symbol: str):
 
 async def _ws_loop():
     import websockets  # type: ignore
+    _backoff = 5
     while True:
         try:
             async with websockets.connect(
                 SOL_WSS_URL, ping_interval=20, ping_timeout=30, max_size=10_000_000
             ) as ws:
+                _backoff = 5  # reset on successful connect
                 log(f"WS: connected to {SOL_WSS_URL}")
                 sub_to_sym: Dict[int, str] = {}   # subscription_id -> symbol
                 pending: Dict[int, str]    = {}   # req_id -> symbol (awaiting sub confirm)
@@ -772,8 +774,9 @@ async def _ws_loop():
                         last_sync = time.time()
 
         except Exception as e:
-            log(f"WS: error — {e}; reconnecting in 5s")
-            await asyncio.sleep(5)
+            log(f"WS: error — {e}; reconnecting in {_backoff}s")
+            await asyncio.sleep(_backoff)
+            _backoff = min(_backoff * 2, 60)
 
 
 def _ws_thread_fn():
@@ -895,11 +898,15 @@ def _probe_new_token(mint: str, symbol: str):
 async def _ws_create_loop():
     """Subscribe to Pump.fun program logs to detect new token creation in real time."""
     import websockets
+    # Stagger startup so _ws_loop and _ws_create_loop don't hit the RPC simultaneously.
+    await asyncio.sleep(15)
+    _backoff = 5
     while True:
         try:
             async with websockets.connect(
                 SOL_WSS_URL, ping_interval=20, ping_timeout=30, max_size=10_000_000
             ) as ws:
+                _backoff = 5  # reset on successful connect
                 log("WS-create: connected, subscribing to Pump.fun log events")
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0", "id": 1,
@@ -920,8 +927,9 @@ async def _ws_create_loop():
                                 _on_pumpfun_create(ev)
                                 break
         except Exception as e:
-            log(f"WS-create: error — {e}; reconnecting in 5s")
-            await asyncio.sleep(5)
+            log(f"WS-create: error — {e}; reconnecting in {_backoff}s")
+            await asyncio.sleep(_backoff)
+            _backoff = min(_backoff * 2, 60)
 
 
 def _ws_create_thread_fn():
