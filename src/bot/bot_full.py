@@ -2392,6 +2392,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     w.setdefault("trade_log", []).append(sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
     _wallet_drawdown_check(wid, w)
+    _wlt_take_home(wid, w, pnl)
     _wlt_maybe_sweep(wid, w)
     save_state()
 
@@ -3408,8 +3409,49 @@ def _maybe_sweep():
         log(f"SWEEP FAILED: {e}")
 
 
+_WLT_TAKE_HOME_MIN_PNL = 15.0
+_WLT_TAKE_HOME_PCT     = 0.50
+
+def _wlt_take_home(wid: str, w: Dict, pnl: float):
+    """On any live wallet sell with pnl >= $15, immediately sweep 50% of the profit
+    to the cold wallet. Mirrors the main bot's _maybe_take_home logic but sends on-chain
+    rather than tracking in a counter."""
+    if not w.get("live"):
+        return
+    if pnl < _WLT_TAKE_HOME_MIN_PNL:
+        return
+    cold_addr = (w.get("sweep_address") or os.getenv("SWEEP_SOL_ADDRESS", "")).strip()
+    if not cold_addr:
+        return
+    amount = round(pnl * _WLT_TAKE_HOME_PCT, 2)
+    if amount < 1.0:
+        return
+    kp = _wallet_keypairs.get(wid)
+    if not kp:
+        log(f"[W:{wid}] TAKE_HOME SKIPPED — no keypair loaded")
+        return
+    try:
+        sig = _sweep_usdc_sol(amount, cold_addr, kp=kp)
+        w["vault_usd"]      = round(w.get("vault_usd", 0.0) - amount, 4)
+        w["take_home_usd"]  = round(w.get("take_home_usd", 0.0) + amount, 2)
+        entry = {
+            "ts": now_utc().isoformat(), "amount_usd": amount,
+            "pnl": pnl, "to": cold_addr, "sig": sig, "type": "take_home",
+        }
+        w.setdefault("sweep_log", []).append(entry)
+        w["total_swept_usd"] = round(w.get("total_swept_usd", 0.0) + amount, 2)
+        log(f"[W:{wid}] TAKE_HOME ${amount:.2f} (50% of ${pnl:.2f} win) → {cold_addr[:8]}… sig={sig[:16]}…")
+        send_alert(
+            f"💸 TAKE HOME — {w.get('label', wid)}\n"
+            f"Win: +${pnl:.2f} → banking ${amount:.2f} (50%) to cold wallet.\n"
+            f"Sig: {sig[:20]}…")
+    except Exception as e:
+        log(f"[W:{wid}] TAKE_HOME FAILED: {e}")
+
+
 def _wlt_maybe_sweep(wid: str, w: Dict):
     """After a live wallet sell: if vault_usd > sweep threshold, send excess USDC to cold wallet.
+    This is a balance-floor sweep — catches accumulated profits that didn't trigger take_home.
     Uses the wallet's own keypair — not the main bot's key."""
     if not w.get("live"):
         return
@@ -3433,7 +3475,7 @@ def _wlt_maybe_sweep(wid: str, w: Dict):
         w["vault_usd"] = round(w["vault_usd"] - amount, 4)
         entry = {
             "ts": now_utc().isoformat(), "amount_usd": amount,
-            "to": cold_addr, "sig": sig,
+            "to": cold_addr, "sig": sig, "type": "sweep",
         }
         w.setdefault("sweep_log", []).append(entry)
         w["total_swept_usd"] = round(w.get("total_swept_usd", 0.0) + amount, 2)
