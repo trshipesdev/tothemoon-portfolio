@@ -148,37 +148,36 @@
                       x-text="(wallets[wid]?.address || '').slice(0,8) + '…'"></span>
               </div>
               <div class="grid grid-cols-3 gap-2 text-center mb-3">
+                <!-- Hot vault: paper + live SOL -->
                 <div class="bg-gray-800 rounded-lg p-2">
                   <div class="text-gray-500 text-xs mb-0.5">Vault</div>
                   <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.vault_usd ?? 0)"></div>
+                  <div class="text-blue-400 text-xs font-mono mt-0.5"
+                       x-show="(wallets[wid]?.on_chain_usd ?? 0) > 0"
+                       x-text="'◎ $' + fmt(wallets[wid]?.on_chain_usd ?? 0)"></div>
                 </div>
                 <div class="bg-gray-800 rounded-lg p-2">
                   <div class="text-gray-500 text-xs mb-0.5">In positions</div>
                   <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.open_pos_usd ?? 0)"></div>
                 </div>
+                <!-- Cold wallet: swept + live SOL -->
                 <div class="bg-emerald-950 border border-emerald-800/40 rounded-lg p-2">
-                  <div class="text-emerald-500 text-xs mb-0.5">→ Cold wallet</div>
+                  <div class="text-emerald-500 text-xs mb-0.5">→ Cold</div>
                   <div class="font-bold text-sm text-emerald-400"
-                       x-text="'$' + fmt(wallets[wid]?.take_home_usd ?? 0)"></div>
+                       x-text="'$' + fmt(wallets[wid]?.total_swept_usd ?? 0)"></div>
+                  <div class="text-blue-400 text-xs font-mono mt-0.5"
+                       x-show="(wallets[wid]?.cold_balance_usd ?? 0) > 0"
+                       x-text="'◎ $' + fmt(wallets[wid]?.cold_balance_usd ?? 0)"></div>
                 </div>
               </div>
-              <!-- Cold wallet on-chain balance check -->
-              <div x-show="wallets[wid]?.sweep_address" class="border-t border-gray-800 pt-3 flex items-center justify-between">
+              <!-- Cold wallet address row -->
+              <div x-show="wallets[wid]?.sweep_address" class="border-t border-gray-800 pt-2 flex items-center justify-between">
                 <div class="text-xs text-gray-500">
                   Cold: <span class="font-mono text-gray-400"
                               x-text="(wallets[wid]?.sweep_address || '').slice(0,10)+'…'"></span>
                 </div>
-                <div class="flex items-center gap-2">
-                  <span x-show="coldBalance[wid]?.balance_usdc != null"
-                        class="text-xs font-bold text-green-400"
-                        x-text="'$' + (coldBalance[wid]?.balance_usdc ?? 0).toFixed(2) + ' USDC on-chain'"></span>
-                  <span x-show="coldBalance[wid]?.error"
-                        class="text-xs text-red-400" x-text="coldBalance[wid]?.error"></span>
-                  <button @click="fetchColdBalance(wid)"
-                          :disabled="coldBalance[wid]?.loading"
-                          class="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 disabled:opacity-50">
-                    <span x-text="coldBalance[wid]?.loading ? '…' : (coldBalance[wid]?.balance_usdc != null ? '↻ refresh' : 'Check balance')"></span>
-                  </button>
+                <div x-show="(wallets[wid]?.cold_balance_sol ?? 0) > 0" class="text-xs text-gray-400">
+                  <span x-text="(wallets[wid]?.cold_balance_sol ?? 0).toFixed(4)"></span> SOL
                 </div>
               </div>
             </div>
@@ -1440,6 +1439,7 @@
               <div>
                 <div class="text-xs text-gray-500">Vault</div>
                 <div class="font-mono font-semibold" :class="w.vault_usd >= w.starting_usd ? 'text-green-400' : 'text-red-400'" x-text="'$'+w.vault_usd.toFixed(2)"></div>
+                <div class="font-mono text-blue-400 text-xs" x-show="(w.on_chain_usd??0)>0" x-text="'◎ $'+(w.on_chain_usd??0).toFixed(2)"></div>
               </div>
               <div>
                 <div class="text-xs text-gray-500">In positions</div>
@@ -1450,8 +1450,9 @@
                 <div class="font-mono" :class="w.net_pnl >= 0 ? 'text-green-400' : 'text-red-400'" x-text="(w.net_pnl >= 0 ? '+' : '') + '$' + w.net_pnl.toFixed(2)"></div>
               </div>
               <div>
-                <div class="text-xs text-gray-500">Banked</div>
-                <div class="font-mono text-emerald-400" x-text="'$'+(w.take_home_usd??0).toFixed(2)"></div>
+                <div class="text-xs text-gray-500">→ Cold</div>
+                <div class="font-mono text-emerald-400" x-text="'$'+(w.total_swept_usd??0).toFixed(2)"></div>
+                <div class="font-mono text-blue-400 text-xs" x-show="(w.cold_balance_usd??0)>0" x-text="'◎ $'+(w.cold_balance_usd??0).toFixed(2)"></div>
               </div>
               <div>
                 <div class="text-xs text-gray-500">Trades</div>

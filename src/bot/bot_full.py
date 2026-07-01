@@ -624,6 +624,7 @@ _ws_thread_obj: Optional[threading.Thread] = None
 _SOL_USD: Dict[str, Any] = {"price": 0.0, "ts": 0.0}
 _SOL_PRICE_HIST: List[Tuple[float, float]] = []           # (unix_ts, price_usd)
 _SOL_ALERT_LAST: Dict[str, float] = {"crash": 0.0, "pump": 0.0}
+_CHAIN_BAL_CACHE: Dict[str, Dict] = {}   # address -> {usd, sol, ts}  (60s TTL)
 
 
 def _sol_usd_cached() -> float:
@@ -641,6 +642,113 @@ def _sol_usd_cached() -> float:
         except Exception:
             pass
     return _SOL_USD["price"] or 180.0
+
+
+def _chain_bal_usd(address: str, ttl: float = 60.0) -> Dict:
+    """Return {sol, usd} for a Solana address, cached for ttl seconds."""
+    cached = _CHAIN_BAL_CACHE.get(address, {})
+    if cached and time.time() - cached.get("ts", 0) < ttl:
+        return cached
+    try:
+        sol = _fetch_sol_native(address)
+        usd = round(sol * _sol_usd_cached(), 2)
+        entry = {"sol": round(sol, 6), "usd": usd, "ts": time.time()}
+        _CHAIN_BAL_CACHE[address] = entry
+        return entry
+    except Exception:
+        return cached or {"sol": 0.0, "usd": 0.0, "ts": 0.0}
+
+
+def _sweep_sol_native(amount_sol: float, cold_address: str, kp) -> str:
+    """Transfer native SOL from kp's wallet to cold_address. Returns tx signature."""
+    import base64, struct
+    from solders.pubkey import Pubkey          # type: ignore
+    from solders.instruction import AccountMeta, Instruction  # type: ignore
+    from solders.message import MessageV0      # type: ignore
+    from solders.transaction import VersionedTransaction  # type: ignore
+    from solders.hash import Hash              # type: ignore
+
+    lamports = int(amount_sol * 1e9)
+    from_pk  = kp.pubkey()
+    to_pk    = Pubkey.from_string(cold_address)
+    sys_pk   = Pubkey.from_string(_SOL_SYSTEM_PROG)
+
+    # System Program Transfer instruction (index 2)
+    transfer_ix = Instruction(
+        program_id=sys_pk,
+        accounts=[
+            AccountMeta(pubkey=from_pk, is_signer=True,  is_writable=True),
+            AccountMeta(pubkey=to_pk,   is_signer=False, is_writable=True),
+        ],
+        data=struct.pack("<IQ", 2, lamports),
+    )
+
+    rpc = _sol_rpc()
+    bh  = requests.post(rpc, json={
+        "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
+        "params": [{"commitment": "finalized"}],
+    }, timeout=10).json()["result"]["value"]["blockhash"]
+
+    msg = MessageV0.try_compile(
+        payer=from_pk,
+        instructions=[transfer_ix],
+        address_lookup_table_accounts=[],
+        recent_blockhash=Hash.from_string(bh),
+    )
+    tx      = VersionedTransaction(msg, [kp])
+    encoded = base64.b64encode(bytes(tx)).decode()
+
+    resp = requests.post(rpc, json={
+        "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+        "params": [encoded, {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}],
+    }, timeout=20).json()
+    if "error" in resp:
+        raise RuntimeError(resp["error"])
+    return resp["result"]
+
+
+def _wlt_tiered_sweep(wid: str, w: Dict, pnl: float):
+    """On a winning live sell, sweep a tier-based % of profit to cold wallet in native SOL.
+    < $10: no sweep    $10-30: 25%    > $30: 40%
+    """
+    if pnl <= 0:
+        return
+    cold_addr = (w.get("sweep_address") or os.getenv("SWEEP_SOL_ADDRESS", "")).strip()
+    if not cold_addr:
+        return
+    kp = _wallet_keypairs.get(wid)
+    if not kp:
+        return
+    if pnl >= 30:
+        pct = 0.40
+    elif pnl >= 10:
+        pct = 0.25
+    else:
+        return  # small win — keep it all
+
+    amount_usd = round(pnl * pct, 2)
+    sol_price  = max(_sol_usd_cached(), 1e-9)
+    amount_sol = amount_usd / sol_price
+
+    try:
+        sig = _sweep_sol_native(amount_sol, cold_addr, kp)
+        w["total_swept_usd"] = round(w.get("total_swept_usd", 0.0) + amount_usd, 2)
+        w.setdefault("sweep_log", []).append({
+            "ts": now_utc().isoformat(), "amount_usd": amount_usd,
+            "amount_sol": round(amount_sol, 6), "pnl": pnl,
+            "pct": int(pct * 100), "to": cold_addr, "sig": sig, "type": "tiered_sweep",
+        })
+        log(f"[W:{wid}] SWEEP {int(pct*100)}% of ${pnl:.2f} win → {amount_sol:.4f} SOL ({cold_addr[:8]}…) sig={sig[:16]}…")
+        send_alert(
+            f"💸 Cold sweep — {w.get('label', wid)}\n"
+            f"{int(pct*100)}% of ${pnl:.2f} win = {amount_sol:.4f} SOL (${amount_usd:.2f})\n"
+            f"→ {cold_addr[:8]}…",
+            critical=False,
+        )
+        # Invalidate chain balance cache so dashboard refreshes
+        _CHAIN_BAL_CACHE.pop(cold_addr, None)
+    except Exception as e:
+        log(f"[W:{wid}] SWEEP FAILED: {e}")
 
 
 def _sol_monitor_loop():
@@ -2480,6 +2588,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     w.setdefault("trade_log", []).append(sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
     _wallet_drawdown_check(wid, w)
+    _wlt_tiered_sweep(wid, w, pnl)
     save_state()
 
 
@@ -5210,6 +5319,10 @@ def api_wallets_list():
         net_pnl  = sum(t.get("pnl") or 0 for t in sells)
         floor_pct    = CONFIG.get("absolute_floor_pct", 0.25)
         at_floor     = w.get("vault_usd", 0) <= w.get("starting_usd", 1) * floor_pct
+        hot_addr     = w.get("address", "")
+        cold_addr    = (w.get("sweep_address") or os.getenv("SWEEP_SOL_ADDRESS", "")).strip()
+        on_chain     = _chain_bal_usd(hot_addr).get("usd", 0.0) if hot_addr else 0.0
+        cold_on_chain = _chain_bal_usd(cold_addr) if cold_addr else {}
         result[wid] = {
             "wid":          wid,
             "label":        w.get("label", wid),
@@ -5232,9 +5345,12 @@ def api_wallets_list():
             "open_pos_names": list(open_pos.keys()),
             "open_pos_usd":  round(sum(p.get("usd", 0) for p in open_pos.values()), 2),
             "created":      w.get("created", ""),
-            "take_home_usd":  round(w.get("take_home_usd", 0.0), 2),
+            "take_home_usd":   round(w.get("take_home_usd", 0.0), 2),
             "total_swept_usd": round(w.get("total_swept_usd", 0.0), 2),
-            "sweep_log":    (w.get("sweep_log") or [])[-20:],
+            "sweep_log":       (w.get("sweep_log") or [])[-20:],
+            "on_chain_usd":    round(on_chain, 2),
+            "cold_balance_usd": round(cold_on_chain.get("usd", 0.0), 2),
+            "cold_balance_sol": round(cold_on_chain.get("sol", 0.0), 6),
         }
     return jsonify(result)
 
