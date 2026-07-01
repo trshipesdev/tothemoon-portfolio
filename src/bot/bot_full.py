@@ -5139,6 +5139,7 @@ def api_wallets_list():
             "win_rate":     round(len(wins) / max(1, len(sells)) * 100, 1),
             "open_positions": len(open_pos),
             "open_pos_names": list(open_pos.keys()),
+            "open_pos_usd":  round(sum(p.get("usd", 0) for p in open_pos.values()), 2),
             "created":      w.get("created", ""),
             "take_home_usd":  round(w.get("take_home_usd", 0.0), 2),
             "total_swept_usd": round(w.get("total_swept_usd", 0.0), 2),
@@ -5203,7 +5204,24 @@ def api_wallet_update(wid):
             _load_wallet_keypairs()
         if want_live and wid not in _wallet_keypairs:
             return jsonify({"error": f"No keypair found. Add W_{wid}_PK to .env and restart."}), 400
+        was_live = w.get("live", False)
         w["live"] = want_live
+        # Going live → wipe shadow history so stats reflect real trades only
+        if want_live and not was_live:
+            w["trade_log"]       = []
+            w["vault_usd"]       = float(w.get("starting_usd", 0))
+            w["take_home_usd"]   = 0.0
+            w["total_swept_usd"] = 0.0
+            w["sweep_log"]       = []
+            w["pnl_hist"]        = []
+            w["open_today_usd"]  = 0.0
+            w["cur_deployed_usd"] = 0.0
+            w["entries_today"]   = {}
+            w["recently_exited"] = {}
+            w["dd_alerted"]      = {}
+            w["vault_snaps"]     = []
+            w["positions"]       = {}
+            log(f"[W:{wid}] RESET — going live, shadow history cleared")
     save_state()
     return jsonify({"ok": True})
 

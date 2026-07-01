@@ -1384,14 +1384,22 @@
               </div>
             </div>
             <!-- Stats -->
-            <div class="hidden sm:flex gap-6 text-center">
+            <div class="hidden sm:flex gap-5 text-center">
               <div>
                 <div class="text-xs text-gray-500">Vault</div>
                 <div class="font-mono font-semibold" :class="w.vault_usd >= w.starting_usd ? 'text-green-400' : 'text-red-400'" x-text="'$'+w.vault_usd.toFixed(2)"></div>
               </div>
               <div>
+                <div class="text-xs text-gray-500">In positions</div>
+                <div class="font-mono text-blue-400" x-text="'$'+(w.open_pos_usd??0).toFixed(2)"></div>
+              </div>
+              <div>
                 <div class="text-xs text-gray-500">Net P&L</div>
                 <div class="font-mono" :class="w.net_pnl >= 0 ? 'text-green-400' : 'text-red-400'" x-text="(w.net_pnl >= 0 ? '+' : '') + '$' + w.net_pnl.toFixed(2)"></div>
+              </div>
+              <div>
+                <div class="text-xs text-gray-500">Banked</div>
+                <div class="font-mono text-emerald-400" x-text="'$'+(w.take_home_usd??0).toFixed(2)"></div>
               </div>
               <div>
                 <div class="text-xs text-gray-500">Trades</div>
@@ -1400,10 +1408,6 @@
               <div>
                 <div class="text-xs text-gray-500">Win %</div>
                 <div class="font-mono" :class="w.win_rate >= 40 ? 'text-green-400' : 'text-yellow-400'" x-text="w.win_rate + '%'"></div>
-              </div>
-              <div>
-                <div class="text-xs text-gray-500">Open</div>
-                <div class="font-mono text-blue-400" x-text="w.open_positions"></div>
               </div>
             </div>
             <!-- Expand arrow -->
