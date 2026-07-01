@@ -134,6 +134,58 @@
         </div>
       </div>
 
+      <!-- ── Live wallet cards ── -->
+      <template x-if="liveWalletIds().length > 0">
+        <div class="mb-4 space-y-3">
+          <template x-for="wid in liveWalletIds()" :key="wid">
+            <div class="bg-gray-900 border border-red-900/40 rounded-xl p-4">
+              <div class="flex items-center justify-between mb-3">
+                <div class="flex items-center gap-2">
+                  <span class="text-red-400 text-xs font-bold">🔴 LIVE</span>
+                  <span class="text-sm font-semibold text-white" x-text="wallets[wid]?.label"></span>
+                </div>
+                <span class="text-gray-600 text-xs font-mono"
+                      x-text="(wallets[wid]?.address || '').slice(0,8) + '…'"></span>
+              </div>
+              <div class="grid grid-cols-3 gap-2 text-center mb-3">
+                <div class="bg-gray-800 rounded-lg p-2">
+                  <div class="text-gray-500 text-xs mb-0.5">Vault</div>
+                  <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.vault_usd ?? 0)"></div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-2">
+                  <div class="text-gray-500 text-xs mb-0.5">In positions</div>
+                  <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.open_pos_usd ?? 0)"></div>
+                </div>
+                <div class="bg-emerald-950 border border-emerald-800/40 rounded-lg p-2">
+                  <div class="text-emerald-500 text-xs mb-0.5">→ Cold wallet</div>
+                  <div class="font-bold text-sm text-emerald-400"
+                       x-text="'$' + fmt(wallets[wid]?.take_home_usd ?? 0)"></div>
+                </div>
+              </div>
+              <!-- Cold wallet on-chain balance check -->
+              <div x-show="wallets[wid]?.sweep_address" class="border-t border-gray-800 pt-3 flex items-center justify-between">
+                <div class="text-xs text-gray-500">
+                  Cold: <span class="font-mono text-gray-400"
+                              x-text="(wallets[wid]?.sweep_address || '').slice(0,10)+'…'"></span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <span x-show="coldBalance[wid]?.balance_usdc != null"
+                        class="text-xs font-bold text-green-400"
+                        x-text="'$' + (coldBalance[wid]?.balance_usdc ?? 0).toFixed(2) + ' USDC on-chain'"></span>
+                  <span x-show="coldBalance[wid]?.error"
+                        class="text-xs text-red-400" x-text="coldBalance[wid]?.error"></span>
+                  <button @click="fetchColdBalance(wid)"
+                          :disabled="coldBalance[wid]?.loading"
+                          class="text-xs px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 disabled:opacity-50">
+                    <span x-text="coldBalance[wid]?.loading ? '…' : (coldBalance[wid]?.balance_usdc != null ? '↻ refresh' : 'Check balance')"></span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </template>
+
       <!-- ── Active blocks / cooldowns alert ── -->
       <template x-if="activeBlocks().length > 0">
         <div class="rounded-xl border border-orange-700/60 bg-orange-950/40 p-3 mb-4">
@@ -2378,6 +2430,7 @@ function app() {
     walletTrades: [],
     walletPositions: {},
     testTrade:    {},      // { [wid]: {open, addr, symbol, usd, loading, result} }
+    coldBalance:  {},      // { [wid]: {balance_usdc, loading, error} }
     newWallet:    { label: '', starting_usd: 100, mode: '', address: '' },
     showAddWallet: false,
     bulkMode: '',
@@ -2751,6 +2804,24 @@ function app() {
       const r = await this.patch(`/api/wallets/${wid}`, { live: goLive });
       if (r?.ok) { await this.loadWallets(); this.showToast(goLive ? '🔴 Wallet is now LIVE' : 'Switched to shadow mode'); }
       else this.showToast(r?.error || 'Failed', false);
+    },
+    liveWalletIds() {
+      return Object.entries(this.wallets)
+        .filter(([, w]) => w.live)
+        .map(([id]) => id);
+    },
+    async fetchColdBalance(wid) {
+      this.coldBalance[wid] = { ...(this.coldBalance[wid] || {}), loading: true, error: null };
+      try {
+        const r = await this.get(`/api/wallets/${wid}/cold_balance`);
+        if (r?.balance_usdc != null) {
+          this.coldBalance[wid] = { balance_usdc: r.balance_usdc, loading: false };
+        } else {
+          this.coldBalance[wid] = { error: r?.error || 'RPC error', loading: false };
+        }
+      } catch (e) {
+        this.coldBalance[wid] = { error: e.message, loading: false };
+      }
     },
     async runTestTrade(wid) {
       const t = this.testTrade[wid] || {};

@@ -5321,6 +5321,23 @@ def api_wallet_test_trade(wid):
     })
 
 
+@app.route("/api/wallets/<wid>/cold_balance", methods=["GET"])
+@_dash_auth
+def api_wallet_cold_balance(wid):
+    """Fetch the on-chain USDC balance of the cold wallet linked to this wallet."""
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "not found"}), 404
+    cold_addr = (w.get("sweep_address") or os.getenv("SWEEP_SOL_ADDRESS", "")).strip()
+    if not cold_addr:
+        return jsonify({"error": "no cold wallet address set — add it in the wallet's sweep field"}), 400
+    try:
+        balance = fetch_sol_balance(cold_addr)
+        return jsonify({"address": cold_addr, "balance_usdc": round(balance, 4)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/opportunity-audit", methods=["GET"])
 @_dash_auth
 def api_opportunity_audit():
