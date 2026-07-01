@@ -501,6 +501,12 @@ def _load_wallets():
         with open(WALLETS_FILE, "r") as f:
             wallets = json.load(f)
         STATE["wallets"] = wallets
+        # Recompute cur_deployed_usd from live positions — saved value may be stale after crash
+        for w in wallets.values():
+            w["cur_deployed_usd"] = sum(
+                p.get("usd", 0.0) for p in w.get("positions", {}).values()
+                if p.get("units", 0) > 0
+            )
         log(f"load_wallets: {len(wallets)} wallet(s) restored from wallets.json")
     except FileNotFoundError:
         pass
@@ -1686,7 +1692,8 @@ def size_ticket_usd(chain: str, hype: Optional[int] = None,
         d_stop = _mode_dollar_stop(CONFIG["mode"])
         mult   = CONFIG["moonshot"].get("dollar_stop_pos_mult", 2.0)
         base   = min(base, d_stop * mult)
-    return base
+    # ±5% jitter — bets should never all be the same round number on-chain
+    return round(base * random.uniform(0.95, 1.05), 2)
 
 # ---------------------------------------------------------------------------
 # Execution adapters
@@ -2249,8 +2256,6 @@ def _wlt_size(w: Dict, symbol: str, chain: str, liq: float,
     mult   = float(w.get("safety", {}).get("dollar_stop_pos_mult") or
                    CONFIG["moonshot"].get("dollar_stop_pos_mult", 4.0))
     usd = min(usd, d_stop * mult)
-    # Small random jitter (±2%) so every bet isn't a round identical number on-chain
-    usd = round(usd * random.uniform(0.98, 1.02), 2)
     return usd
 
 
@@ -2322,6 +2327,7 @@ def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
     }
     w.setdefault("trade_log", []).append(entry)
     log(f"[W:{wid}] BUY {symbol} ${usd:.2f} @ {filled:.6f}")
+    save_state()   # persist position before any exit loop runs
 
 
 def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
@@ -2636,6 +2642,9 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
         # Size jitter ±8% so each wallet's position size differs (not identical clone bets).
         jitter = 1.0 + random.uniform(-0.08, 0.08)
         usd = max(_min_t, usd * jitter)
+        # Hard ceiling AFTER jitter — ticket_cap_usd must never be exceeded
+        if cap > 0:
+            usd = min(usd, cap)
 
         _wlt_buy(wid, w, symbol, chain, usd, price, liq, addr)
         scan_entered.setdefault(wid, set()).add(symbol)
