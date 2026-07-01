@@ -1471,6 +1471,11 @@
 
             <!-- Controls row -->
             <div class="flex flex-wrap gap-3 items-center">
+              <button @click="setBaseCurrency(wid, w.base_currency === 'sol' ? 'usdc' : 'sol')"
+                      :class="w.base_currency === 'sol' ? 'bg-purple-800 text-purple-200 border-purple-600' : 'bg-gray-700 text-gray-400 border-gray-600'"
+                      class="text-xs px-3 py-1.5 rounded-lg border font-mono">
+                <span x-text="w.base_currency === 'sol' ? '◎ SOL base' : '💵 USDC base'"></span>
+              </button>
               <select @change="setWalletMode(wid, $event.target.value)" class="bg-gray-700 text-white text-xs rounded-lg px-3 py-1.5 border border-gray-600">
                 <option value="">— Global mode —</option>
                 <template x-for="m in (state.modes || [])" :key="m">
@@ -2803,6 +2808,11 @@ function app() {
       if (goLive && !confirm(`Switch wallet "${w.label}" to LIVE trading?\n\nThis will submit real Solana transactions. Make sure the hot wallet is funded and W_${wid}_PK is set correctly.`)) return;
       const r = await this.patch(`/api/wallets/${wid}`, { live: goLive });
       if (r?.ok) { await this.loadWallets(); this.showToast(goLive ? '🔴 Wallet is now LIVE' : 'Switched to shadow mode'); }
+      else this.showToast(r?.error || 'Failed', false);
+    },
+    async setBaseCurrency(wid, currency) {
+      const r = await this.patch(`/api/wallets/${wid}`, { base_currency: currency });
+      if (r?.ok) { await this.loadWallets(); this.showToast(currency === 'sol' ? '◎ Switched to SOL base — buys/sells use native SOL' : '💵 Switched to USDC base'); }
       else this.showToast(r?.error || 'Failed', false);
     },
     liveWalletIds() {

@@ -2137,16 +2137,27 @@ def _load_wallet_keypairs():
                 log(f"[W:{wid}] keypair load failed — {e}")
 
 
+def _wlt_base_mint(w: Dict):
+    """Return (input_mint, decimals) for this wallet's base currency (SOL or USDC)."""
+    if w.get("base_currency", "sol") == "sol":
+        return WSOL_MINT, SOL_DECIMALS
+    return USDC_MINT_SOL, USDC_DECIMALS
+
+
 def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict:
     """Submit a real Jupiter buy for a live wallet. Returns {price, units, sig} or {error}."""
     kp = _wallet_keypairs.get(wid)
     if not kp:
         return {"error": "no_keypair — set W_<wid>_PK in .env"}
     try:
-        mode_name  = w.get("mode") or CONFIG["mode"]
-        slip_bps   = CONFIG["modes"].get(mode_name, {}).get("slip_bps", 150)
-        usdc_units = int(usd * 10 ** USDC_DECIMALS)
-        quote      = _jupiter_get_quote(USDC_MINT_SOL, addr, usdc_units, slip_bps)
+        mode_name      = w.get("mode") or CONFIG["mode"]
+        slip_bps       = CONFIG["modes"].get(mode_name, {}).get("slip_bps", 150)
+        base_mint, base_dec = _wlt_base_mint(w)
+        if base_mint == WSOL_MINT:
+            in_units = int((usd / max(_sol_usd_cached(), 1e-9)) * 10 ** base_dec)
+        else:
+            in_units = int(usd * 10 ** base_dec)
+        quote = _jupiter_get_quote(base_mint, addr, in_units, slip_bps)
         if not quote or not quote.get("outAmount"):
             return {"error": "no_jupiter_route"}
         tx_b64 = _jupiter_get_swap_tx(quote, str(kp.pubkey()))
@@ -2170,25 +2181,40 @@ def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float) -> Di
         addr     = pos.get("address", "")
         if not addr:
             return {"error": "no_token_address"}
-        mode_name  = w.get("mode") or CONFIG["mode"]
-        slip_bps   = CONFIG["modes"].get(mode_name, {}).get("slip_bps", 150)
+        mode_name       = w.get("mode") or CONFIG["mode"]
+        slip_bps        = CONFIG["modes"].get(mode_name, {}).get("slip_bps", 150)
+        base_mint, base_dec = _wlt_base_mint(w)
         tok_dec    = _sol_token_decimals(addr)
         pos_units  = pos.get("units", 0)
         frac       = min(1.0, usd / max(pos_units * price, 1e-9))
         sell_units = int(pos_units * frac * 10 ** tok_dec)
         if sell_units <= 0:
             return {"error": "zero_units"}
-        quote = _jupiter_get_quote(addr, USDC_MINT_SOL, sell_units, slip_bps)
+        quote = _jupiter_get_quote(addr, base_mint, sell_units, slip_bps)
         if not quote or not quote.get("outAmount"):
             return {"error": "no_jupiter_route"}
-        tx_b64    = _jupiter_get_swap_tx(quote, str(kp.pubkey()))
+        tx_b64 = _jupiter_get_swap_tx(quote, str(kp.pubkey()))
         if not tx_b64:
             return {"error": "jupiter_swap_build_failed"}
-        sig       = _sol_submit_tx(tx_b64, kp)
-        proceeds  = int(quote["outAmount"]) / 10 ** USDC_DECIMALS
+        sig  = _sol_submit_tx(tx_b64, kp)
+        if base_mint == WSOL_MINT:
+            sol_out  = int(quote["outAmount"]) / 10 ** SOL_DECIMALS
+            proceeds = sol_out * _sol_usd_cached()
+        else:
+            proceeds = int(quote["outAmount"]) / 10 ** USDC_DECIMALS
         return {"proceeds": proceeds, "units_sold": pos_units * frac, "sig": sig}
     except Exception as e:
         return {"error": str(e)}
+
+
+def _fetch_sol_native(address: str) -> float:
+    """Return native SOL balance of an address in SOL."""
+    rpc = _sol_rpc()
+    resp = requests.post(rpc, json={
+        "jsonrpc": "2.0", "id": 1, "method": "getBalance",
+        "params": [address],
+    }, timeout=10)
+    return resp.json().get("result", {}).get("value", 0) / 1e9
 
 
 def _wlt_init(label: str, starting_usd: float, mode: Optional[str] = None,
@@ -2196,6 +2222,7 @@ def _wlt_init(label: str, starting_usd: float, mode: Optional[str] = None,
     return {
         "label":          label,
         "address":        address,
+        "base_currency":  "sol",    # "sol" (native) or "usdc" — what the wallet buys/sells with
         "starting_usd":   starting_usd,
         "vault_usd":      starting_usd,
         "mode":           mode,        # None → inherit global CONFIG["mode"]
@@ -2822,6 +2849,8 @@ def _manage_arenas(live_prices: Dict):
 # ---------------------------------------------------------------------------
 USDC_MINT_SOL  = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDC_DECIMALS  = 6
+WSOL_MINT      = "So11111111111111111111111111111111111111112"
+SOL_DECIMALS   = 9
 JUPITER_QUOTE  = "https://lite-api.jup.ag/swap/v1/quote"
 JUPITER_SWAP   = "https://lite-api.jup.ag/swap/v1/swap"
 
@@ -5131,8 +5160,9 @@ def api_wallets_list():
             "ticket_cap_usd": w.get("ticket_cap_usd", 0.0),
             "safety":         w.get("safety", {}),
             "mode":           w.get("mode") or CONFIG["mode"],
-            "active":       w.get("active", True),
-            "live":         w.get("live", False),
+            "active":         w.get("active", True),
+            "live":           w.get("live", False),
+            "base_currency":  w.get("base_currency", "sol"),
             "keypair_loaded": wid in _wallet_keypairs,
             "at_floor":     at_floor,
             "starting_usd": w.get("starting_usd", 0),
@@ -5190,6 +5220,8 @@ def api_wallet_update(wid):
         w["starting_usd"] = float(data["starting_usd"])
     if "sweep_address" in data:
         w["sweep_address"] = str(data["sweep_address"]).strip()
+    if "base_currency" in data and data["base_currency"] in ("sol", "usdc"):
+        w["base_currency"] = data["base_currency"]
     if "ticket_cap_usd" in data:
         cap = float(data["ticket_cap_usd"])
         w["ticket_cap_usd"] = max(0.0, cap)
@@ -5211,9 +5243,16 @@ def api_wallet_update(wid):
         w["live"] = want_live
         # Going live → wipe shadow history so stats reflect real trades only
         if want_live and not was_live:
-            # Read actual on-chain USDC balance so vault starts at the real number
             hot_addr = w.get("address", "")
-            on_chain = fetch_sol_balance(hot_addr) if hot_addr else 0.0
+            base     = w.get("base_currency", "sol")
+            if base == "sol" and hot_addr:
+                try:
+                    sol_bal  = _fetch_sol_native(hot_addr)
+                    on_chain = round(sol_bal * _sol_usd_cached(), 2)
+                except Exception:
+                    on_chain = 0.0
+            else:
+                on_chain = fetch_sol_balance(hot_addr) if hot_addr else 0.0
             actual_balance = on_chain if on_chain > 0 else float(w.get("starting_usd", 0))
             if on_chain > 0:
                 w["starting_usd"] = round(actual_balance, 2)   # anchor drawdown to real deposit
@@ -5334,8 +5373,15 @@ def api_wallet_cold_balance(wid):
     if not cold_addr:
         return jsonify({"error": "no cold wallet address set — add it in the wallet's sweep field"}), 400
     try:
-        balance = fetch_sol_balance(cold_addr)
-        return jsonify({"address": cold_addr, "balance_usdc": round(balance, 4)})
+        base = w.get("base_currency", "sol")
+        if base == "sol":
+            sol_bal   = _fetch_sol_native(cold_addr)
+            sol_price = _sol_usd_cached()
+            return jsonify({"address": cold_addr, "balance_sol": round(sol_bal, 6),
+                            "balance_usdc": round(sol_bal * sol_price, 2), "sol_price": round(sol_price, 2)})
+        else:
+            balance = fetch_sol_balance(cold_addr)
+            return jsonify({"address": cold_addr, "balance_usdc": round(balance, 4)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
