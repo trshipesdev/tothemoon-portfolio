@@ -367,6 +367,7 @@ _state_path_env = os.getenv("STATE_PATH", "")
 SAVEFILE        = _state_path_env if _state_path_env else f"state_{CONFIG['tenant']['name']}.json"
 TRADELOG_FILE   = os.path.join(os.path.dirname(SAVEFILE) or ".", "trades.jsonl")
 SCAN_LOG_FILE   = os.path.join(os.path.dirname(SAVEFILE) or ".", "scan_log.jsonl")
+WALLETS_FILE    = os.path.join(os.path.dirname(SAVEFILE) or ".", "wallets.json")
 _SCAN_LOG_MAX_LINES = 100_000   # rotate oldest half when exceeded
 
 
@@ -485,6 +486,28 @@ def _load_tradelog_file() -> List[Dict]:
     return records
 
 
+def _save_wallets():
+    """Persist wallets to a separate file so they survive state.json corruption."""
+    try:
+        with open(WALLETS_FILE, "w") as f:
+            json.dump(STATE.get("wallets", {}), f, indent=2, default=str)
+    except Exception as e:
+        log(f"WARN _save_wallets failed: {e}")
+
+
+def _load_wallets():
+    """Load wallets from wallets.json; takes priority over anything in state.json."""
+    try:
+        with open(WALLETS_FILE, "r") as f:
+            wallets = json.load(f)
+        STATE["wallets"] = wallets
+        log(f"load_wallets: {len(wallets)} wallet(s) restored from wallets.json")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"WARN _load_wallets failed: {e}")
+
+
 def save_state():
     try:
         # Exclude trade_log — it's always rebuilt from trades.jsonl on load_state(),
@@ -492,6 +515,7 @@ def save_state():
         payload = {k: v for k, v in STATE.items() if k != "trade_log"}
         with open(SAVEFILE, "w") as f:
             json.dump(payload, f, indent=2, default=str)
+        _save_wallets()
     except Exception as e:
         log(f"WARN save_state failed: {e}")
 
@@ -559,6 +583,10 @@ def load_state():
         merged.sort(key=lambda t: t.get("ts", ""))
         STATE["trade_log"] = merged
         log(f"load_state: merged trades.jsonl — {len(merged)} total trades ({len(file_trades)} on disk)")
+
+    # Wallets live in their own file so they survive state.json corruption.
+    # Load after the state merge so wallets.json always wins.
+    _load_wallets()
 
 # ---------------------------------------------------------------------------
 # Data feeds
