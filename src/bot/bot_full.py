@@ -1821,7 +1821,10 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         "entry_hype":  entry_hype,
         "entry_liq":   liq_usd,
     }
-    STATE.setdefault("trade_log", []).append(_trade_entry)
+    tl = STATE.setdefault("trade_log", [])
+    tl.append(_trade_entry)
+    if len(tl) > 500:
+        del tl[:len(tl) - 500]
     _append_trade(_trade_entry)
     if is_new_pos:
         _arena_enter(symbol, chain, filled_price)
@@ -1921,7 +1924,10 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
         "entry_price": avg_entry,
         "min_price":   pos.get("trough_price"),
     }
-    STATE.setdefault("trade_log", []).append(_trade_entry)
+    tl = STATE.setdefault("trade_log", [])
+    tl.append(_trade_entry)
+    if len(tl) > 500:
+        del tl[:len(tl) - 500]
     _append_trade(_trade_entry)
     # Purge a fully-closed position so its empty shell doesn't linger in the
     # positions dict and count against the max-open-positions cap (which had jammed
@@ -2013,24 +2019,29 @@ def _arena_ensure(mode_name: str, params: Dict) -> Dict:
     return arenas[mode_name]
 
 
-def _arena_enter(symbol: str, chain: str, price: float):
-    """Paper-buy a new entry across every known mode in parallel."""
-    all_modes: Dict[str, str] = {}
-    for k in CONFIG["modes"]:
-        all_modes[k] = k
-    for k in STATE.get("custom_modes", {}):
-        all_modes[k] = k
+_ARENA_BUILTIN_MODES = {"safe", "default", "hype", "degen"}
 
-    for mode_name in all_modes:
+
+def _arena_enter(symbol: str, chain: str, price: float):
+    """Paper-buy a new entry across the 4 builtin modes in parallel.
+    Sizing is proportional: each arena bets the same FRACTION of its vault that
+    the main bot bets of its own vault — so arenas never go bankrupt and their
+    PnL curves are directly comparable to the main bot's."""
+    main_vault = max(STATE.get("vault_usd", 1000), 1)
+    main_bet   = CONFIG["base_size_usd"]   # base before size_mult
+
+    for mode_name in _ARENA_BUILTIN_MODES:
         params = _arena_mode_params(mode_name)
         if not params:
             continue
         arena = _arena_ensure(mode_name, params)
         if symbol in arena["positions"]:
             continue
-        bet = CONFIG["base_size_usd"] * params["size_mult"]
-        bet = min(bet, arena["vault"] * 0.20)
-        if bet < 3:
+        # Proportional bet: same vault-fraction as main bot, scaled by mode size_mult
+        arena_fraction = (main_bet / main_vault) * params["size_mult"]
+        bet = arena["vault"] * arena_fraction
+        bet = min(bet, arena["vault"] * 0.15)   # never more than 15% of remaining vault
+        if bet < 1:
             continue
         units     = bet / price if price > 0 else 0
         buy_gas   = _gas_usd(chain)
