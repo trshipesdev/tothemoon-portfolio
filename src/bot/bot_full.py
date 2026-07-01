@@ -2908,7 +2908,9 @@ def _sol_submit_tx(tx_b64: str, kp) -> str:
     rpc     = _sol_rpc()
     resp    = requests.post(rpc, json={
         "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
-        "params": [encoded, {"encoding": "base64", "skipPreflight": False, "maxRetries": 3}],
+        # skipPreflight=True: public RPC has stale AMM state that causes false
+        # simulation failures on Jupiter swaps. Jupiter validates server-side.
+        "params": [encoded, {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}],
     }, timeout=30)
     result = resp.json()
     if "error" in result:
