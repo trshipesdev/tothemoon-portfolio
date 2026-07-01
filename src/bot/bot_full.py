@@ -3990,7 +3990,7 @@ def api_state():
     return jsonify({
         **{k: v for k, v in STATE.items() if k not in ("trade_log", "liq_prev", "scout_log", "wallet_goal")},
         "wallet_goal": {**STATE.get("wallet_goal", {}), "payout_log": STATE.get("wallet_goal", {}).get("payout_log", [])[-20:]},
-        "trade_count":     len(STATE.get("trade_log", [])),
+        "trade_count":     sum(1 for t in STATE.get("trade_log", []) if not _is_ghost_sell(t)),
         "deployable_usd":  deployable_now(),
         "mode":            CONFIG["mode"],
         "modes":           list(CONFIG["modes"].keys()),
@@ -4072,6 +4072,15 @@ def api_positions():
 _history_cache: Dict[str, Any] = {}   # {n_trades, ts_last, payload}
 _backtest_cache: Dict[str, Any] = {}  # same pattern
 
+def _is_ghost_sell(t: Dict) -> bool:
+    """Ghost sells: dollar_stop firing on an already-closed position (floating-point dust).
+    Identified by near-zero proceeds (just gas deduction, no real units sold).
+    These corrupt win_rate and avg_loss stats and must be excluded from all analytics."""
+    return (t.get("side") == "sell"
+            and abs(t.get("usd", 0) or 0) < 0.01
+            and abs(t.get("pnl", 0) or 0) < 0.01)
+
+
 @app.route("/api/history")
 @_dash_auth
 def api_history():
@@ -4079,15 +4088,16 @@ def api_history():
     n = len(trades)
     if _history_cache.get("n") == n and _history_cache.get("payload"):
         return _history_cache["payload"]
-    sells   = [t for t in trades if t.get("side") == "sell" and t.get("pnl") is not None]
+    sells   = [t for t in trades if t.get("side") == "sell" and t.get("pnl") is not None
+               and not _is_ghost_sell(t)]
     wins    = [t for t in sells if t["pnl"] > 0]
     losses  = [t for t in sells if t["pnl"] <= 0]
     running = 0.0
     enriched: List[Dict] = []
     for t in trades:
-        if t.get("side") == "sell" and t.get("pnl") is not None:
+        if t.get("side") == "sell" and t.get("pnl") is not None and not _is_ghost_sell(t):
             running += t["pnl"]
-        enriched.append({**t, "running_pnl": running})
+        enriched.append({**t, "running_pnl": running, "ghost": _is_ghost_sell(t)})
     # $100 runner — replay every actual trade starting with $100.
     # Same dollar bet sizes as the real run. Every sell's proceeds go straight
     # back into the pool and fund the next bet — that's the compounding.
@@ -4173,7 +4183,7 @@ def api_sim100():
     - Dollar stop: cap any loss at max($12, 10% of sim deployed cost)
     - Full compounding: all proceeds go back into the pool
     """
-    trades = STATE.get("trade_log", [])
+    trades = [t for t in STATE.get("trade_log", []) if not _is_ghost_sell(t)]
     n = len(trades)
     if _sim100_cache.get("n") == n and _sim100_cache.get("payload"):
         return _sim100_cache["payload"]
@@ -4349,7 +4359,7 @@ def api_backtest():
 
     Returns per-trade status ('kept'/'blocked'/'capped') plus revised stats.
     """
-    trades   = STATE.get("trade_log", [])
+    trades   = [t for t in STATE.get("trade_log", []) if not _is_ghost_sell(t)]
     n = len(trades)
     if _backtest_cache.get("n") == n and _backtest_cache.get("payload"):
         return _backtest_cache["payload"]
