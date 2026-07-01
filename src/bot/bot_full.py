@@ -1404,10 +1404,11 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
         "max_age_min", CONFIG["scan"]["new_max_age_min"])
     if sc.age_min > max_age:
         return f"age {sc.age_min:.0f}m over {max_age:.0f}m limit"
-    # Skip the 24h trend check for tokens under 5 minutes old — they have no 24h history
-    # so price_chg=0, which _pair_to_candidate() treats as non-positive. This false-rejects
-    # brand new mints that haven't had time to establish a directional trend.
-    if not sc.positive and sc.age_min >= 5:
+    # Skip the 24h trend check for tokens under 5 minutes old (no h24 history yet) OR
+    # when m5 is strongly positive (≥10%) — an active pump overrides a stale 24h window.
+    # Meme coins often launch, consolidate, then spike: h24 looks negative while m5 is +80%.
+    _m5_overrides_h24 = sc.price_chg_m5 >= 10.0
+    if not sc.positive and sc.age_min >= 5 and not _m5_overrides_h24:
         return "price trend is negative (24h)"
     # Require active upward momentum in the last 5 minutes.
     # h24 is useless for new tokens (compares to launch price, not the recent peak) — a token
