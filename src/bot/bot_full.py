@@ -2011,6 +2011,7 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
             )
             if not wallet_still_open:
                 _ws_remove(symbol)
+    save_state()
     return {"sold": proceeds, "pnl": pnl}
 
 
