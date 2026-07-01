@@ -5265,6 +5265,62 @@ def api_wallet_positions(wid):
     return jsonify({s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0})
 
 
+@app.route("/api/wallets/<wid>/test_trade", methods=["POST"])
+@_dash_auth
+def api_wallet_test_trade(wid):
+    """Execute a tiny real buy+sell to verify keypair, Jupiter, and RPC all work.
+    Does NOT touch vault_usd or trade_log — gas cost is intentionally wasted."""
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "wallet not found"}), 404
+    if not w.get("live"):
+        return jsonify({"error": "wallet is not live — flip to live mode first"}), 400
+    if not _wallet_keypairs.get(wid):
+        return jsonify({"error": f"no keypair — set W_{wid}_PK in .env and restart"}), 400
+
+    data       = flask_request.get_json() or {}
+    usd        = max(0.5, min(5.0, float(data.get("usd", 1.0))))
+    token_addr = (data.get("address") or "").strip()
+    symbol     = (data.get("symbol") or "TEST").strip()[:20]
+
+    if not token_addr:
+        return jsonify({"error": "pass {\"address\": \"<CA>\", \"symbol\": \"NAME\"} in request body"}), 400
+
+    # --- BUY ---
+    buy = _wlt_live_buy(wid, w, symbol, usd, token_addr)
+    if "error" in buy:
+        return jsonify({"step": "buy", "error": buy["error"]}), 500
+
+    # Minimal pos dict for the sell call (never added to w["positions"])
+    temp_pos = {
+        "address": token_addr,
+        "units":   buy["units"],
+        "chain":   "sol",
+    }
+
+    # Brief pause so the buy confirms on-chain before we try to sell
+    time.sleep(3)
+
+    # --- SELL (full amount) ---
+    sell_usd = buy["units"] * buy["price"]  # approximate full value
+    sell = _wlt_live_sell(wid, w, temp_pos, sell_usd, buy["price"])
+
+    net = None
+    if "error" not in sell:
+        net = round(sell.get("proceeds", 0) - usd, 4)
+
+    log(f"[W:{wid}] TEST TRADE {symbol} buy={buy.get('sig','')[:16]}… sell={sell.get('sig','')[:16]}… net=${net}")
+    return jsonify({
+        "ok":      "error" not in sell,
+        "symbol":  symbol,
+        "address": token_addr,
+        "usd_in":  usd,
+        "buy":  {"sig": buy.get("sig"),  "price": buy.get("price"),  "units": buy.get("units")},
+        "sell": {"sig": sell.get("sig"), "proceeds": sell.get("proceeds"), "error": sell.get("error")},
+        "net_usd": net,
+    })
+
+
 @app.route("/api/opportunity-audit", methods=["GET"])
 @_dash_auth
 def api_opportunity_audit():

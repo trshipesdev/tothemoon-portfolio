@@ -1437,6 +1437,64 @@
                 <span x-text="w.live ? '🔴 Live — click to shadow' : (w.keypair_loaded ? '⚪ Go Live' : '🔑 Key needed')"></span>
               </button>
               <button @click="deleteWallet(wid)" class="text-xs px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-red-800 text-gray-400 hover:text-red-300">Delete</button>
+              <button x-show="w.live && w.keypair_loaded"
+                      @click="testTrade[wid] = testTrade[wid] || {}; testTrade[wid].open = !testTrade[wid]?.open"
+                      :class="testTrade[wid]?.open ? 'bg-purple-700 text-white' : 'bg-gray-700 hover:bg-purple-800 text-gray-400 hover:text-purple-300'"
+                      class="text-xs px-3 py-1.5 rounded-lg">
+                🧪 Test Trade
+              </button>
+            </div>
+
+            <!-- Test Trade panel -->
+            <div x-show="testTrade[wid]?.open" class="bg-gray-900 border border-purple-800/40 rounded-lg p-3 space-y-2">
+              <div class="text-xs font-semibold text-purple-300 mb-1">Test Trade — real $1 buy + immediate sell to verify live plumbing</div>
+              <div class="flex gap-2 flex-wrap items-end">
+                <div class="flex flex-col gap-1 flex-1 min-w-48">
+                  <label class="text-xs text-gray-500">Token contract address (CA)</label>
+                  <input type="text" placeholder="Paste any Solana CA, e.g. from pump.fun"
+                         x-model.lazy="(testTrade[wid] = testTrade[wid] || {}).addr"
+                         class="bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 border border-gray-700 placeholder-gray-600 font-mono w-full">
+                </div>
+                <div class="flex flex-col gap-1 w-20">
+                  <label class="text-xs text-gray-500">$ amount</label>
+                  <input type="number" min="0.5" max="5" step="0.5"
+                         x-model.number="(testTrade[wid] = testTrade[wid] || {usd:1}).usd"
+                         class="bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 border border-gray-700 w-full">
+                </div>
+                <div class="flex flex-col gap-1 w-24">
+                  <label class="text-xs text-gray-500">Symbol</label>
+                  <input type="text" placeholder="TOKEN"
+                         x-model="(testTrade[wid] = testTrade[wid] || {}).symbol"
+                         class="bg-gray-800 text-xs text-gray-200 rounded px-2 py-1.5 border border-gray-700 w-full">
+                </div>
+                <button @click="runTestTrade(wid)"
+                        :disabled="testTrade[wid]?.loading || !testTrade[wid]?.addr"
+                        :class="testTrade[wid]?.loading ? 'opacity-50 cursor-not-allowed' : 'hover:bg-purple-600'"
+                        class="bg-purple-700 text-white text-xs px-4 py-1.5 rounded-lg self-end whitespace-nowrap">
+                  <span x-text="testTrade[wid]?.loading ? 'Running…' : 'Run Test'"></span>
+                </button>
+              </div>
+              <!-- Result -->
+              <div x-show="testTrade[wid]?.result" class="mt-2 text-xs space-y-1 font-mono">
+                <div :class="testTrade[wid]?.result?.ok ? 'text-green-400' : 'text-red-400'"
+                     x-text="testTrade[wid]?.result?.ok ? '✓ Both legs executed' : '✗ ' + (testTrade[wid]?.result?.error || testTrade[wid]?.result?.sell?.error || 'failed')"></div>
+                <template x-if="testTrade[wid]?.result?.buy?.sig">
+                  <div class="text-gray-400">
+                    Buy: <a :href="'https://solscan.io/tx/' + testTrade[wid].result.buy.sig" target="_blank"
+                            class="text-indigo-400 hover:underline" x-text="testTrade[wid].result.buy.sig.slice(0,20)+'…'"></a>
+                  </div>
+                </template>
+                <template x-if="testTrade[wid]?.result?.sell?.sig">
+                  <div class="text-gray-400">
+                    Sell: <a :href="'https://solscan.io/tx/' + testTrade[wid].result.sell.sig" target="_blank"
+                             class="text-indigo-400 hover:underline" x-text="testTrade[wid].result.sell.sig.slice(0,20)+'…'"></a>
+                  </div>
+                </template>
+                <template x-if="testTrade[wid]?.result?.net_usd !== null && testTrade[wid]?.result?.net_usd !== undefined">
+                  <div :class="testTrade[wid].result.net_usd >= 0 ? 'text-green-400' : 'text-yellow-400'"
+                       x-text="'Net: ' + (testTrade[wid].result.net_usd >= 0 ? '+' : '') + '$' + testTrade[wid].result.net_usd.toFixed(4) + ' (gas + slippage)'"></div>
+                </template>
+              </div>
             </div>
 
             <!-- Wallet ID + sweep address -->
@@ -2319,6 +2377,7 @@ function app() {
     walletDetail: null,    // wid of currently expanded wallet
     walletTrades: [],
     walletPositions: {},
+    testTrade:    {},      // { [wid]: {open, addr, symbol, usd, loading, result} }
     newWallet:    { label: '', starting_usd: 100, mode: '', address: '' },
     showAddWallet: false,
     bulkMode: '',
@@ -2692,6 +2751,25 @@ function app() {
       const r = await this.patch(`/api/wallets/${wid}`, { live: goLive });
       if (r?.ok) { await this.loadWallets(); this.showToast(goLive ? '🔴 Wallet is now LIVE' : 'Switched to shadow mode'); }
       else this.showToast(r?.error || 'Failed', false);
+    },
+    async runTestTrade(wid) {
+      const t = this.testTrade[wid] || {};
+      if (!t.addr) return;
+      this.testTrade[wid] = { ...t, loading: true, result: null };
+      try {
+        const r = await fetch(`/api/wallets/${wid}/test_trade`, {
+          method: 'POST',
+          headers: this._headers(),
+          body: JSON.stringify({ usd: t.usd || 1.0, address: t.addr, symbol: t.symbol || 'TEST' }),
+        });
+        const d = await r.json();
+        this.testTrade[wid] = { ...this.testTrade[wid], loading: false, result: d };
+        if (d.ok) this.showToast('🧪 Test trade complete — check Solscan links');
+        else this.showToast('Test trade failed: ' + (d.error || d.sell?.error || 'unknown'), false);
+      } catch (e) {
+        this.testTrade[wid] = { ...this.testTrade[wid], loading: false, result: { error: e.message } };
+        this.showToast('Request failed: ' + e.message, false);
+      }
     },
     async setSweepAddress(wid, addr) {
       const r = await this.patch(`/api/wallets/${wid}`, { sweep_address: addr });
