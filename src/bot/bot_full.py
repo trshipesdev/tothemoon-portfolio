@@ -2822,8 +2822,8 @@ def _manage_arenas(live_prices: Dict):
 # ---------------------------------------------------------------------------
 USDC_MINT_SOL  = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDC_DECIMALS  = 6
-JUPITER_QUOTE  = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP   = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE  = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP   = "https://lite-api.jup.ag/swap/v1/swap"
 
 
 def _sol_keypair():
