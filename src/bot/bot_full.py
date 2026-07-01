@@ -5399,6 +5399,8 @@ def api_wallet_update(wid):
     if "ticket_cap_usd" in data:
         cap = float(data["ticket_cap_usd"])
         w["ticket_cap_usd"] = max(0.0, cap)
+    if "entry_prob" in data:
+        w["entry_prob"] = max(0.0, min(1.0, float(data["entry_prob"])))
     if "safety" in data and isinstance(data["safety"], dict):
         sf = w.setdefault("safety", {})
         allowed = {"dollar_stop_usd", "dollar_stop_pos_mult", "velocity_m5_pct",
