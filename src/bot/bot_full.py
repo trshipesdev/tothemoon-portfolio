@@ -2480,8 +2480,6 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     w.setdefault("trade_log", []).append(sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
     _wallet_drawdown_check(wid, w)
-    _wlt_take_home(wid, w, pnl)
-    _wlt_maybe_sweep(wid, w)
     save_state()
 
 
