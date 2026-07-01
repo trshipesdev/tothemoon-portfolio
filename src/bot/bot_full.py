@@ -95,7 +95,7 @@ CONFIG: Dict[str, Any] = {
             "velocity_exit_pct": 0.05, "rug_liq_drop": 0.20, "loss_cooldown_min": 30,
         },
         "default": {
-            "tp": [0.28], "sl": 0.12, "slip_bps": 100, "liq_min": 30000,
+            "tp": [0.28], "sl": 0.12, "slip_bps": 300, "liq_min": 30000,
             "max_age_min": 180, "max_entries_per_token_day": 3, "size_mult": 1.0,
             # Entry: balanced
             "m5_min": 0.5, "buy_ratio_min": 0.55,
@@ -103,7 +103,7 @@ CONFIG: Dict[str, Any] = {
             "velocity_exit_pct": 0.07, "rug_liq_drop": 0.30, "loss_cooldown_min": 15,
         },
         "hype": {
-            "tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 150, "liq_min": 20000,
+            "tp": [0.45, 0.9], "sl": 0.18, "slip_bps": 500, "liq_min": 20000,
             "max_age_min": 120, "max_entries_per_token_day": 4, "size_mult": 1.3,
             # Entry: requires real momentum and majority buyers
             "m5_min": 1.0, "buy_ratio_min": 0.55,
@@ -2318,6 +2318,31 @@ def _wlt_base_mint(w: Dict):
     return USDC_MINT_SOL, USDC_DECIMALS
 
 
+def _sol_confirm_tx(sig: str, max_wait: int = 30):
+    """Poll getSignatureStatuses until the tx is confirmed on-chain or raise on failure/timeout."""
+    rpc = _sol_rpc()
+    for _ in range(max_wait):
+        time.sleep(1)
+        try:
+            resp = requests.post(rpc, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignatureStatuses",
+                "params": [[sig], {"searchTransactionHistory": True}],
+            }, timeout=10).json()
+            val = (resp.get("result", {}).get("value") or [None])[0]
+            if val is None:
+                continue
+            if val.get("err"):
+                raise RuntimeError(f"tx failed on-chain: {val['err']}")
+            if val.get("confirmationStatus") in ("confirmed", "finalized"):
+                return
+        except RuntimeError:
+            raise
+        except Exception:
+            continue
+    raise RuntimeError(f"tx not confirmed within {max_wait}s")
+
+
 def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict:
     """Submit a real Jupiter buy for a live wallet. Returns {price, units, sig} or {error}."""
     kp = _wallet_keypairs.get(wid)
@@ -2338,6 +2363,7 @@ def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict
         if not tx_b64:
             return {"error": "jupiter_swap_build_failed"}
         sig       = _sol_submit_tx(tx_b64, kp)
+        _sol_confirm_tx(sig)
         tok_dec   = _sol_token_decimals(addr)
         out_units = int(quote["outAmount"]) / 10 ** tok_dec
         filled_px = usd / out_units if out_units else 0
@@ -2371,6 +2397,7 @@ def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float) -> Di
         if not tx_b64:
             return {"error": "jupiter_swap_build_failed"}
         sig  = _sol_submit_tx(tx_b64, kp)
+        _sol_confirm_tx(sig)
         if base_mint == WSOL_MINT:
             sol_out  = int(quote["outAmount"]) / 10 ** SOL_DECIMALS
             proceeds = sol_out * _sol_usd_cached()
@@ -2437,28 +2464,27 @@ def _wlt_deployable(w: Dict) -> float:
 def _wlt_size(w: Dict, symbol: str, chain: str, liq: float,
               hype: Optional[int] = None, buy_ratio: Optional[float] = None) -> float:
     mode_name = w.get("mode") or CONFIG["mode"]
-    mode_cfg  = CONFIG["modes"].get(mode_name, CONFIG["modes"].get(CONFIG["mode"], {}))
-    base = CONFIG["base_size_usd"] * mode_cfg.get("size_mult", 1.0)
-    base *= _conviction_mult(hype, buy_ratio)
-    dep  = _wlt_deployable(w)
-    # Per-token cap and chain cap (same fractions as main bot)
-    per_token = CONFIG["per_token_cap_pct"] * dep
-    per_chain = CONFIG["per_chain_cap_pct"].get(chain, 0.25) * dep
-    usd = min(base, per_token, per_chain)
-    # Don't deploy more than what's actually in the wallet
-    usd = min(usd, max(0.0, w["vault_usd"] - w.get("cur_deployed_usd", 0.0)))
-    # Per-wallet ticket cap — lets a wallet run any mode at a smaller scale
-    # (e.g. "testing 3" at $5 tickets for a live go-live test)
     cap = float(w.get("ticket_cap_usd") or 0)
     if cap > 0:
-        usd = min(usd, cap)
-    # Gap-down safety: cap position so a 100% token crash can't exceed dollar_stop × mult.
-    # Per-wallet override lets individual wallets take bigger bets if desired.
+        # Wallet has an explicit ticket cap — use it as the sizing target.
+        # Skip global per_token/per_chain caps (designed for the shadow's large vault,
+        # not for a wallet with an explicit per-trade size).
+        base = cap * _conviction_mult(hype, buy_ratio)
+        base = min(base, cap)
+    else:
+        mode_cfg = CONFIG["modes"].get(mode_name, CONFIG["modes"].get(CONFIG["mode"], {}))
+        base = CONFIG["base_size_usd"] * mode_cfg.get("size_mult", 1.0)
+        base *= _conviction_mult(hype, buy_ratio)
+        dep  = _wlt_deployable(w)
+        per_token = CONFIG["per_token_cap_pct"] * dep
+        per_chain = CONFIG["per_chain_cap_pct"].get(chain, 0.25) * dep
+        base = min(base, per_token, per_chain)
+    # Both paths: limit to remaining cash and dollar_stop safety cap
+    base = min(base, max(0.0, w["vault_usd"] - w.get("cur_deployed_usd", 0.0)))
     d_stop = _mode_dollar_stop(mode_name)
     mult   = float(w.get("safety", {}).get("dollar_stop_pos_mult") or
                    CONFIG["moonshot"].get("dollar_stop_pos_mult", 4.0))
-    usd = min(usd, d_stop * mult)
-    return usd
+    return min(base, d_stop * mult)
 
 
 def _wlt_can_enter(w: Dict, symbol: str, chain: str) -> bool:
@@ -2818,14 +2844,25 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
     (±8% on ticket size), and a per-wallet random delay offset stored for reference.
     In live mode these delays must be honored by the real tx submission layer.
     """
+    ts = now_utc().isoformat()
+
+    def _miss(w: Dict, reason: str):
+        ml = w.setdefault("missed_log", [])
+        ml.append({"ts": ts, "symbol": symbol, "chain": chain, "reason": reason})
+        if len(ml) > 100:
+            w["missed_log"] = ml[-100:]
+
     for wid, w in STATE.get("wallets", {}).items():
         if not w.get("active"):
+            _miss(w, "wallet_paused")
             continue
         if w.get("paused_new_entries"):
+            _miss(w, "drawdown_pause")
             continue
         if symbol in scan_entered.get(wid, set()):
             continue
         if not _wlt_can_enter(w, symbol, chain):
+            _miss(w, "can_enter")
             continue
 
         # Entry probability — each wallet independently decides whether to enter.
@@ -2833,6 +2870,7 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
         entry_prob = float(w.get("entry_prob", 0.85))
         if random.random() > entry_prob:
             log(f"[W:{wid}] SKIP {symbol} — skipped by entry_prob ({entry_prob:.0%})")
+            _miss(w, "entry_prob")
             continue
 
         usd = _wlt_size(w, symbol, chain, liq, hype=hype, buy_ratio=buy_ratio)
@@ -2840,6 +2878,7 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
         cap = float(w.get("ticket_cap_usd") or 0)
         _min_t = max(1.0, cap * 0.5) if cap > 0 else _mode_min_ticket(w.get("mode") or CONFIG["mode"])
         if usd < _min_t:
+            _miss(w, "min_ticket")
             continue
 
         # Size jitter ±8% so each wallet's position size differs (not identical clone bets).
@@ -5477,6 +5516,15 @@ def api_wallet_trades(wid):
     if not w:
         return jsonify({"error": "not found"}), 404
     return jsonify(w.get("trade_log", []))
+
+
+@app.route("/api/wallets/<wid>/missed", methods=["GET"])
+@_dash_auth
+def api_wallet_missed(wid):
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"missed": list(reversed(w.get("missed_log", [])))[:50]})
 
 
 @app.route("/api/wallets/<wid>/positions", methods=["GET"])
