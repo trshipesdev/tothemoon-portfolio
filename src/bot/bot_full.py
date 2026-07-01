@@ -2784,6 +2784,34 @@ def _wallet_drawdown_check(wid: str, w: Dict):
         alerted.pop("warning", None)
 
 
+def _wlt_sync_vault(wid: str, w: Dict, live_prices: Dict):
+    """Auto-correct vault_usd to on-chain SOL balance + open position values.
+
+    Runs every 30s so the dashboard always reflects reality regardless of
+    ghost trades, manual sells, or any accounting drift.
+    """
+    addr = w.get("address", "")
+    if not addr:
+        return
+    bal = _chain_bal_usd(addr, ttl=25.0)
+    sol_usd = bal.get("usd", 0.0)
+    if sol_usd <= 0:
+        return
+    pos_value = sum(
+        pos.get("units", 0) * (live_prices.get(sym, {}).get("price") or pos.get("avg", 0))
+        for sym, pos in w.get("positions", {}).items()
+        if pos.get("units", 0) > 0
+    )
+    new_vault = round(sol_usd + pos_value, 2)
+    new_deployed = round(pos_value, 2)
+    if abs(new_vault - w.get("vault_usd", 0)) > 0.50:
+        log(f"[W:{wid}] VAULT SYNC ${w.get('vault_usd',0):.2f}→${new_vault:.2f} "
+            f"(on-chain ${sol_usd:.2f} + positions ${pos_value:.2f})")
+        w["vault_usd"] = new_vault
+        w["cur_deployed_usd"] = new_deployed
+        save_state()
+
+
 def _wlt_reconcile_positions(wid: str, w: Dict):
     """Fetch on-chain token balances and auto-close positions with 0 balance.
 
@@ -2844,10 +2872,11 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
     MS        = CONFIG["moonshot"]
     liq_prev  = w.setdefault("liq_prev", {})
 
-    # Periodic on-chain reconciliation for live wallets — detects manual sells
+    # Periodic on-chain sync for live wallets — reconcile positions + correct vault_usd
     if w.get("live") and w.get("address"):
         if time.time() - w.get("_last_reconcile_ts", 0) >= 30:
             _wlt_reconcile_positions(wid, w)
+            _wlt_sync_vault(wid, w, live_prices)
             w["_last_reconcile_ts"] = time.time()
 
     for symbol, pos in list(w.get("positions", {}).items()):
