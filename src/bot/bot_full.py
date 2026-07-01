@@ -858,6 +858,9 @@ def _ws_remove(symbol: str):
 
 async def _ws_loop():
     import websockets  # type: ignore
+    # Stagger after _ws_create_loop (which itself starts at T+15s) to avoid simultaneous
+    # connection bursts that trigger IP-rate-limiting on shared RPC endpoints.
+    await asyncio.sleep(30)
     _backoff = 5
     while True:
         try:
