@@ -2553,6 +2553,12 @@ def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
         result = _wlt_live_buy(wid, w, symbol, usd, addr)
         if "error" in result:
             log(f"[W:{wid}] LIVE BUY FAILED {symbol}: {result['error']}")
+            w.setdefault("trade_log", []).append({
+                "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
+                "side": "buy_failed", "usd": usd, "error": result["error"],
+                "address": addr, "mode": w.get("mode") or CONFIG["mode"],
+            })
+            save_state()
             return
         filled = result["price"]
         units  = result["units"]
@@ -2604,6 +2610,12 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         if "error" in result:
             log(f"[W:{wid}] LIVE SELL FAILED {symbol}: {result['error']}")
             pos["sell_fail_ts"] = time.time()
+            w.setdefault("trade_log", []).append({
+                "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "sol"),
+                "side": "sell_failed", "usd": target_usd, "error": result["error"],
+                "exit_reason": exit_reason, "address": pos.get("address", ""),
+            })
+            save_state()
             return
         # Use actual proceeds to derive the effective exit price
         units_sold = result.get("units_sold", pos["units"])
@@ -2800,6 +2812,12 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
         if actual <= 0:
             cost = pos.get("usd", 0.0)
             log(f"[W:{wid}] RECONCILE {symbol}: on-chain balance=0 → closing ghost position (cost=${cost:.2f})")
+            w.setdefault("trade_log", []).append({
+                "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "sol"),
+                "side": "closed", "usd": 0.0, "pnl": None,
+                "exit_reason": "manual_sell_detected", "address": mint,
+                "entry_price": pos.get("avg", 0),
+            })
             w["positions"].pop(symbol, None)
             w["cur_deployed_usd"] = max(0.0, w.get("cur_deployed_usd", 0.0) - cost)
             changed = True

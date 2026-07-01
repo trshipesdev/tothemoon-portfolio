@@ -1689,6 +1689,27 @@
                     <span class="text-gray-700 flex-1">entry</span>
                     <span class="text-gray-700" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
                   </div>
+                  <!-- buy failed row -->
+                  <div x-show="t.side === 'buy_failed'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-red-950/40 text-xs border-l-2 border-red-700">
+                    <span class="text-red-400 font-semibold w-14 truncate" x-text="t.symbol"></span>
+                    <span class="text-red-600 font-mono w-16 text-right">BUY FAIL</span>
+                    <span class="text-red-800 truncate flex-1" x-text="t.error || ''"></span>
+                    <span class="text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+                  </div>
+                  <!-- sell failed row -->
+                  <div x-show="t.side === 'sell_failed'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-orange-950/40 text-xs border-l-2 border-orange-700">
+                    <span class="text-orange-400 font-semibold w-14 truncate" x-text="t.symbol"></span>
+                    <span class="text-orange-600 font-mono w-16 text-right">SELL FAIL</span>
+                    <span class="text-orange-800 truncate flex-1" x-text="(t.error || t.exit_reason || '')"></span>
+                    <span class="text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+                  </div>
+                  <!-- reconcile auto-close row -->
+                  <div x-show="t.side === 'closed'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-purple-950/40 text-xs border-l-2 border-purple-800">
+                    <span class="text-purple-400 font-semibold w-14 truncate" x-text="t.symbol"></span>
+                    <span class="text-purple-600 font-mono w-16 text-right">CLOSED</span>
+                    <span class="text-purple-800 truncate flex-1" x-text="t.exit_reason || 'reconciled'"></span>
+                    <span class="text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+                  </div>
                 </template>
               </div>
             </div>
