@@ -2383,7 +2383,85 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     }
     w.setdefault("trade_log", []).append(sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
+    _wallet_drawdown_check(wid, w)
     save_state()
+
+
+def _wallet_drawdown_check(wid: str, w: Dict):
+    """Three-tier drawdown protection on live wallets vs the real deposit (starting_usd).
+
+    Tier 1 — Velocity ($15 lost in 30 min): fires early even if total loss is small.
+    Tier 2 — Warning ($50 cumulative loss): serious alert, no pause yet.
+    Tier 3 — Hard stop ($100 cumulative loss): pauses wallet + critical Telegram alert.
+
+    Equity = vault_usd + open position cost basis (so unrealized losses count).
+    Alerts auto-reset if equity recovers back toward starting_usd.
+    """
+    if not w.get("live"):
+        return
+    start = w.get("starting_usd", 0)
+    if start <= 0:
+        return
+
+    # Total equity: cash in vault + cost basis of every open position
+    equity   = w.get("vault_usd", 0) + sum(
+        p.get("usd", 0) for p in w.get("positions", {}).values()
+    )
+    drawdown = start - equity   # positive = cumulative loss from deposit
+    alerted  = w.setdefault("dd_alerted", {})
+    label    = w.get("label", wid)
+
+    # ── Tier 3: Hard stop at $100 loss ───────────────────────────────────
+    if drawdown >= 100 and not alerted.get("stop"):
+        w["active"]      = False
+        alerted["stop"]  = True
+        send_alert(
+            f"🛑 HARD STOP — {label}\n"
+            f"Down ${drawdown:.0f} of your ${start:.0f} deposit. Bot PAUSED — no new entries.\n"
+            f"Current equity: ${equity:.2f}. Re-enable from dashboard when ready.",
+            critical=True)
+        log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — wallet paused")
+        return
+
+    # ── Tier 2: Serious warning at $50 loss ──────────────────────────────
+    if drawdown >= 50 and not alerted.get("warning"):
+        alerted["warning"] = True
+        send_alert(
+            f"🚨 WARNING — {label}\n"
+            f"Down ${drawdown:.0f} of your ${start:.0f} deposit. Equity: ${equity:.2f}.\n"
+            f"Hard stop triggers at $100 loss. Watch closely.",
+            critical=True)
+        log(f"[W:{wid}] WARNING — drawdown ${drawdown:.2f}")
+
+    # ── Tier 1: Velocity — losing $15+ in 30 min ─────────────────────────
+    now   = time.time()
+    snaps = w.setdefault("vault_snaps", [])
+    if not snaps or now - snaps[-1][0] > 300:          # snapshot every 5 min
+        snaps.append((now, equity))
+        if len(snaps) > 14:                             # keep ~70 min
+            snaps[:] = snaps[-14:]
+
+    old = [s for s in snaps if 1500 < now - s[0] < 2100]   # 25-35 min ago
+    if old:
+        velocity_loss = old[-1][1] - equity             # positive = lost money
+        if velocity_loss >= 15 and not alerted.get("velocity"):
+            alerted["velocity"] = True
+            send_alert(
+                f"⚡ VELOCITY — {label}\n"
+                f"Lost ${velocity_loss:.0f} in the last 30 min. Total down: ${drawdown:.0f} of ${start:.0f}.\n"
+                f"Equity: ${equity:.2f}. No action taken — heads up.",
+                critical=True)
+            log(f"[W:{wid}] VELOCITY WARNING — ${velocity_loss:.2f} in 30min")
+        elif velocity_loss < 5:
+            alerted.pop("velocity", None)   # reset once pace stabilises
+
+    # ── Reset level alerts when equity recovers ───────────────────────────
+    if drawdown < 15:
+        alerted.clear()
+    elif drawdown < 35:
+        alerted.pop("watch", None)
+    elif drawdown < 70:
+        alerted.pop("warning", None)
 
 
 def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
@@ -2428,10 +2506,15 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         _sf = w.get("safety", {})  # per-wallet safety overrides
 
         # Dollar stop — wallet override → mode default → base $12
+        # Use pos["usd"] (cost basis of REMAINING units, reduced on each partial sell)
+        # NOT deployed_usd (which only resets at full close — fires stop every tick after TP rung 1).
         _dollar_stop = _sf.get("dollar_stop_usd") or _mode_dollar_stop(mode_name)
-        _cost        = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
+        _cost        = pos.get("usd", 0) or 1e-9
         _cur_val     = pos["units"] * price
         _eff_stop    = max(_dollar_stop, _cost * 0.10)
+        if _cur_val < 0.01:
+            w.get("positions", {}).pop(symbol, None)
+            continue
         if _dollar_stop > 0 and (_cur_val - _cost) < -_eff_stop:
             exit_reason = f"DOLLAR STOP -${abs(_cur_val - _cost):.2f}"
 
@@ -2481,6 +2564,9 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         sl_level = pos.get("sl_override") or mode_cfg.get("sl", 0.18)
         if pos.get("units", 0) > 0 and price <= pos["avg"] * (1 - sl_level):
             _wlt_sell(wid, w, symbol, price, "fixed_sl")
+
+    # Periodic drawdown check — takes velocity snapshots even between sells
+    _wallet_drawdown_check(wid, w)
 
 
 def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
