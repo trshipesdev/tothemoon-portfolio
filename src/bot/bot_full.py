@@ -2390,9 +2390,11 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
 def _wallet_drawdown_check(wid: str, w: Dict):
     """Three-tier drawdown protection on live wallets vs the real deposit (starting_usd).
 
-    Tier 1 — Velocity ($15 lost in 30 min): fires early even if total loss is small.
-    Tier 2 — Warning ($50 cumulative loss): serious alert, no pause yet.
-    Tier 3 — Hard stop ($100 cumulative loss): pauses wallet + critical Telegram alert.
+    Tier 1 — Velocity ($15 lost in 30 min): alert only, no action.
+    Tier 2 — Warning ($50 cumulative loss): alert only, no action.
+    Tier 3 — Hard stop ($100 cumulative loss): block NEW entries immediately, but
+              let existing open positions run to their own exits. Once all positions
+              are closed, fully deactivate the wallet and send a final Telegram alert.
 
     Equity = vault_usd + open position cost basis (so unrealized losses count).
     Alerts auto-reset if equity recovers back toward starting_usd.
@@ -2403,24 +2405,50 @@ def _wallet_drawdown_check(wid: str, w: Dict):
     if start <= 0:
         return
 
+    label    = w.get("label", wid)
+    open_pos = {k: v for k, v in w.get("positions", {}).items() if v.get("units", 0) > 0}
+
+    # ── If already draining after hard stop: wait for positions to clear ──
+    if w.get("paused_new_entries") and not open_pos:
+        w["active"]             = False
+        w["paused_new_entries"] = False
+        send_alert(
+            f"🛑 FULLY PAUSED — {label}\n"
+            f"All positions closed. Bot deactivated. Re-enable from dashboard when ready.",
+            critical=True)
+        log(f"[W:{wid}] FULLY PAUSED — all positions closed, wallet deactivated")
+        return
+
     # Total equity: cash in vault + cost basis of every open position
     equity   = w.get("vault_usd", 0) + sum(
-        p.get("usd", 0) for p in w.get("positions", {}).values()
+        p.get("usd", 0) for p in open_pos.values()
     )
     drawdown = start - equity   # positive = cumulative loss from deposit
     alerted  = w.setdefault("dd_alerted", {})
-    label    = w.get("label", wid)
 
     # ── Tier 3: Hard stop at $100 loss ───────────────────────────────────
     if drawdown >= 100 and not alerted.get("stop"):
-        w["active"]      = False
-        alerted["stop"]  = True
-        send_alert(
-            f"🛑 HARD STOP — {label}\n"
-            f"Down ${drawdown:.0f} of your ${start:.0f} deposit. Bot PAUSED — no new entries.\n"
-            f"Current equity: ${equity:.2f}. Re-enable from dashboard when ready.",
-            critical=True)
-        log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — wallet paused")
+        alerted["stop"]           = True
+        w["paused_new_entries"]   = True   # block new entries immediately
+        n_open = len(open_pos)
+        if n_open == 0:
+            # No open positions — deactivate now
+            w["active"]             = False
+            w["paused_new_entries"] = False
+            send_alert(
+                f"🛑 HARD STOP — {label}\n"
+                f"Down ${drawdown:.0f} of your ${start:.0f} deposit. No open positions — bot DEACTIVATED.\n"
+                f"Equity: ${equity:.2f}. Re-enable from dashboard when ready.",
+                critical=True)
+            log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — no positions, deactivated immediately")
+        else:
+            send_alert(
+                f"🛑 HARD STOP — {label}\n"
+                f"Down ${drawdown:.0f} of your ${start:.0f} deposit. No new entries.\n"
+                f"Letting {n_open} open position(s) run to their exits, then fully pausing.\n"
+                f"Equity: ${equity:.2f}.",
+                critical=True)
+            log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — draining {n_open} position(s)")
         return
 
     # ── Tier 2: Serious warning at $50 loss ──────────────────────────────
@@ -2581,6 +2609,8 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
     """
     for wid, w in STATE.get("wallets", {}).items():
         if not w.get("active"):
+            continue
+        if w.get("paused_new_entries"):
             continue
         if symbol in scan_entered.get(wid, set()):
             continue
@@ -5054,6 +5084,8 @@ def api_wallet_update(wid):
         w["mode"] = m if (m and m in CONFIG["modes"]) else None
     if "active" in data:
         w["active"]   = bool(data["active"])
+        if w["active"]:
+            w.pop("paused_new_entries", None)   # re-enable clears hard-stop block
     if "address" in data:
         w["address"] = str(data["address"]).strip()
     if "starting_usd" in data:
