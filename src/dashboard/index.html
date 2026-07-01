@@ -99,7 +99,7 @@
   <main class="flex-1 overflow-auto p-4">
 
     <!-- WALLET (Coinbase-style total balance) -->
-    <div x-show="tab === 'Wallet'" class="max-w-2xl mx-auto">
+    <div x-show="tab === 'Shadow'" class="max-w-2xl mx-auto">
       <div class="text-center py-6">
         <div class="text-gray-500 text-xs uppercase tracking-wider mb-1">Total Balance
           <span x-show="state.shadow_mode" class="text-yellow-500">· paper</span>
@@ -1331,7 +1331,7 @@
     </div>
 
     <!-- WALLETS -->
-    <div x-show="tab === 'Wallets'" class="space-y-4">
+    <div x-show="tab === 'Hot Wallet'" class="space-y-4">
       <div class="flex items-center justify-between flex-wrap gap-2">
         <p class="text-gray-400 text-sm">Independent vaults running the same scanner — each with its own balance, mode, and trade history.</p>
         <div class="flex gap-2">
@@ -2466,8 +2466,8 @@
 <script>
 function app() {
   return {
-    tabs: ['Wallet', 'Positions', 'Scout', 'Controls', 'History', 'Backtest', 'Arena', 'Wallets', 'Audit', 'Alerts', 'RPC', 'Settings'],
-    tab:  'Wallet',
+    tabs: ['Hot Wallet', 'Positions', 'Scout', 'Controls', 'History', 'Shadow', 'Backtest', 'Arena', 'Audit', 'Alerts', 'RPC', 'Settings'],
+    tab:  'Hot Wallet',
 
     state:   { shadow_mode: true, mode: '…', signals: {}, objective: {}, watchlist: {} },
     pos:     {},
@@ -2594,12 +2594,13 @@ function app() {
       // Restore the last-selected tab across page refreshes
       const savedTab = localStorage.getItem('dash_tab');
       if (savedTab && this.tabs.includes(savedTab)) this.tab = savedTab;
+      else this.tab = 'Hot Wallet';
       this.$watch('tab', v => {
         localStorage.setItem('dash_tab', v);
         if (v === 'History')  this.$nextTick(() => this.drawChart());
         if (v === 'Backtest') this.$nextTick(() => this.runBacktest());
         if (v === 'Arena')    this.$nextTick(() => this.loadArenas());
-        if (v === 'Wallets')  this.$nextTick(() => this.loadWallets());
+        if (v === 'Hot Wallet') this.$nextTick(() => this.loadAndOpenHotWallet());
         if (v === 'Audit')    this.$nextTick(() => this.loadAudit());
       });
       this.$watch('btParams', () => this.runBacktest(), { deep: true });
@@ -2649,6 +2650,22 @@ function app() {
       if (h) { this.history = h; this.$nextTick(() => this.drawChart(h)); }
       if (al)  this.alerts  = al;
       if (rpc) this.rpc     = rpc;
+      // Keep hot wallet in sync on every refresh tick
+      if (this.tab === 'Hot Wallet') {
+        const wr = await this.get('/api/wallets');
+        if (wr) this.wallets = wr;
+        if (this.walletDetail) {
+          const wid = this.walletDetail;
+          const [t, pos2, m] = await Promise.all([
+            this.get(`/api/wallets/${wid}/trades`),
+            this.get(`/api/wallets/${wid}/positions`),
+            this.get(`/api/wallets/${wid}/missed`),
+          ]);
+          if (t) this.walletTrades = t.slice().reverse();
+          if (pos2) this.walletPositions = pos2;
+          if (m) this.walletMisses = m.missed || [];
+        }
+      }
       this.lastRefresh = new Date().toLocaleTimeString();
       this.loadBlocks();
     },
@@ -2744,6 +2761,21 @@ function app() {
     async loadWallets() {
       const r = await this.get('/api/wallets');
       if (r) this.wallets = r;
+    },
+    async loadAndOpenHotWallet() {
+      await this.loadWallets();
+      const wid = Object.keys(this.wallets || {})[0];
+      if (wid && this.walletDetail !== wid) {
+        this.walletDetail = wid;
+        const [t, p, m] = await Promise.all([
+          this.get(`/api/wallets/${wid}/trades`),
+          this.get(`/api/wallets/${wid}/positions`),
+          this.get(`/api/wallets/${wid}/missed`),
+        ]);
+        if (t) this.walletTrades = t.slice().reverse();
+        if (p) this.walletPositions = p;
+        if (m) this.walletMisses = m.missed || [];
+      }
     },
     async openWallet(wid) {
       this.walletDetail = (this.walletDetail === wid) ? null : wid;
