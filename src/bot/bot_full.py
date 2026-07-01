@@ -2392,6 +2392,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     w.setdefault("trade_log", []).append(sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
     _wallet_drawdown_check(wid, w)
+    _wlt_maybe_sweep(wid, w)
     save_state()
 
 
@@ -3307,8 +3308,9 @@ def _find_sol_ata(wallet: str, mint: str) -> str:
     return str(ata)
 
 
-def _sweep_usdc_sol(amount_usdc: float, cold_address: str) -> str:
-    """Send amount_usdc USDC from the hot wallet to cold_address. Returns tx signature."""
+def _sweep_usdc_sol(amount_usdc: float, cold_address: str, kp=None) -> str:
+    """Send amount_usdc USDC from hot_wallet to cold_address. Returns tx signature.
+    kp defaults to the main bot keypair; pass a wallet keypair to sweep from a sub-wallet."""
     import base64, struct
     from solders.pubkey import Pubkey          # type: ignore
     from solders.instruction import AccountMeta, Instruction  # type: ignore
@@ -3316,7 +3318,7 @@ def _sweep_usdc_sol(amount_usdc: float, cold_address: str) -> str:
     from solders.transaction import VersionedTransaction  # type: ignore
     from solders.hash import Hash              # type: ignore
 
-    kp      = _sol_keypair()
+    kp      = kp or _sol_keypair()
     hot_pk  = kp.pubkey()
     cold_pk = Pubkey.from_string(cold_address)
     mint_pk = Pubkey.from_string(USDC_MINT_SOL)
@@ -3404,6 +3406,41 @@ def _maybe_sweep():
         log(f"SWEEP ${amount:.2f} USDC → {cold_addr[:8]}… sig={sig[:16]}…")
     except Exception as e:
         log(f"SWEEP FAILED: {e}")
+
+
+def _wlt_maybe_sweep(wid: str, w: Dict):
+    """After a live wallet sell: if vault_usd > sweep threshold, send excess USDC to cold wallet.
+    Uses the wallet's own keypair — not the main bot's key."""
+    if not w.get("live"):
+        return
+    cold_addr = (w.get("sweep_address") or os.getenv("SWEEP_SOL_ADDRESS", "")).strip()
+    above_usd = float(w.get("sweep_above_usd") or os.getenv("SWEEP_ABOVE_USD", "0") or 0)
+    keep_usd  = float(w.get("sweep_keep_usd")  or os.getenv("SWEEP_KEEP_USD",  "200") or 200)
+    if not cold_addr or above_usd <= 0:
+        return
+    balance = w.get("vault_usd", 0.0)
+    if balance <= above_usd:
+        return
+    amount = round(balance - keep_usd, 2)
+    if amount < 1.0:
+        return
+    kp = _wallet_keypairs.get(wid)
+    if not kp:
+        log(f"[W:{wid}] SWEEP SKIPPED — no keypair loaded")
+        return
+    try:
+        sig = _sweep_usdc_sol(amount, cold_addr, kp=kp)
+        w["vault_usd"] = round(w["vault_usd"] - amount, 4)
+        entry = {
+            "ts": now_utc().isoformat(), "amount_usd": amount,
+            "to": cold_addr, "sig": sig,
+        }
+        w.setdefault("sweep_log", []).append(entry)
+        w["total_swept_usd"] = round(w.get("total_swept_usd", 0.0) + amount, 2)
+        log(f"[W:{wid}] SWEEP ${amount:.2f} USDC → {cold_addr[:8]}… sig={sig[:16]}…")
+        send_alert(f"💸 SWEEP — {w.get('label', wid)}\n${amount:.2f} USDC → cold wallet {cold_addr[:8]}…")
+    except Exception as e:
+        log(f"[W:{wid}] SWEEP FAILED: {e}")
 
 
 # ---------------------------------------------------------------------------
