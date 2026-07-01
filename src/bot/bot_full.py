@@ -2249,6 +2249,8 @@ def _wlt_size(w: Dict, symbol: str, chain: str, liq: float,
     mult   = float(w.get("safety", {}).get("dollar_stop_pos_mult") or
                    CONFIG["moonshot"].get("dollar_stop_pos_mult", 4.0))
     usd = min(usd, d_stop * mult)
+    # Small random jitter (±2%) so every bet isn't a round identical number on-chain
+    usd = round(usd * random.uniform(0.98, 1.02), 2)
     return usd
 
 
