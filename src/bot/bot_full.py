@@ -5,7 +5,7 @@ import os, io, json, time, random, asyncio, threading, traceback, base64, struct
 from collections import deque
 from datetime import datetime, timezone, timedelta
 import requests
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -622,6 +622,8 @@ _ws_subs:  Dict[str, Dict] = {}     # symbol -> {curve}
 _ws_lock   = threading.Lock()
 _ws_thread_obj: Optional[threading.Thread] = None
 _SOL_USD: Dict[str, Any] = {"price": 0.0, "ts": 0.0}
+_SOL_PRICE_HIST: List[Tuple[float, float]] = []           # (unix_ts, price_usd)
+_SOL_ALERT_LAST: Dict[str, float] = {"crash": 0.0, "pump": 0.0}
 
 
 def _sol_usd_cached() -> float:
@@ -639,6 +641,55 @@ def _sol_usd_cached() -> float:
         except Exception:
             pass
     return _SOL_USD["price"] or 180.0
+
+
+def _sol_monitor_loop():
+    """Track SOL/USD history and send Telegram alerts on big price moves."""
+    while True:
+        time.sleep(120)
+        try:
+            price = _sol_usd_cached()
+            now   = time.time()
+            _SOL_PRICE_HIST.append((now, price))
+            # Trim to 25h
+            cutoff = now - 25 * 3600
+            while _SOL_PRICE_HIST and _SOL_PRICE_HIST[0][0] < cutoff:
+                _SOL_PRICE_HIST.pop(0)
+            if len(_SOL_PRICE_HIST) < 3:
+                continue
+            # (label, lookback_secs, crash_threshold_pct, pump_threshold_pct)
+            windows = [
+                ("15m",    15 * 60,  -4.0,  6.0),
+                ("1h",     60 * 60,  -8.0, 12.0),
+                ("4h",    240 * 60, -15.0, 20.0),
+                ("24h",  1440 * 60, -25.0, 35.0),
+            ]
+            cooldown = 30 * 60  # don't repeat same direction within 30 min
+            for label, secs, crash_thr, pump_thr in windows:
+                ref_prices = [(t, p) for t, p in _SOL_PRICE_HIST if t <= now - secs]
+                if not ref_prices:
+                    continue
+                ref = ref_prices[-1][1]
+                pct = (price - ref) / ref * 100
+                if pct <= crash_thr and now - _SOL_ALERT_LAST["crash"] > cooldown:
+                    send_alert(
+                        f"⚠️ SOL dropping: {pct:+.1f}% in {label}\n"
+                        f"${ref:.2f} → ${price:.2f}\n"
+                        f"Bot is live — positions being watched.",
+                        critical=True,
+                    )
+                    _SOL_ALERT_LAST["crash"] = now
+                    break
+                if pct >= pump_thr and now - _SOL_ALERT_LAST["pump"] > cooldown:
+                    send_alert(
+                        f"🚀 SOL pumping: {pct:+.1f}% in {label}\n"
+                        f"${ref:.2f} → ${price:.2f}",
+                        critical=True,
+                    )
+                    _SOL_ALERT_LAST["pump"] = now
+                    break
+        except Exception as e:
+            log(f"SOL monitor: {e}")
 
 
 def _pf_curve_address(mint: str) -> Optional[str]:
@@ -7092,6 +7143,7 @@ def main():
             _ws_add(sym, p["address"])
     start_flask()
     threading.Thread(target=engine_loop, daemon=True).start()
+    threading.Thread(target=_sol_monitor_loop, name="sol-monitor", daemon=True).start()
     start_telegram()
 
 
