@@ -3211,15 +3211,16 @@ def exec_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reason
 # ---------------------------------------------------------------------------
 # Wallet balance fetch
 # ---------------------------------------------------------------------------
-def fetch_sol_balance() -> float:
-    """Return USDC balance on Solana in USD."""
+def fetch_sol_balance(address: str = "") -> float:
+    """Return USDC balance on Solana in USD. Pass address to check any wallet; defaults to main bot."""
     try:
-        kp     = _sol_keypair()
-        pubkey = str(kp.pubkey())
-        rpc    = _sol_rpc()
-        resp   = requests.post(rpc, json={
+        if not address:
+            kp      = _sol_keypair()
+            address = str(kp.pubkey())
+        rpc  = _sol_rpc()
+        resp = requests.post(rpc, json={
             "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
-            "params": [pubkey, {"mint": USDC_MINT_SOL}, {"encoding": "jsonParsed"}],
+            "params": [address, {"mint": USDC_MINT_SOL}, {"encoding": "jsonParsed"}],
         }, timeout=10)
         accounts = resp.json().get("result", {}).get("value", [])
         return sum(
@@ -5208,8 +5209,14 @@ def api_wallet_update(wid):
         w["live"] = want_live
         # Going live → wipe shadow history so stats reflect real trades only
         if want_live and not was_live:
+            # Read actual on-chain USDC balance so vault starts at the real number
+            hot_addr = w.get("address", "")
+            on_chain = fetch_sol_balance(hot_addr) if hot_addr else 0.0
+            actual_balance = on_chain if on_chain > 0 else float(w.get("starting_usd", 0))
+            if on_chain > 0:
+                w["starting_usd"] = round(actual_balance, 2)   # anchor drawdown to real deposit
             w["trade_log"]       = []
-            w["vault_usd"]       = float(w.get("starting_usd", 0))
+            w["vault_usd"]       = round(actual_balance, 2)
             w["take_home_usd"]   = 0.0
             w["total_swept_usd"] = 0.0
             w["sweep_log"]       = []
