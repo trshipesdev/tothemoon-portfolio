@@ -2568,6 +2568,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         result     = _wlt_live_sell(wid, w, pos, target_usd, price)
         if "error" in result:
             log(f"[W:{wid}] LIVE SELL FAILED {symbol}: {result['error']}")
+            pos["sell_fail_ts"] = time.time()
             return
         # Use actual proceeds to derive the effective exit price
         units_sold = result.get("units_sold", pos["units"])
@@ -2742,6 +2743,11 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         liq       = px["liq"]
         change_m5 = px.get("change_m5", 0)
         if price <= 0:
+            continue
+
+        # Back off 60s after any sell failure — prevents tight retry loop when
+        # Jupiter has no route or a TX fails on-chain
+        if time.time() - pos.get("sell_fail_ts", 0) < 60:
             continue
 
         # Track peak
