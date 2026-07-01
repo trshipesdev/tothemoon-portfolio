@@ -616,6 +616,9 @@ LUNARCRUSH_KEY_ENV   = "LUNARCRUSH_API_KEY"
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 # SOL_WSS_URL env overrides the default public endpoint (set to Helius/QuickNode for prod).
 SOL_WSS_URL = os.getenv("SOL_WSS_URL", "wss://api.mainnet-beta.solana.com")
+# Separate URL for the pump.fun create loop — allows price WS and create WS to use different endpoints
+# (e.g., Helius for price tracking, public Solana for create detection to avoid concurrent-connection limits).
+SOL_CREATE_WSS_URL = os.getenv("SOL_CREATE_WSS_URL", SOL_WSS_URL)
 
 WS_PRICES: Dict[str, Dict] = {}     # symbol -> {price, liq, ts}
 _ws_subs:  Dict[str, Dict] = {}     # symbol -> {curve}
@@ -1063,7 +1066,7 @@ async def _ws_create_loop():
     while True:
         try:
             async with websockets.connect(
-                SOL_WSS_URL, ping_interval=20, ping_timeout=30, max_size=10_000_000
+                SOL_CREATE_WSS_URL, ping_interval=20, ping_timeout=30, max_size=10_000_000
             ) as ws:
                 _backoff = 5  # reset on successful connect
                 log("WS-create: connected, subscribing to Pump.fun log events")
