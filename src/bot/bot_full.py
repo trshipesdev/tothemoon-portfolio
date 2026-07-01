@@ -2343,6 +2343,37 @@ def _sol_confirm_tx(sig: str, max_wait: int = 30):
     raise RuntimeError(f"tx not confirmed within {max_wait}s")
 
 
+def _sol_get_all_token_balances(owner_addr: str) -> Dict[str, float]:
+    """Return {mint: ui_amount} for all non-zero SPL token accounts owned by owner_addr.
+
+    ui_amount is already adjusted for token decimals (human-readable units, same scale
+    as pos['units']). Uses confirmed commitment to avoid stale reads right after a TX.
+    """
+    rpc = _sol_rpc()
+    try:
+        resp = requests.post(rpc, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                owner_addr,
+                {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ],
+        }, timeout=15).json()
+        out: Dict[str, float] = {}
+        for acct in resp.get("result", {}).get("value", []):
+            info = (acct.get("account", {}).get("data", {})
+                    .get("parsed", {}).get("info", {}))
+            mint = info.get("mint", "")
+            ui   = float(info.get("tokenAmount", {}).get("uiAmount") or 0)
+            if mint and ui > 0:
+                out[mint] = ui
+        return out
+    except Exception as e:
+        log(f"WARN _sol_get_all_token_balances: {e}")
+        return {}
+
+
 def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict:
     """Submit a real Jupiter buy for a live wallet. Returns {price, units, sig} or {error}."""
     kp = _wallet_keypairs.get(wid)
@@ -2364,9 +2395,13 @@ def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict
             return {"error": "jupiter_swap_build_failed"}
         sig       = _sol_submit_tx(tx_b64, kp)
         _sol_confirm_tx(sig)
-        tok_dec   = _sol_token_decimals(addr)
-        out_units = int(quote["outAmount"]) / 10 ** tok_dec
-        filled_px = usd / out_units if out_units else 0
+        # Brief pause so the RPC state reflects the confirmed slot before querying balances
+        time.sleep(1)
+        balances  = _sol_get_all_token_balances(str(kp.pubkey()))
+        out_units = balances.get(addr, 0.0)
+        if out_units <= 0:
+            raise RuntimeError("buy confirmed on-chain but 0 tokens received — likely bonding curve edge case")
+        filled_px = usd / out_units
         return {"price": filled_px, "units": out_units, "sig": sig}
     except Exception as e:
         return {"error": str(e)}
@@ -2730,10 +2765,65 @@ def _wallet_drawdown_check(wid: str, w: Dict):
         alerted.pop("warning", None)
 
 
+def _wlt_reconcile_positions(wid: str, w: Dict):
+    """Fetch on-chain token balances and auto-close positions with 0 balance.
+
+    Catches manual sells, failed-buy ghosts, and any on-chain divergence from bot state.
+    Skips positions entered within the last 60s to avoid RPC propagation lag.
+    """
+    if not w.get("live"):
+        return
+    owner_addr = w.get("address", "")
+    if not owner_addr:
+        return
+    open_pos = {s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0}
+    if not open_pos:
+        return
+
+    balances = _sol_get_all_token_balances(owner_addr)
+    changed  = False
+    now_ts   = time.time()
+
+    for symbol, pos in list(open_pos.items()):
+        mint = pos.get("address", "")
+        if not mint:
+            continue
+        try:
+            entry_ts = datetime.fromisoformat(pos.get("entry_ts", "")).timestamp()
+        except Exception:
+            entry_ts = 0
+        if now_ts - entry_ts < 60:
+            continue
+
+        actual = balances.get(mint, 0.0)
+
+        if actual <= 0:
+            cost = pos.get("usd", 0.0)
+            log(f"[W:{wid}] RECONCILE {symbol}: on-chain balance=0 → closing ghost position (cost=${cost:.2f})")
+            w["positions"].pop(symbol, None)
+            w["cur_deployed_usd"] = max(0.0, w.get("cur_deployed_usd", 0.0) - cost)
+            changed = True
+        elif actual < pos["units"] * 0.9:
+            frac = actual / max(pos["units"], 1e-9)
+            log(f"[W:{wid}] RECONCILE {symbol}: units {pos['units']:.4f} → {actual:.4f} (on-chain)")
+            pos["units"] = actual
+            pos["usd"]   = pos.get("usd", 0.0) * frac
+            changed = True
+
+    if changed:
+        save_state()
+
+
 def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
     """Run the exit loop for one wallet's open positions using its mode's params."""
     MS        = CONFIG["moonshot"]
     liq_prev  = w.setdefault("liq_prev", {})
+
+    # Periodic on-chain reconciliation for live wallets — detects manual sells
+    if w.get("live") and w.get("address"):
+        if time.time() - w.get("_last_reconcile_ts", 0) >= 30:
+            _wlt_reconcile_positions(wid, w)
+            w["_last_reconcile_ts"] = time.time()
 
     for symbol, pos in list(w.get("positions", {}).items()):
         if pos.get("units", 0) <= 0:
