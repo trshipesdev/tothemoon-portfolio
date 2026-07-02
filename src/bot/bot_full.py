@@ -1581,7 +1581,13 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     # Max-hype override (SOL only): if the community is at 100 hype, the early signal
     # outweighs thin liquidity — lower the floor to 5k. $24 position on a 5k pool
     # is 0.5% price impact, acceptable. This is what catches the early +1000% movers.
-    if chain == "sol" and sc.hype >= 100:
+    # A hyped token on a razor-thin pool is exactly the setup that can rug in minutes
+    # (TRENCH, 2026-07-02: liq $13.5k, hype 100, rugged to $0 liq ~13min after entry —
+    # bot's rug-detector caught it, but the entry itself was still a thin-liq gamble).
+    # Hype alone doesn't confirm real buying — buy_ratio does, so raise that bar
+    # specifically when this override is what let the candidate through.
+    _low_liq_override = chain == "sol" and sc.hype >= 100 and liq_min > 5000
+    if _low_liq_override:
         liq_min = min(liq_min, 5000)
     hype_min = max(50, ms["hype_min"] - (20 if spraying else 0))
     if sc.liq < liq_min * 0.90:
@@ -1608,7 +1614,12 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     if sc.hype < hype_min:
         return f"hype {sc.hype} below min {hype_min}"
     # Buyer/seller pressure — skip tokens being actively dumped (more sells than buys).
+    # Demand a much stronger buy ratio when the max-hype override is the only reason
+    # this thin-liquidity candidate is still in play — hype score alone doesn't confirm
+    # real buying pressure, and a razor-thin pool has no room to absorb a wrong call.
     br_min = ms.get("buy_ratio_min", 0.45)
+    if _low_liq_override:
+        br_min = max(br_min, 0.70)
     if sc.buy_ratio is not None and sc.buy_ratio < br_min:
         return f"selling pressure — only {sc.buy_ratio*100:.0f}% of trades are buys"
     return None
