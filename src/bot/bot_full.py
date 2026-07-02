@@ -7844,6 +7844,7 @@ _CHAT_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("audit"), KeyboardButton("history"), KeyboardButton("market")],
         [KeyboardButton("scout"), KeyboardButton("scout entries"),
          KeyboardButton("scout rejections"), KeyboardButton("scout suggested")],
+        [KeyboardButton("/wallet"), KeyboardButton("/help_long")],
     ],
     resize_keyboard=True,
 )
