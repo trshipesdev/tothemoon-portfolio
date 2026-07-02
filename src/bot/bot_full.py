@@ -6498,6 +6498,19 @@ def require_auth(fn):
     async def w(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update and update.effective_user and not tg_allowed(update.effective_user.id):
             return
+        # Self-heal the proactive-alert chat id from ANY authenticated command, not
+        # just /start. owner_chat_id is what send_alert() needs to push unprompted
+        # messages (drawdown warnings, sell/rug alerts, digests) — if it's never
+        # set (e.g. wiped by a server migration), those alerts silently no-op
+        # forever while normal replies keep working, which looks like "only
+        # responds when messaged first."
+        if update and update.effective_chat:
+            cid = update.effective_chat.id
+            tg = STATE.setdefault("telegram", {})
+            if tg.get("owner_chat_id") != cid:
+                tg["owner_chat_id"] = cid
+                save_state()
+                log(f"Telegram: owner_chat_id linked ({cid}) via {fn.__name__}")
         return await fn(update, context)
     return w
 
@@ -7525,6 +7538,9 @@ def start_telegram():
     tg.add_handler(CommandHandler("shadow",       cmd_shadow))
     tg.add_handler(CommandHandler("version",      cmd_version))
     tg.add_handler(CommandHandler("restart",      cmd_restart))
+    if not STATE.get("telegram", {}).get("owner_chat_id"):
+        log("WARN Telegram: owner_chat_id not set — proactive alerts (drawdown/sell/rug/digest) "
+            "won't send until you message the bot once (any command works, e.g. /status)")
     log("Telegram polling started")
     tg.run_polling(allowed_updates=["message"], drop_pending_updates=False)
 
