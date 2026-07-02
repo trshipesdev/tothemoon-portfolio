@@ -2765,6 +2765,7 @@ _TIER_MULTS = [1.0, 0.5, 1.0, 1.25, 1.5, 2.0]
 SPRAY_TP_USD         = 2.0
 SPRAY_STOP_PCT        = 0.30
 SPRAY_MAX_CONCURRENT  = 5
+SPRAY_MAX_LEG_FRAC    = 0.40   # never sell more than this fraction of the position in one leg
 
 
 def _symbol_tier_mult(addr: str) -> float:
@@ -3651,18 +3652,26 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
             # dollar take-profit instead of the normal % ladder. User (2026-07-02):
             # "instead of reaching $2 profit and getting out, making it should be
             # just keep taking out the $2 profits and letting it ride until the bot
-            # thinks its time to pull it." Every time UNREALIZED gain on the
-            # remaining units reaches $2, bank exactly $2 of profit (not $2 of
-            # position value) and let the rest keep riding — repeats indefinitely.
-            # Once gain stalls under $2, the position just falls through to the
-            # normal trailing-stop/rug logic below like any other position — that's
-            # "until the bot thinks it's time to pull it."
+            # thinks its time to pull it." Once gain stalls, the position falls
+            # through to the normal trailing-stop/rug logic below like any other
+            # position — that's "until the bot thinks it's time to pull it."
+            #
+            # FIXED same day: solving for the exact fraction that yields $2 of
+            # profit (frac = $2/gain) sells ~95% of the position the moment gain
+            # first crosses $2, since $2 is 40% of a $5 ticket — there's rarely
+            # more profit sitting there to leave behind, so it degenerated into a
+            # near-full exit almost every time, not a real "ride." Capped at
+            # SPRAY_MAX_LEG_FRAC (40%) per leg instead: takes UP TO $2 (whatever
+            # fits in 40% of the position), so at least 60% always survives to
+            # actually ride, compounding across multiple legs on a real winner.
             _gain_usd = _cur_val_now - pos["usd"]
             if _gain_usd >= SPRAY_TP_USD:
-                _frac     = SPRAY_TP_USD / _gain_usd   # solves proceeds-cost=$2 exactly
+                _frac_for_exact_2 = SPRAY_TP_USD / _gain_usd
+                _frac     = min(_frac_for_exact_2, SPRAY_MAX_LEG_FRAC)
                 _sell_usd = pos["usd"] * _frac
+                _leg_pnl  = _frac * _gain_usd
                 if _sell_usd > 0.01:
-                    _wlt_sell(wid, w, symbol, price, "SPRAY TP +$2", sell_usd=_sell_usd)
+                    _wlt_sell(wid, w, symbol, price, f"SPRAY TP +${_leg_pnl:.2f}", sell_usd=_sell_usd)
         else:
             deployed      = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
             moonbag_floor = moonbag_frac * deployed
