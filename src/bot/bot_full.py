@@ -7372,7 +7372,7 @@ def manage_positions():
                     tail = (f" Keeping a {moonbag_frac*100:.0f}% moon bag riding for a bigger run."
                             if last else " Letting the rest ride higher.")
                     send_alert(
-                        f"✅ TOOK PROFIT on {s} (+{gain*100:.0f}%) — banked ${pnl:+.2f} on {frac*100:.0f}% "
+                        f"✅ TOOK PROFIT (paper) on {s} (+{gain*100:.0f}%) — banked ${pnl:+.2f} on {frac*100:.0f}% "
                         f"of the position.{tail} (Rung #{i+1}.)")
                     tp_hit = True
                 save_state()
