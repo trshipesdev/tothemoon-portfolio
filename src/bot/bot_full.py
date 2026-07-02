@@ -7919,7 +7919,8 @@ async def cmd_doge_band(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/status /mode /objective /moonshot /auto_old\n"
+        "REAL WALLET: /wallet /wmode /wactive /whold /wbuy /wsell /wsell_at /wbuy_at\n"
+        "Paper engine: /status /mode /objective /moonshot /auto_old\n"
         "/skim /spray_until /boost /export_state /import_state\n"
         "/doge_core /doge_band\n"
         "/buy /sell /shadow /version /restart\n"
@@ -7933,6 +7934,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help_long(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Modes: safe / default / hype / degen\n\n"
+        "── REAL WALLET (acts on your live hot wallet) ──\n"
+        "/wallet                              — status: mode, equity, open positions, flags\n"
+        "/wmode <mode>                        — change the wallet's mode\n"
+        "/wactive [on|off]                    — pause/resume all new entries (no arg toggles)\n"
+        "/whold SYMBOL [on|off]                — HOLD a position (blocks noise exits, not rug/TP)\n"
+        "/wbuy SYMBOL USD [ADDRESS]           — manual buy; ADDRESS only needed for a new token\n"
+        "/wsell SYMBOL [USD|%|all]            — manual sell (default: all)\n"
+        "/wsell_at SYMBOL <VALUE_USD|off>     — sell target: closes position at this $ value\n"
+        "/wbuy_at SYMBOL <VALUE_USD|off> [ADD_USD] [repeat] — buy-more trigger at a $ value\n\n"
+        "── Paper/shadow engine (simulation, not real money) ──\n"
         "/objective target <usd> <weeks>  — set a profit target\n"
         "/objective off                   — clear objective\n"
         "/moonshot enter|suggest          — auto-enter or alert on new launches\n"
@@ -7944,8 +7955,8 @@ async def cmd_help_long(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/import_state {key: val}         — patch state with inline JSON\n"
         "/doge_core <units>               — set DOGE core bag target\n"
         "/doge_band <min> <max>           — set DOGE trim exit band\n"
-        "/buy SYMBOL USD [chain] [price]  — manual buy\n"
-        "/sell SYMBOL <USD|%|all> [price] — manual sell\n"
+        "/buy SYMBOL USD [chain] [price]  — manual buy (paper)\n"
+        "/sell SYMBOL <USD|%|all> [price] — manual sell (paper)\n"
         "/shadow on|off                   — toggle paper trading\n"
         "/start                           — link this chat for proactive alerts\n"
         "/version                         — build info\n"
@@ -8008,6 +8019,266 @@ async def cmd_sell(update, context):
         )
     except Exception:
         await update.message.reply_text("Usage: /sell SYMBOL <USD|%|all> [price] [liq]")
+
+
+# ---------------------------------------------------------------------------
+# Wallet commands — real-money equivalents of /status /buy /sell /mode.
+# User (2026-07-02): "i need to be able to communicate with it for a lot of
+# things... i need it to be able to trigger things. i need an essentially
+# fully working dashboard via telegram." Every existing command above
+# (/status, /buy, /sell, /mode) only ever touched the paper engine
+# (STATE["positions"]) — none of them could see or act on the real wallet at
+# all. These reuse the exact same backend functions the dashboard calls
+# (_wlt_buy, _wlt_sell, sell_trigger/buy_trigger fields) so behavior is
+# identical either way.
+# ---------------------------------------------------------------------------
+
+def _default_wallet_id() -> Optional[str]:
+    """Pick the wallet a wallet-command targets when none is specified — the
+    first live wallet, or the first wallet at all if none are live."""
+    wallets = STATE.get("wallets", {})
+    for wid, w in wallets.items():
+        if w.get("live"):
+            return wid
+    return next(iter(wallets), None)
+
+
+@require_auth
+async def cmd_wallet(update, context):
+    wid = _default_wallet_id()
+    if not wid:
+        await update.message.reply_text("No wallets configured.")
+        return
+    w = STATE["wallets"][wid]
+    pos_lines = []
+    for sym, p in w.get("positions", {}).items():
+        if p.get("units", 0) <= 0:
+            continue
+        flags = []
+        if p.get("sell_paused"):  flags.append("HOLD")
+        if p.get("spray"):        flags.append("spray")
+        if p.get("sell_trigger"): flags.append(f"sell@${p['sell_trigger']['value_usd']:.0f}")
+        if p.get("buy_trigger"):  flags.append(f"buy@${p['buy_trigger']['value_usd']:.0f}")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        pos_lines.append(f"  {sym}: ${p.get('usd', 0):.2f}{flag_str}")
+    msg = (
+        f"Wallet: {w.get('label', wid)}\n"
+        f"Mode: {w.get('mode')}  Active: {'yes' if w.get('active') else 'PAUSED'}  "
+        f"Live: {'yes' if w.get('live') else 'no'}\n"
+        f"Equity: ${w.get('equity_usd', 0):.2f}  Vault: ${w.get('vault_usd', 0):.2f}\n"
+        f"Net PnL: ${w.get('net_pnl', 0):.2f}  Win rate: {w.get('win_rate', 0):.0f}%\n"
+        f"Open positions ({len(pos_lines)}):\n"
+        + ("\n".join(pos_lines) if pos_lines else "  (none)")
+    )
+    await update.message.reply_text(msg)
+
+
+@require_auth
+async def cmd_wmode(update, context):
+    wid = _default_wallet_id()
+    if not wid:
+        await update.message.reply_text("No wallets configured.")
+        return
+    w = STATE["wallets"][wid]
+    valid = list(CONFIG["modes"].keys())
+    if not context.args or context.args[0].lower() not in valid:
+        await update.message.reply_text(f"Usage: /wmode <{'|'.join(valid)}>\nCurrent: {w.get('mode')}")
+        return
+    m = context.args[0].lower()
+    w["mode"] = m
+    save_state()
+    send_alert(f"⚙️ Mode changed to {m} on {w.get('label', wid)} (Telegram)", critical=True)
+    await update.message.reply_text(f"{w.get('label', wid)} mode set to {m}")
+
+
+@require_auth
+async def cmd_wactive(update, context):
+    wid = _default_wallet_id()
+    if not wid:
+        await update.message.reply_text("No wallets configured.")
+        return
+    w = STATE["wallets"][wid]
+    arg = context.args[0].lower() if context.args else None
+    if arg not in (None, "on", "off"):
+        await update.message.reply_text("Usage: /wactive [on|off] — no arg toggles")
+        return
+    new_active = (arg == "on") if arg else not w.get("active")
+    w["active"] = new_active
+    save_state()
+    send_alert(f"{'▶️ RESUMED' if new_active else '⏸️ PAUSED'} {w.get('label', wid)} (Telegram)", critical=True)
+    await update.message.reply_text(f"{w.get('label', wid)} is now {'active' if new_active else 'paused'}")
+
+
+@require_auth
+async def cmd_whold(update, context):
+    wid = _default_wallet_id()
+    if not wid or not context.args:
+        await update.message.reply_text("Usage: /whold SYMBOL [on|off] — no on/off toggles")
+        return
+    w = STATE["wallets"][wid]
+    symbol = context.args[0].upper()
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        await update.message.reply_text(f"No open position in {symbol}")
+        return
+    arg = context.args[1].lower() if len(context.args) > 1 else None
+    if arg not in (None, "on", "off"):
+        await update.message.reply_text("Usage: /whold SYMBOL [on|off]")
+        return
+    paused = (arg == "on") if arg else not pos.get("sell_paused")
+    pos["sell_paused"] = paused
+    if not paused:
+        pos.pop("hold_alert_reason", None)
+        pos.pop("hold_alert_ts", None)
+    save_state()
+    await update.message.reply_text(
+        f"{symbol} on {w.get('label', wid)} is now {'⏸️ HOLD' if paused else '▶️ auto'}")
+
+
+@require_auth
+async def cmd_wbuy(update, context):
+    wid = _default_wallet_id()
+    if not wid:
+        await update.message.reply_text("No wallets configured.")
+        return
+    w = STATE["wallets"][wid]
+    if not w.get("live"):
+        await update.message.reply_text(f"{w.get('label', wid)} is not live.")
+        return
+    try:
+        symbol = context.args[0].upper()
+        usd    = float(context.args[1])
+        addr   = (context.args[2] if len(context.args) > 2
+                  else w.get("positions", {}).get(symbol, {}).get("address", ""))
+    except Exception:
+        await update.message.reply_text(
+            "Usage: /wbuy SYMBOL USD [ADDRESS] — ADDRESS only needed for a brand new token")
+        return
+    if not addr:
+        await update.message.reply_text(
+            f"No address on file for {symbol} — pass it: /wbuy {symbol} {usd} <address>")
+        return
+    if usd <= 0:
+        await update.message.reply_text("USD must be > 0")
+        return
+    usd = min(usd, max(0.0, w["vault_usd"] - 3.0))
+    if usd < 1.0:
+        await update.message.reply_text("Insufficient cash after reserving gas")
+        return
+    dex = fetch_dexscreener_token(addr)
+    price, liq = 0.0, 0.0
+    if dex and dex.get("pairs"):
+        p0    = dex["pairs"][0]
+        price = float(p0.get("priceUsd") or 0)
+        liq   = float((p0.get("liquidity") or {}).get("usd") or 0)
+    if price <= 0:
+        await update.message.reply_text(f"Could not fetch a current price for {symbol}")
+        return
+    _wlt_buy(wid, w, symbol, "sol", usd, price, liq, addr)
+    save_state()
+    await update.message.reply_text(f"Bought ${usd:.2f} of {symbol} on {w.get('label', wid)} (Telegram override)")
+
+
+@require_auth
+async def cmd_wsell(update, context):
+    wid = _default_wallet_id()
+    if not wid:
+        await update.message.reply_text("No wallets configured.")
+        return
+    w = STATE["wallets"][wid]
+    try:
+        symbol    = context.args[0].upper()
+        amt_token = context.args[1] if len(context.args) > 1 else "all"
+    except Exception:
+        await update.message.reply_text("Usage: /wsell SYMBOL [USD|%|all]")
+        return
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        await update.message.reply_text(f"No open position in {symbol}")
+        return
+    usd   = _parse_sell_amount(pos, amt_token)
+    price = pos.get("avg", 1.0) * 1.02
+    if usd >= pos["usd"] * 0.99:
+        _wlt_sell(wid, w, symbol, price, "manual sell (Telegram)")
+    else:
+        _wlt_sell(wid, w, symbol, price, "manual sell (Telegram)", sell_usd=usd)
+    save_state()
+    await update.message.reply_text(f"Sell submitted: {symbol} ${usd:.2f} on {w.get('label', wid)}")
+
+
+@require_auth
+async def cmd_wsell_at(update, context):
+    wid = _default_wallet_id()
+    if not wid:
+        await update.message.reply_text("No wallets configured.")
+        return
+    w = STATE["wallets"][wid]
+    try:
+        symbol = context.args[0].upper()
+        value  = context.args[1].lower()
+    except Exception:
+        await update.message.reply_text("Usage: /wsell_at SYMBOL <VALUE_USD|off>")
+        return
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        await update.message.reply_text(f"No open position in {symbol}")
+        return
+    if value in ("off", "clear", "0"):
+        pos["sell_trigger"] = None
+        save_state()
+        await update.message.reply_text(f"Sell target cleared for {symbol}")
+        return
+    try:
+        value_usd = float(value)
+    except ValueError:
+        await update.message.reply_text("Usage: /wsell_at SYMBOL <VALUE_USD|off>")
+        return
+    if value_usd <= 0:
+        await update.message.reply_text("VALUE_USD must be > 0")
+        return
+    pos["sell_trigger"] = {"value_usd": value_usd}
+    save_state()
+    await update.message.reply_text(f"{symbol} on {w.get('label', wid)} — sell target set at ${value_usd:.2f}")
+
+
+@require_auth
+async def cmd_wbuy_at(update, context):
+    wid = _default_wallet_id()
+    if not wid:
+        await update.message.reply_text("No wallets configured.")
+        return
+    w = STATE["wallets"][wid]
+    try:
+        symbol = context.args[0].upper()
+        value  = context.args[1].lower()
+    except Exception:
+        await update.message.reply_text("Usage: /wbuy_at SYMBOL <VALUE_USD|off> [ADD_USD] [repeat]")
+        return
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        await update.message.reply_text(f"No open position in {symbol}")
+        return
+    if value in ("off", "clear", "0"):
+        pos["buy_trigger"] = None
+        save_state()
+        await update.message.reply_text(f"Buy-more trigger cleared for {symbol}")
+        return
+    try:
+        value_usd = float(value)
+        add_usd   = float(context.args[2]) if len(context.args) > 2 else 5.0
+    except ValueError:
+        await update.message.reply_text("Usage: /wbuy_at SYMBOL <VALUE_USD|off> [ADD_USD] [repeat]")
+        return
+    repeat = len(context.args) > 3 and context.args[3].lower() == "repeat"
+    if value_usd <= 0 or add_usd <= 0:
+        await update.message.reply_text("VALUE_USD and ADD_USD must both be > 0")
+        return
+    pos["buy_trigger"] = {"value_usd": value_usd, "add_usd": add_usd, "repeat": repeat, "armed": True}
+    save_state()
+    await update.message.reply_text(
+        f"{symbol} on {w.get('label', wid)} — buy-more trigger set at ${value_usd:.2f} "
+        f"(+${add_usd:.2f}{', repeats' if repeat else ''})")
+
 
 # ---------------------------------------------------------------------------
 # Engine
@@ -8835,6 +9106,14 @@ def start_telegram():
     tg.add_handler(CommandHandler("shadow",       cmd_shadow))
     tg.add_handler(CommandHandler("version",      cmd_version))
     tg.add_handler(CommandHandler("restart",      cmd_restart))
+    tg.add_handler(CommandHandler("wallet",       cmd_wallet))
+    tg.add_handler(CommandHandler("wmode",        cmd_wmode))
+    tg.add_handler(CommandHandler("wactive",      cmd_wactive))
+    tg.add_handler(CommandHandler("whold",        cmd_whold))
+    tg.add_handler(CommandHandler("wbuy",         cmd_wbuy))
+    tg.add_handler(CommandHandler("wsell",        cmd_wsell))
+    tg.add_handler(CommandHandler("wsell_at",     cmd_wsell_at))
+    tg.add_handler(CommandHandler("wbuy_at",      cmd_wbuy_at))
     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_night_mode))
     if not STATE.get("telegram", {}).get("owner_chat_id"):
         log("WARN Telegram: owner_chat_id not set — proactive alerts (drawdown/sell/rug/digest) "
