@@ -3196,6 +3196,12 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
 
         exit_reason: Optional[str] = None
         _sf = w.get("safety", {})  # per-wallet safety overrides
+        # User-controlled pause: blocks every "normal" exit (dollar stop, velocity,
+        # trailing stop, TP ladder, fixed SL) so the user can manually hold a position
+        # through the dashboard. Liquidity-based protection (sudden RUG drop and slow
+        # LIQ DRAIN) stays active regardless — pausing means "I want to pick the exit
+        # timing," not "let this go to zero unprotected."
+        _sell_paused = bool(pos.get("sell_paused"))
 
         # Dollar stop — wallet override → mode default → base $12
         # Use pos["usd"] (cost basis of REMAINING units, reduced on each partial sell)
@@ -3207,10 +3213,10 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         if _cur_val < 0.01:
             w.get("positions", {}).pop(symbol, None)
             continue
-        if _dollar_stop > 0 and (_cur_val - _cost) < -_eff_stop:
+        if not _sell_paused and _dollar_stop > 0 and (_cur_val - _cost) < -_eff_stop:
             exit_reason = f"DOLLAR STOP -${abs(_cur_val - _cost):.2f}"
 
-        # Rug liq drop — wallet override → global
+        # Rug liq drop — wallet override → global. NEVER gated by _sell_paused.
         _rug_drop = _sf.get("rug_liq_drop_pct") or MS["rug_liq_drop"]
         prev_liq = liq_prev.get(symbol, liq)
         if liq < prev_liq * (1 - _rug_drop):
@@ -3219,10 +3225,11 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
 
         # Velocity — wallet override → global
         _vel_pct = _sf.get("velocity_m5_pct") or MS["velocity_exit_pct"]
-        if exit_reason is None and change_m5 < -(_vel_pct * 100):
+        if not _sell_paused and exit_reason is None and change_m5 < -(_vel_pct * 100):
             exit_reason = f"VELOCITY {change_m5:.1f}% in 5m"
 
-        # Slow liq drain — wallet override → global
+        # Slow liq drain — wallet override → global. NEVER gated by _sell_paused
+        # (same reasoning as RUG liq drop — this is the gradual version of the same risk).
         _drain_pct = _sf.get("liq_drain_pct") or MS["liq_drain_pct"]
         if (exit_reason is None and len(liq_ticks) >= MS["liq_drain_ticks"]
                 and all(liq_ticks[i] < liq_ticks[i-1] * (1 - _drain_pct)
@@ -3230,12 +3237,15 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
             exit_reason = f"LIQ DRAIN {liq_ticks[0]:.0f}→{liq:.0f}"
 
         # Trailing stop
-        if exit_reason is None and price <= peak * (1 - trail_pct):
+        if not _sell_paused and exit_reason is None and price <= peak * (1 - trail_pct):
             exit_reason = f"TRAIL STOP {((price/peak)-1)*100:.1f}% from peak"
 
         if exit_reason:
             _wlt_sell(wid, w, symbol, price, exit_reason)
             continue
+
+        if _sell_paused:
+            continue   # skip TP ladder + fixed SL too — fully user-controlled from here
 
         # TP ladder (partial sells)
         deployed     = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
@@ -6017,6 +6027,29 @@ def api_wallet_positions(wid):
     if not w:
         return jsonify({"error": "not found"}), 404
     return jsonify({s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0})
+
+
+@app.route("/api/wallets/<wid>/positions/<symbol>/pause", methods=["POST"])
+@_dash_auth
+def api_wallet_position_pause(wid, symbol):
+    """Toggle manual hold on one open position. Blocks the bot's normal exits
+    (dollar stop, velocity, trailing stop, TP ladder, fixed SL) so the user picks
+    the exit themselves — liquidity-based rug/drain protection stays active either way."""
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "wallet not found"}), 404
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        return jsonify({"error": "position not found"}), 404
+    paused = bool((flask_request.get_json() or {}).get("paused", True))
+    pos["sell_paused"] = paused
+    save_state()
+    send_alert(
+        f"{'⏸️ HOLD' if paused else '▶️ RESUMED'} {symbol} on {w.get('label', wid)} (dashboard) — "
+        + ("bot will not sell this until you resume it; rug/liq-drain protection still active."
+           if paused else "bot's normal exits are back in control."),
+        critical=True)
+    return jsonify({"ok": True, "symbol": symbol, "sell_paused": paused})
 
 
 @app.route("/api/wallets/<wid>/test_trade", methods=["POST"])
