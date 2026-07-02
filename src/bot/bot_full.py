@@ -15,7 +15,7 @@ except Exception:
 
 from flask import Flask, jsonify, request as flask_request, abort, send_from_directory
 from functools import wraps
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ---------------------------------------------------------------------------
@@ -7831,12 +7831,34 @@ async def cmd_auto_old(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /auto_old <on|off>")
 
 
+# Tappable keyboard for the chat commands (2026-07-02) — user: "can you make
+# all the commands clickable too, even chat ones." Tapping a button just
+# sends that exact text as a normal message, so it runs through the same
+# free-text router as if typed by hand — no separate handling needed.
+# SYMBOL-taking commands (hold/check/watch) can't have a fixed button since
+# the symbol varies, so those stay text-only (documented in /help_long).
+_CHAT_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("hype"), KeyboardButton("degen"), KeyboardButton("safe"), KeyboardButton("default")],
+        [KeyboardButton("pause"), KeyboardButton("resume"), KeyboardButton("stop"), KeyboardButton("start")],
+        [KeyboardButton("audit"), KeyboardButton("history"), KeyboardButton("market")],
+        [KeyboardButton("scout"), KeyboardButton("scout entries"),
+         KeyboardButton("scout rejections"), KeyboardButton("scout suggested")],
+    ],
+    resize_keyboard=True,
+)
+
+
 @require_auth
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     STATE.setdefault("telegram", {})["owner_chat_id"] = cid
     save_state()
-    await update.message.reply_text(f"Owner chat linked (id {cid}). Proactive alerts will be sent here.")
+    await update.message.reply_text(
+        f"Owner chat linked (id {cid}). Proactive alerts will be sent here.\n\n"
+        f"Tap a button below or just type — 'hold SYMBOL', 'check SYMBOL', 'watch SYMBOL', "
+        f"and 'pause losses at $N' work the same way but need a symbol/number so they're not buttons.",
+        reply_markup=_CHAT_KEYBOARD)
 
 
 # ---------------------------------------------------------------------------
@@ -8298,8 +8320,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buy /sell /shadow /version /restart\n"
         "/start — link owner chat for alerts\n"
         "/whoami — get your Telegram user ID\n"
-        "/help_long — full command reference"
-    )
+        "/help_long — full command reference",
+        reply_markup=_CHAT_KEYBOARD)
 
 
 @require_auth
@@ -9511,6 +9533,43 @@ def start_telegram():
     async def _post_init(application):
         TG_STATE["bot"]  = application.bot
         TG_STATE["loop"] = asyncio.get_running_loop()
+        # Registers every slash command with Telegram's native "/" menu so they
+        # show up as a tappable, described list while typing — user (2026-07-02):
+        # "can you make all the commands clickable too."
+        try:
+            await application.bot.set_my_commands([
+                BotCommand("wallet",       "Real wallet status"),
+                BotCommand("wmode",        "Change wallet mode"),
+                BotCommand("wactive",      "Pause/resume all new entries"),
+                BotCommand("whold",        "HOLD toggle on a position"),
+                BotCommand("wbuy",         "Manual buy override"),
+                BotCommand("wsell",        "Manual sell"),
+                BotCommand("wsell_at",     "Set/clear a sell-target trigger"),
+                BotCommand("wbuy_at",      "Set/clear a buy-more trigger"),
+                BotCommand("status",       "Paper engine status"),
+                BotCommand("mode",         "Change paper engine mode"),
+                BotCommand("objective",    "Set/clear a profit target"),
+                BotCommand("moonshot",     "enter|suggest new-launch mode"),
+                BotCommand("auto_old",     "Toggle old-coin auto-join"),
+                BotCommand("skim",         "Toggle profit skimming"),
+                BotCommand("spray_until",  "Broaden filters until a date"),
+                BotCommand("boost",        "Temporary size multiplier"),
+                BotCommand("export_state", "Dump state as JSON"),
+                BotCommand("import_state", "Patch state with inline JSON"),
+                BotCommand("doge_core",    "Set DOGE core bag target"),
+                BotCommand("doge_band",    "Set DOGE trim exit band"),
+                BotCommand("buy",          "Manual buy (paper)"),
+                BotCommand("sell",         "Manual sell (paper)"),
+                BotCommand("shadow",       "Toggle paper trading"),
+                BotCommand("start",        "Link this chat for alerts"),
+                BotCommand("whoami",       "Get your Telegram user ID"),
+                BotCommand("help",         "Quick command list"),
+                BotCommand("help_long",    "Full command reference"),
+                BotCommand("version",      "Build info"),
+                BotCommand("restart",      "Restart the process"),
+            ])
+        except Exception:
+            traceback.print_exc()
 
     tg = Application.builder().token(token).post_init(_post_init).build()
     tg.add_handler(CommandHandler("whoami",       whoami))
