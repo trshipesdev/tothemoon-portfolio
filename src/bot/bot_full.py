@@ -1584,11 +1584,16 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     # A hyped token on a razor-thin pool is exactly the setup that can rug in minutes
     # (TRENCH, 2026-07-02: liq $13.5k, hype 100, rugged to $0 liq ~13min after entry —
     # bot's rug-detector caught it, but the entry itself was still a thin-liq gamble).
-    # Hype alone doesn't confirm real buying — buy_ratio does, so raise that bar
-    # specifically when this override is what let the candidate through.
-    _low_liq_override = chain == "sol" and sc.hype >= 100 and liq_min > 5000
-    if _low_liq_override:
+    # Hype alone doesn't confirm real buying — buy_ratio does, so raise that bar,
+    # but ONLY when the lowered floor is what actually let this candidate through
+    # (liq genuinely below the mode's real floor) — not for every max-hype token,
+    # which would wrongly penalize a healthy-liquidity + max-hype combo (FABLE,
+    # 2026-07-02: liq $18.9k already cleared the normal floor on its own, but got
+    # held to the stricter 70% bar anyway and rejected at 57%).
+    _orig_liq_min = liq_min
+    if chain == "sol" and sc.hype >= 100:
         liq_min = min(liq_min, 5000)
+    _low_liq_override = liq_min < _orig_liq_min and sc.liq < _orig_liq_min * 0.90
     hype_min = max(50, ms["hype_min"] - (20 if spraying else 0))
     if sc.liq < liq_min * 0.90:
         return f"liquidity ${sc.liq:,.0f} below min ${liq_min:,.0f}"
