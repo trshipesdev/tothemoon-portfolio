@@ -5067,9 +5067,19 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
             f"🤖 AI switched the bot from '{old}' to '{rec}' mode ({decision['confidence']:.0%} sure). "
             f"Mode = how aggressive it trades (safe → degen). Why: {decision['reasoning']}", critical=True)
     else:
-        send_alert(
-            f"🤖 AI tip: consider '{rec}' mode ({decision['confidence']:.0%} sure). "
-            f"Mode = how aggressive the bot trades (safe → degen). Why: {decision['reasoning']}")
+        # Only alert when there's actually something to tell the user: the AI wants
+        # a DIFFERENT mode than what's running, AND it's not just re-suggesting the
+        # exact same thing it already suggested last time. Without this, the 12-min
+        # timer sent an identical "consider X mode" tip every single cycle for as
+        # long as the recommendation didn't change — pure duplicate spam.
+        last_tip = STATE.get("ai", {}).get("last_tip_mode")
+        if rec != CONFIG["mode"] and rec != last_tip:
+            send_alert(
+                f"🤖 AI tip: consider '{rec}' mode ({decision['confidence']:.0%} sure). "
+                f"Mode = how aggressive the bot trades (safe → degen). Why: {decision['reasoning']}")
+            STATE.setdefault("ai", {})["last_tip_mode"] = rec
+        elif rec == CONFIG["mode"]:
+            STATE.setdefault("ai", {})["last_tip_mode"] = None   # reset so a future change gets tipped
     decision["applied"] = applied
     save_state()
     return decision
