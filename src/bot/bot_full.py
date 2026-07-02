@@ -3058,8 +3058,13 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
     if not owner_addr:
         return
     open_pos = {s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0}
-    if not open_pos:
-        return
+    # BUG FIXED 2026-07-02: used to `return` here when open_pos was empty, which
+    # skipped the orphan-adopt loop below entirely — meaning the exact moment the
+    # bot has zero tracked positions (the most common case) it would NEVER look for
+    # real on-chain tokens it doesn't know about. Two real positions (FABLE ~$22,
+    # ROBINSEM ~$0.08) sat on-chain fully unmanaged — no stop-loss, no rug protection
+    # — because reconcile refused to even check while positions was empty. Only skip
+    # the ghost-close loop now (nothing tracked to check); always still look for orphans.
 
     balances = _sol_get_all_token_balances(owner_addr)
     if balances is None:
