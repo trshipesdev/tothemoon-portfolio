@@ -2917,6 +2917,23 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     save_state()
 
 
+def _wlt_realized_pnl_recent(w: Dict, n: int = 10) -> Dict[str, Any]:
+    """Real, completed-trade P&L only — immune to the equity-drawdown false-alarm
+    below. Used to answer the user's actual question: 'am I genuinely losing over
+    and over on trades, or is my equity figure just down because cash is currently
+    sitting in open/newly-bought positions.'"""
+    sells = [t for t in w.get("trade_log", []) if t.get("side") == "sell" and t.get("pnl") is not None]
+    sells = sells[-n:]
+    pnls  = [t.get("pnl", 0) for t in sells]
+    losses = [p for p in pnls if p < 0]
+    return {
+        "count":        len(pnls),
+        "net_pnl":      round(sum(pnls), 2),
+        "loss_streak":  len(pnls) - next((i for i, p in enumerate(reversed(pnls)) if p >= 0), len(pnls)),
+        "losing_count": len(losses),
+    }
+
+
 def _wallet_drawdown_check(wid: str, w: Dict):
     """Three-tier drawdown protection on live wallets vs the real deposit (starting_usd).
 
@@ -2928,6 +2945,16 @@ def _wallet_drawdown_check(wid: str, w: Dict):
 
     Equity = chain-synced cash + position market value when fresh (so unrealized
     losses actually count); fallback is ledger cash + open cost basis.
+
+    IMPORTANT (user, 2026-07-02): this "equity vs deposit" figure can look like a
+    loss right after a MANUAL buy (Phantom, etc) that hasn't been auto-adopted yet
+    — the on-chain cash drop is real and immediate, but the offsetting position
+    isn't recognized until the next ~30s reconcile tick, so equity can show a
+    temporary phantom drop that isn't a real loss at all. The alert wording below
+    is explicit that this figure includes capital currently deployed/uncounted, and
+    every tier now also reports real_pnl_recent (actual completed trades only) so
+    the user can tell the two apart at a glance. Reply 'ok' in Telegram to clear
+    a tier and let it re-arm fresh if it turns out to be a false alarm.
     """
     if not w.get("live"):
         return
@@ -2955,6 +2982,16 @@ def _wallet_drawdown_check(wid: str, w: Dict):
     equity   = _wlt_equity(w)
     drawdown = start - equity   # positive = cumulative loss from deposit
     alerted  = w.setdefault("dd_alerted", {})
+    real     = _wlt_realized_pnl_recent(w, 10)
+    # One-line context appended to every tier: distinguishes "equity is down"
+    # (deposit vs current mark-to-market, includes capital sitting in open/
+    # newly-bought positions — can be a timing artifact, not a real loss) from
+    # "actually losing on trades" (real, completed, realized results).
+    _real_line = (
+        f"Last {real['count']} closed trades: ${real['net_pnl']:+.2f}"
+        + (f", {real['loss_streak']} losses in a row" if real['loss_streak'] >= 2 else "")
+        + "."
+    ) if real["count"] else "No closed trades yet to compare against."
 
     # ── Tier 3: Hard stop at $100 loss ───────────────────────────────────
     if drawdown >= 100 and not alerted.get("stop"):
@@ -2967,15 +3004,20 @@ def _wallet_drawdown_check(wid: str, w: Dict):
             w["paused_new_entries"] = False
             send_alert(
                 f"🛑 HARD STOP — {label}\n"
-                f"Down ${drawdown:.0f} of your ${start:.0f} deposit. No open positions — bot DEACTIVATED.\n"
-                f"Equity: ${equity:.2f}. Re-enable from dashboard when ready.",
+                f"Equity down ${drawdown:.0f} vs your ${start:.0f} deposit (includes any capital "
+                f"currently deployed in positions, not necessarily a real loss). No open positions "
+                f"— bot DEACTIVATED.\n"
+                f"Equity: ${equity:.2f}. {_real_line}\n"
+                f"Reply 'ok' to clear this and re-arm, or re-enable from the dashboard when ready.",
                 critical=True)
             log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — no positions, deactivated immediately")
         else:
             send_alert(
                 f"🛑 HARD STOP — {label}\n"
-                f"Down ${drawdown:.0f} of your ${start:.0f} deposit. No new entries.\n"
+                f"Equity down ${drawdown:.0f} vs your ${start:.0f} deposit (includes any capital "
+                f"currently deployed in positions, not necessarily a real loss). No new entries.\n"
                 f"Letting {n_open} open position(s) run to their exits, then fully pausing.\n"
+                f"{_real_line} Reply 'ok' to clear this and re-arm.\n"
                 f"Equity: ${equity:.2f}.",
                 critical=True)
             log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — draining {n_open} position(s)")
@@ -2986,8 +3028,10 @@ def _wallet_drawdown_check(wid: str, w: Dict):
         alerted["warning"] = True
         send_alert(
             f"🚨 WARNING — {label}\n"
-            f"Down ${drawdown:.0f} of your ${start:.0f} deposit. Equity: ${equity:.2f}.\n"
-            f"Hard stop triggers at $100 loss. Watch closely.",
+            f"Equity down ${drawdown:.0f} vs your ${start:.0f} deposit (includes any capital "
+            f"currently deployed in positions, not necessarily a real loss). Equity: ${equity:.2f}.\n"
+            f"{_real_line}\n"
+            f"Hard stop triggers at $100. Reply 'ok' to clear this if it's a false alarm.",
             critical=True)
         log(f"[W:{wid}] WARNING — drawdown ${drawdown:.2f}")
 
@@ -3006,8 +3050,11 @@ def _wallet_drawdown_check(wid: str, w: Dict):
             alerted["velocity"] = True
             send_alert(
                 f"⚡ VELOCITY — {label}\n"
-                f"Lost ${velocity_loss:.0f} in the last 30 min. Total down: ${drawdown:.0f} of ${start:.0f}.\n"
-                f"Equity: ${equity:.2f}. No action taken — heads up.",
+                f"Equity down ${velocity_loss:.0f} in the last 30 min (can include capital that just "
+                f"moved into a new position, not necessarily lost). Total vs deposit: ${drawdown:.0f} "
+                f"of ${start:.0f}.\n"
+                f"{_real_line}\n"
+                f"Equity: ${equity:.2f}. No action taken — heads up. Reply 'ok' to clear.",
                 critical=True)
             log(f"[W:{wid}] VELOCITY WARNING — ${velocity_loss:.2f} in 30min")
         elif velocity_loss < 5:
@@ -7339,6 +7386,7 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "ok" or text.startswith("ok "):
         changed = False
+        cleared_dd = []
         for wid, w in live_wallets:
             nm = w.get("night_mode") or {}
             if nm.get("tripped"):
@@ -7348,10 +7396,25 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 nm["loss_events"]   = []
                 changed = True
                 log(f"[W:{wid}] night mode cleared by 'ok' — resuming buys")
+            # Also clear drawdown warning/velocity tiers — user (2026-07-02) wants
+            # a way to dismiss a false-alarm equity-drop alert (e.g. right after a
+            # manual buy that hasn't been adopted yet) without waiting for equity
+            # to naturally recover. Deliberately does NOT clear "stop" (the hard
+            # stop that already paused new entries) — that one needs a real look,
+            # not a quick dismiss, so it's untouched here.
+            dd = w.get("dd_alerted") or {}
+            if dd.get("warning") or dd.get("velocity"):
+                dd.pop("warning", None)
+                dd.pop("velocity", None)
+                cleared_dd.append(w.get("label", wid))
+                changed = True
         if changed:
             save_state()
-            await update.message.reply_text(
-                "👍 False alarm cleared — buys resumed. Night mode still armed for the rest of the night.")
+            msg = "👍 Cleared."
+            if cleared_dd:
+                msg += f" Drawdown warning reset for {', '.join(cleared_dd)} — will re-arm if it happens again."
+            msg += " Night mode (if armed) still watching for the rest of the night."
+            await update.message.reply_text(msg)
         return
 
     if text == "hello" or text.startswith("hello "):
