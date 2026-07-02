@@ -1990,7 +1990,7 @@ def shadow_buy(symbol: str, chain: str, usd: float, price: float, liq_usd: float
         log(f"BURST GUARD: skipping new open for {symbol} (too many opens in 30s)")
         send_alert(
             f"⚡ Skipped buying {symbol} — the bot opened several trades very fast and is pausing briefly "
-            f"so it doesn't behave like an obvious bot. Nothing's wrong; no money moved.")
+            f"so it doesn't behave like an obvious bot. Nothing's wrong; no money moved.", paper=True)
         return {"price": price, "units": 0.0}
     impact       = est_price_impact(usd, liq_usd)
     slip         = _jitter_slip(0.5 * impact)
@@ -2179,7 +2179,8 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
         if pnl <= -30:
             send_alert(
                 f"🚨 HARD STOP ${symbol} — lost ${abs(pnl):.0f} on this trade. "
-                f"Blacklisting for 4 hours to prevent re-entry."
+                f"Blacklisting for 4 hours to prevent re-entry.",
+                paper=True
             )
             STATE.setdefault("reject_cache", {})[symbol] = {
                 "ts":        time.time(),
@@ -2660,6 +2661,10 @@ def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
     }
     w.setdefault("trade_log", []).append(entry)
     log(f"[W:{wid}] BUY {symbol} ${usd:.2f} @ {filled:.6f}")
+    if w.get("live") and _buy_sig:
+        send_alert(
+            f"🟢 BOUGHT {symbol} — real ${usd:.2f} on {w.get('label', wid)}\n"
+            f"https://solscan.io/tx/{_buy_sig}", critical=True)
     save_state()   # persist position before any exit loop runs
 
 
@@ -2740,6 +2745,10 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     }
     w.setdefault("trade_log", []).append(sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
+    if w.get("live") and _sell_sig:
+        send_alert(
+            f"🔴 SOLD {symbol} — real pnl ${pnl:+.2f} [{exit_reason}] on {w.get('label', wid)}\n"
+            f"https://solscan.io/tx/{_sell_sig}", critical=True)
     _wallet_drawdown_check(wid, w)
     _wlt_tiered_sweep(wid, w, pnl)
     save_state()
@@ -4056,7 +4065,7 @@ def autoscale_maybe(symbol: str, chain: str, price: float, liq_usd: float, veloc
     log(f"AUTOSCALE {symbol} add #{pos['add_count']} ${add_usd:.2f}")
     send_alert(
         f"📈 ADDED to {symbol} — it's winning, so the bot put in ${add_usd:.0f} more (paper) to ride the "
-        f"momentum. Add #{pos['add_count']}.")
+        f"momentum. Add #{pos['add_count']}.", paper=True)
 
 # ---------------------------------------------------------------------------
 # Old-coin pump detector
@@ -4141,7 +4150,7 @@ def manage_trusted_coins():
                 log(f"TRUSTED dip-buy {sym} @{price:.5f} (floor {floor})")
                 send_alert(
                     f"🐕 BOUGHT THE DIP on {sym} @ {price:.5f} — it dropped to your set floor price, so the "
-                    f"bot grabbed more of this trusted long-term hold while it's cheap.")
+                    f"bot grabbed more of this trusted long-term hold while it's cheap.", paper=True)
 
         band = spec.get("exit_band", [None, None])
         core = spec.get("core_units", 0)
@@ -4153,7 +4162,7 @@ def manage_trusted_coins():
                 log(f"TRUSTED trim {sym}: {trim_units:.0f} units @{price:.5f}")
                 send_alert(
                     f"🐕 TRIMMED {sym} @ {price:.5f} — it rose into your take-profit zone, so the bot sold "
-                    f"some to bank gains while keeping your core long-term bag.")
+                    f"some to bank gains while keeping your core long-term bag.", paper=True)
 
 # ---------------------------------------------------------------------------
 # Re-entry watch
@@ -4260,7 +4269,7 @@ def check_reentry_watch():
             continue
         exec_buy(sym, chain, ticket, price, liq, w.get("address", ""))
         log(f"REENTRY {sym} @{price:.6f} ${ticket:.2f} (stable {R['stable_ticks']} ticks, liq ${liq:.0f})")
-        send_alert(f"🔄 RE-ENTRY {sym} @{price:.6f} — price stable, liq holding | ${ticket:.2f}")
+        send_alert(f"🔄 RE-ENTRY {sym} @{price:.6f} — price stable, liq holding | ${ticket:.2f}", paper=True)
         save_state()
         to_remove.append(sym)
 
@@ -6447,9 +6456,23 @@ def emit_heartbeat():
         pass
 
 
-def send_alert(msg: str, critical: bool = False):
-    """Send a proactive message to the owner chat. Non-critical msgs respect quiet hours."""
+def _any_wallet_live() -> bool:
+    return any(w.get("live") for w in STATE.get("wallets", {}).values())
+
+
+def send_alert(msg: str, critical: bool = False, paper: bool = False):
+    """Send a proactive message to the owner chat. Non-critical msgs respect quiet hours.
+
+    paper=True marks alerts from the simulated STATE["positions"] engine (BOUGHT/SOLD/
+    TOOK PROFIT/etc — always fake money regardless of the "(paper)" wording in the text).
+    Once any wallet goes live, these are suppressed from Telegram — a real dollar amount
+    moving is what matters once real money is on the line, and mixing paper P&L into the
+    same feed as real trades reads as "did my money just move?" (it didn't). Still logged
+    to ALERT_LOG so the dashboard's alert history is unaffected.
+    """
     ALERT_LOG.appendleft({"ts": now_utc().isoformat(), "msg": msg, "critical": critical})
+    if paper and _any_wallet_live():
+        return
     if not TG_STATE.get("bot") or not TG_STATE.get("loop"):
         return
     chat_id = STATE.get("telegram", {}).get("owner_chat_id")
@@ -6485,7 +6508,7 @@ def send_digest():
         f"mode={CONFIG['mode']}  shadow={'ON' if SHADOW_MODE else 'OFF'}\n"
         f"Positions ({len(pos_lines)}):\n" + ("\n".join(pos_lines) if pos_lines else "  none")
     )
-    send_alert(msg, critical=True)
+    send_alert(msg, critical=True, paper=True)
 
 
 def tg_allowed(user_id: int) -> bool:
@@ -7061,7 +7084,7 @@ def scan_candidates():
                 log(f"PRESALE GATE {symbol}: score {ps} < {ps_threshold}, suggest only")
                 send_alert(
                     f"⚠️ SKIPPED {symbol} ({chain}) — a brand-new token with no social buzz or "
-                    f"audit yet (safety score {ps}/100). Too unproven to buy; just watching.\n{link}")
+                    f"audit yet (safety score {ps}/100). Too unproven to buy; just watching.\n{link}", paper=True)
                 _scout(symbol, chain, "rejected", f"presale score {ps} < {ps_threshold} (no social/audit signal)", sc, addr)
                 continue
             # Scam / rug safety gate — on-chain rug checks
@@ -7070,7 +7093,7 @@ def scan_candidates():
                 log(f"SAFETY GATE {symbol}: {why}")
                 send_alert(
                     f"🛡️ SKIPPED {symbol} ({chain}) — {why}. The bot steered clear to protect you "
-                    f"from a likely scam/rug.\n{link}")
+                    f"from a likely scam/rug.\n{link}", paper=True)
                 _scout(symbol, chain, "rejected", f"safety: {why}", sc, addr)
                 continue
             if CONFIG["moonshot"]["mode"] == "enter":
@@ -7098,7 +7121,7 @@ def scan_candidates():
                     send_alert(
                         f"🚀 BOUGHT {symbol} ({chain}) — a new token that passed every safety filter "
                         f"(liquidity, hype, age). Put in ${usd:.0f} of paper money @ {price:.6f}. "
-                        f"Plan: take profit as it climbs, auto-sell if it drops.\n{link}")
+                        f"Plan: take profit as it climbs, auto-sell if it drops.\n{link}", paper=True)
                     _scout(symbol, chain, "entered", f"passed filters, ps {ps}, sized ${usd:.0f}", sc, addr)
                 else:
                     # "Suggested" = passed every filter but no daily budget / too thin to size.
@@ -7110,7 +7133,7 @@ def scan_candidates():
                 log(f"SUGGEST {symbol} new launch (mode=suggest) [ps:{ps}]")
                 send_alert(
                     f"👀 SPOTTED {symbol} ({chain}) — a new launch that passed the safety filters. "
-                    f"The bot is in 'suggest' mode, so it's flagging it for you instead of auto-buying.\n{link}")
+                    f"The bot is in 'suggest' mode, so it's flagging it for you instead of auto-buying.\n{link}", paper=True)
                 _scout(symbol, chain, "suggested", f"passed filters, ps {ps} (moonshot mode = suggest)", sc, addr)
         else:
             if detect_oldcoin_pump(symbol, CONFIG["oldcoin"]["volume_x"], CONFIG["oldcoin"]["mentions_x"]):
@@ -7123,17 +7146,17 @@ def scan_candidates():
                         log(f"AUTO-JOIN tiny {symbol} ${usd:.2f}")
                         send_alert(
                             f"⚡ BOUGHT a tiny ${usd:.0f} of {symbol} ({chain}) — an older coin whose "
-                            f"trading volume just spiked (a 'pump'). Small bet to ride the momentum.\n{link}")
+                            f"trading volume just spiked (a 'pump'). Small bet to ride the momentum.\n{link}", paper=True)
                     else:
                         log(f"ALERT old pump {symbol} (cap too small)")
                         send_alert(
                             f"⚡ {symbol} ({chain}) is pumping (volume spiking) but your caps are full, "
-                            f"so the bot can't join. Heads-up only.\n{link}")
+                            f"so the bot can't join. Heads-up only.\n{link}", paper=True)
                 else:
                     log(f"ALERT old pump {symbol}")
                     send_alert(
                         f"⚡ PUMP: {symbol} ({chain}) — an older coin with a sudden volume spike. "
-                        f"The bot is alerting you, not buying (auto-join is off).\n{link}")
+                        f"The bot is alerting you, not buying (auto-join is off).\n{link}", paper=True)
 
     # Watchlist — coins not surfaced by the feed
     candidate_symbols = {c["symbol"] for c in candidates}
@@ -7158,15 +7181,15 @@ def scan_candidates():
                 log(f"AUTO-JOIN watchlist {sym} ${usd:.2f}")
                 send_alert(
                     f"⚡ BOUGHT a tiny ${usd:.0f} of {sym} ({w_chain}) — a coin on your watchlist just "
-                    f"spiked in volume. Small bet to ride it.\n{_dex_link(w_chain, addr)}")
+                    f"spiked in volume. Small bet to ride it.\n{_dex_link(w_chain, addr)}", paper=True)
             else:
                 log(f"ALERT watchlist pump {sym} (cap too small)")
                 send_alert(
-                    f"⚡ {sym} (your watchlist) is pumping but your caps are full — heads-up only.\n{_dex_link(w_chain, addr)}")
+                    f"⚡ {sym} (your watchlist) is pumping but your caps are full — heads-up only.\n{_dex_link(w_chain, addr)}", paper=True)
         else:
             log(f"ALERT watchlist pump {sym}")
             send_alert(
-                f"⚡ PUMP: {sym} (your watchlist) — a sudden volume spike. Alerting you, not buying.\n{_dex_link('sol', addr)}")
+                f"⚡ PUMP: {sym} (your watchlist) — a sudden volume spike. Alerting you, not buying.\n{_dex_link('sol', addr)}", paper=True)
 
     # Re-entry watch + trusted-coin management run on the slow cadence (not time-critical)
     check_reentry_watch()
@@ -7182,7 +7205,8 @@ def manage_positions():
     if brake_now and not STATE.get("brake_alerted"):
         send_alert(
             "🛑 SAFETY BRAKE ON — the bot hit a losing streak, so it's pausing new trades for the rest "
-            "of the day and shrinking bet sizes. This protects your vault from a bad run.", critical=True)
+            "of the day and shrinking bet sizes. This protects your vault from a bad run.",
+            critical=True, paper=True)
         STATE["brake_alerted"] = True
     elif not brake_now:
         STATE["brake_alerted"] = False
@@ -7333,7 +7357,7 @@ def manage_positions():
             log(f"EXIT {s} [{exit_reason}] pnl ${pnl:.2f}")
             send_alert(
                 f"🚨 SOLD {s} — {_exit_plain(exit_reason)}. Paper result: ${pnl:+.2f}.\n"
-                f"{_dex_link(p.get('chain', 'sol'), p.get('address', ''))}", critical=True)
+                f"{_dex_link(p.get('chain', 'sol'), p.get('address', ''))}", critical=True, paper=True)
             _add_reentry_watch(s, p, liq, vol_h1, exit_reason)
             STATE["liq_prev"].pop(s, None)
             STATE.get("vol_dry_alerted", {}).pop(s, None)
@@ -7349,7 +7373,7 @@ def manage_positions():
                 _vda[s] = time.time()
                 send_alert(
                     f"⚠️ {s} is going quiet — trading volume dropped to ${vol_h1:,.0f} (was ${entry_vol:,.0f} "
-                    f"when you bought in). Interest is fading; the bot is watching but not selling yet.")
+                    f"when you bought in). Interest is fading; the bot is watching but not selling yet.", paper=True)
 
         # 6. TP ladder — scalp a chunk at each rung, but never sell into the moon bag
         tp_hit        = False
@@ -7373,7 +7397,7 @@ def manage_positions():
                             if last else " Letting the rest ride higher.")
                     send_alert(
                         f"✅ TOOK PROFIT (paper) on {s} (+{gain*100:.0f}%) — banked ${pnl:+.2f} on {frac*100:.0f}% "
-                        f"of the position.{tail} (Rung #{i+1}.)")
+                        f"of the position.{tail} (Rung #{i+1}.)", paper=True)
                     tp_hit = True
                 save_state()
                 break
@@ -7385,7 +7409,8 @@ def manage_positions():
             log(f"SL {s}: exit pnl ${pnl:.2f}")
             send_alert(
                 f"🔻 STOP-LOSS on {s} — it slid down to your max-loss line, so the bot sold to cap the "
-                f"damage. Paper result: ${pnl:+.2f}. Better a small loss than a big one.", critical=True)
+                f"damage. Paper result: ${pnl:+.2f}. Better a small loss than a big one.",
+                critical=True, paper=True)
             _add_reentry_watch(s, p, liq, vol_h1, "fixed_sl")
             save_state()
             continue
@@ -7399,7 +7424,7 @@ def manage_positions():
                 _npa[s] = time.time()
                 send_alert(
                     f"⏱ {s} has been flat since you bought it — it isn't taking off. Heads-up so you can "
-                    f"decide whether to cut it loose; the bot is still holding for now.")
+                    f"decide whether to cut it loose; the bot is still holding for now.", paper=True)
 
         # Autoscale after grace
         if p.get("units", 0) > 0 and time.time() - entry_ts >= CONFIG["autoscale"]["grace_sec"]:
