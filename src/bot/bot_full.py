@@ -1631,6 +1631,17 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
         "max_age_min", CONFIG["scan"]["new_max_age_min"])
     if sc.age_min > max_age:
         return f"age {sc.age_min:.0f}m over {max_age:.0f}m limit"
+    # User (2026-07-02): "i do not want it joining coins that are less than an hour or
+    # so old unless theyre up like 1000%... irresponsible and a waste when it affects
+    # the pool that much." A brand-new coin is also a brand-new (thin) pool — a normal
+    # full-size ticket into it causes real price impact (see the LOVE incident same day:
+    # 73% real impact, -48% in 96 seconds) even when every other filter passes cleanly.
+    # Below 20min old the h1/h6 checks above are exempted entirely (no real history
+    # yet) — meaning young tokens currently get an easier bar, not a harder one. Flip
+    # that: under 1h old, require an extreme, unmistakable pump on at least one window
+    # before it's worth the risk at all.
+    if sc.age_min < 60 and max(sc.price_chg_m5, sc.price_chg_h1, sc.price_chg_h6) < 1000:
+        return f"under 1h old and not up 1000%+ yet (best window {max(sc.price_chg_m5, sc.price_chg_h1, sc.price_chg_h6):.0f}%)"
     # Skip the 24h trend check for tokens under 5 minutes old (no h24 history yet) OR
     # when m5 is strongly positive (≥10%) — an active pump overrides a stale 24h window.
     # Meme coins often launch, consolidate, then spike: h24 looks negative while m5 is +80%.
@@ -2719,19 +2730,27 @@ def _symbol_tier_mult(addr: str) -> float:
 
 
 def _wlt_size(w: Dict, symbol: str, chain: str, liq: float, addr: str = "",
-              hype: Optional[int] = None, buy_ratio: Optional[float] = None) -> float:
+              hype: Optional[int] = None, buy_ratio: Optional[float] = None,
+              age_min: float = 9999.0) -> float:
     mode_name = w.get("mode") or CONFIG["mode"]
+    # User (2026-07-02): a coin under 1h old only passes moonshot_reject_reason at all
+    # via the 1000%+ extreme-pump exemption — it hasn't had time to confirm anything a
+    # normal full-size bet deserves, and it's also a brand-new (thin) pool where a full
+    # ticket causes real price impact ("irresponsible... wipes out my small climbs").
+    # Treat it exactly like a fresh tier-1 seed bet regardless of this symbol's actual
+    # tier state — same principle as the pyramid: earn size, don't start with it.
+    tier_mult = min(_symbol_tier_mult(addr), 0.5) if age_min < 60 else _symbol_tier_mult(addr)
     cap = float(w.get("ticket_cap_usd") or 0)
     if cap > 0:
         # Wallet has an explicit ticket cap — use it as the sizing target.
         # Skip global per_token/per_chain caps (designed for the shadow's large vault,
         # not for a wallet with an explicit per-trade size).
-        base = cap * _conviction_mult(hype, buy_ratio) * _symbol_tier_mult(addr)
+        base = cap * _conviction_mult(hype, buy_ratio) * tier_mult
         base = min(base, cap * 2.0)   # tier can exceed the flat cap, up to the 2x ceiling
     else:
         mode_cfg = CONFIG["modes"].get(mode_name, CONFIG["modes"].get(CONFIG["mode"], {}))
         base = CONFIG["base_size_usd"] * mode_cfg.get("size_mult", 1.0)
-        base *= _conviction_mult(hype, buy_ratio) * _symbol_tier_mult(addr)
+        base *= _conviction_mult(hype, buy_ratio) * tier_mult
         dep  = _wlt_deployable(w)
         per_token = CONFIG["per_token_cap_pct"] * dep
         per_chain = CONFIG["per_chain_cap_pct"].get(chain, 0.25) * dep
@@ -3291,9 +3310,18 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
     # Adopt orphans: on-chain tokens this bot bought (there's a buy/buy_failed
     # record) but no longer tracks. Without adoption nothing ever sells them —
     # they sit exposed to rugs while Phantom and the dashboard disagree.
+    # DUST_ADOPT_FLOOR: user (2026-07-02) — a fully-sold position can leave a
+    # rounding-error remainder on-chain (RESET: 0.000001 tokens, real value
+    # nowhere near a cent) that's technically > 0 and got re-adopted, re-alerted,
+    # and re-attempted-to-sell every single 30s reconcile cycle forever, since
+    # nothing ever purges it. Skip adoption entirely below this floor and
+    # remember the mint so it's never re-evaluated — genuinely worthless dust,
+    # leave it alone permanently rather than spamming about it.
+    DUST_ADOPT_FLOOR = 0.10
+    dust_ignore = w.setdefault("dust_ignore", [])
     tracked_mints = {p.get("address") for p in w.get("positions", {}).values()}
     for mint, ui in balances.items():
-        if mint in tracked_mints or ui <= 0:
+        if mint in tracked_mints or ui <= 0 or mint in dust_ignore:
             continue
         rec = next((t for t in reversed(w.get("trade_log", []))
                     if t.get("address") == mint and t.get("side") in ("buy", "buy_failed")), None)
@@ -3323,6 +3351,9 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
             entry_mode = w.get("mode") or CONFIG["mode"]
             src        = "manual_buy_detected"
         usd = entry_px * ui
+        if usd < DUST_ADOPT_FLOOR:
+            dust_ignore.append(mint)
+            continue
         avg = entry_px
         w["positions"][symbol] = {
             "chain": "sol", "units": ui, "usd": usd, "avg": avg,
@@ -3510,7 +3541,8 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
 
 def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
                          addr: str, scan_entered: Dict,
-                         hype: Optional[int] = None, buy_ratio: Optional[float] = None):
+                         hype: Optional[int] = None, buy_ratio: Optional[float] = None,
+                         age_min: float = 9999.0):
     """After the main bot enters a candidate, offer it to each active additional wallet.
 
     Each wallet gets independent humanization so on-chain transactions don't look like
@@ -3553,7 +3585,7 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
             _miss(w, "entry_prob")
             continue
 
-        usd = _wlt_size(w, symbol, chain, liq, addr=addr, hype=hype, buy_ratio=buy_ratio)
+        usd = _wlt_size(w, symbol, chain, liq, addr=addr, hype=hype, buy_ratio=buy_ratio, age_min=age_min)
         # ticket_cap_usd wallets bypass the global min-ticket check (cap itself is the floor)
         cap = float(w.get("ticket_cap_usd") or 0)
         _min_t = max(1.0, cap * 0.5) if cap > 0 else _mode_min_ticket(w.get("mode") or CONFIG["mode"])
@@ -7971,7 +8003,7 @@ def scan_candidates():
                                entry_hype=sc.hype if sc else None)
                     _entered_this_scan.add(symbol)
                     _wallets_offer_entry(symbol, chain, price, liq, addr, _wallet_scan_entered,
-                                         hype=sc.hype, buy_ratio=sc.buy_ratio)
+                                         hype=sc.hype, buy_ratio=sc.buy_ratio, age_min=sc.age_min)
                     STATE["entries_today"][symbol] = STATE["entries_today"].get(symbol, 0) + 1
                     _record({"ev": "entry", "symbol": symbol, "chain": chain, "address": addr,
                              "price": price, "liq": liq, "hype": sc.hype,

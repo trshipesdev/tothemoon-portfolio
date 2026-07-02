@@ -222,7 +222,15 @@ def find_entry_index(ticks: List[Dict[str, float]], lookback: int = 3) -> Option
     for i in range(lookback, len(ticks)):
         t = ticks[i]
         positive = t["price"] > ticks[i - lookback]["price"]
-        sc = bot.Score(_hype_of(t), t["liq"], 0.0, positive)   # age 0 = fresh; buy_ratio unknown
+        age_min = (t["ts"] - ticks[0]["ts"]) / 60.0   # real elapsed sim time, not a fresh-token stand-in
+        # Backtest ticks don't carry separate h1/h6 windows like DexScreener does —
+        # only this lookback-window "positive" signal. Past 20min old, moonshot_reject_reason
+        # requires real h1/h6 data (2026-07-02 trend checks); feed it the same momentum
+        # signal on both rather than leaving them at the 0.0 default, which would read
+        # as "flat/red" and reject every backtest candidate that isn't brand new.
+        m5  = 15.0 if positive else -15.0
+        sc = bot.Score(_hype_of(t), t["liq"], age_min, positive,
+                       price_chg_m5=m5, price_chg_h1=m5, price_chg_h6=m5)   # buy_ratio unknown
         if bot.moonshot_reject_reason(sc) is None:
             return i
     return None
@@ -266,7 +274,8 @@ def replay_episode(symbol: str, chain: str, address: str,
             return None                                # never built momentum → no trade
         first = ticks[e]
         clock.now = first["ts"]
-        sc = bot.Score(_hype_of(first), first["liq"], 0.0, True)
+        age_min = (first["ts"] - ticks[0]["ts"]) / 60.0
+        sc = bot.Score(_hype_of(first), first["liq"], age_min, True)
         if entry == "start" and bot.moonshot_reject_reason(sc) and \
            bot.moonshot_reject_reason(sc).startswith("liquidity"):
             return None                                # too thin for this mode → no entry

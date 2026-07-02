@@ -370,8 +370,13 @@ class TestMoonshotFilters(unittest.TestCase):
     def setUp(self):
         _reset()
 
-    def _sc(self, hype=90, liq=50000, age_min=15, positive=True, buy_ratio=None):
-        return bot.Score(hype, liq, age_min, positive, buy_ratio=buy_ratio)
+    def _sc(self, hype=90, liq=50000, age_min=65, positive=True, buy_ratio=None):
+        # age_min=65: past the "just hatched" 1h gate added 2026-07-02 (which requires
+        # a 1000%+ pump to enter under 1h old) and past the h1/h6 20min exemption — so
+        # h1/h6 must be explicitly positive here for the baseline candidate to pass,
+        # same as a real healthy candidate would need.
+        return bot.Score(hype, liq, age_min, positive, buy_ratio=buy_ratio,
+                         price_chg_h1=5.0, price_chg_h6=5.0)
 
     def test_passes_valid_candidate(self):
         self.assertTrue(bot.passes_moonshot_filters(self._sc()))
@@ -2007,8 +2012,10 @@ class TestScoutLog(unittest.TestCase):
         _reset()
         bot.STATE["scout_log"] = []
 
-    def _sc(self, hype=90, liq=50000, age_min=15, positive=True):
-        return bot.Score(hype, liq, age_min, positive)
+    def _sc(self, hype=90, liq=50000, age_min=65, positive=True):
+        # age_min=65: same reasoning as the sibling helper in TestMoonshotFilters —
+        # past both the 2026-07-02 "just hatched" gate and the h1/h6 20min exemption.
+        return bot.Score(hype, liq, age_min, positive, price_chg_h1=5.0, price_chg_h6=5.0)
 
     def test_reject_reason_none_when_passing(self):
         self.assertIsNone(bot.moonshot_reject_reason(self._sc()))
@@ -2781,7 +2788,10 @@ class TestBacktest(unittest.TestCase):
 
     def test_replay_winner_is_profitable(self):
         # steady climb to +300% then flat → momentum entry fires, banks a gain
-        ticks = self._ticks([1.0] + [1.0 + 0.2 * i for i in range(1, 20)])
+        # step_sec=1500 (25min) so the entry tick lands on an already-established
+        # token (>1h elapsed), not a "just hatched" one — the latter now requires a
+        # 1000%+ pump to enter at all (2026-07-02), which this modest scenario isn't.
+        ticks = self._ticks([1.0] + [1.0 + 0.2 * i for i in range(1, 20)], step_sec=1500)
         r = bt.replay_episode("PUMP", "sol", "0xpump", ticks, "degen")
         self.assertIsNotNone(r)
         self.assertGreater(r["pnl"], 0)
@@ -2791,7 +2801,7 @@ class TestBacktest(unittest.TestCase):
 
     def test_replay_rug_is_a_loss(self):
         # rises (momentum entry fires) then craters → exit at a loss, position closed
-        ticks = self._ticks([1.0, 1.05, 1.1, 1.15, 1.2, 1.25])
+        ticks = self._ticks([1.0, 1.05, 1.1, 1.15, 1.2, 1.25], step_sec=1500)
         ticks += [{"ts": ticks[-1]["ts"] + 300, "price": 0.2, "liq": 1000.0, "vol_h1": 100.0}]
         r = bt.replay_episode("PUMP", "sol", "0xpump", ticks, "degen")
         self.assertIsNotNone(r)
