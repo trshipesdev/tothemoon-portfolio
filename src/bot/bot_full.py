@@ -2662,7 +2662,24 @@ def _wlt_deployable(w: Dict) -> float:
     return max(0.0, w["vault_usd"] * (1 - reserve))
 
 
-def _wlt_size(w: Dict, symbol: str, chain: str, liq: float,
+# Confidence-tier sizing multiplier per re-entry (user, 2026-07-02): "id rather stay
+# flat or grow then go backwards" — pyramid into confirmed strength, never shrink
+# mid-run, reset to normal only on a loss. Tier 0 = first-ever entry, or reset after
+# a loss. Tier 1 = the first re-entry after banking a profitable exit + reclaiming a
+# new high (the lower-high guard already gates this) — deliberately a SMALLER seed
+# bet to re-test with less risk. Tier 2+ = each further confirmed profitable cycle
+# scales back up and beyond normal size, since conviction has now proven itself
+# multiple times. Capped at 2x to keep pyramiding from compounding into an
+# oversized bet on a single token.
+_TIER_MULTS = [1.0, 0.5, 1.0, 1.25, 1.5, 2.0]
+
+
+def _symbol_tier_mult(addr: str) -> float:
+    tier = STATE.get("symbol_tier", {}).get(addr, {}).get("tier", 0)
+    return _TIER_MULTS[min(tier, len(_TIER_MULTS) - 1)]
+
+
+def _wlt_size(w: Dict, symbol: str, chain: str, liq: float, addr: str = "",
               hype: Optional[int] = None, buy_ratio: Optional[float] = None) -> float:
     mode_name = w.get("mode") or CONFIG["mode"]
     cap = float(w.get("ticket_cap_usd") or 0)
@@ -2670,12 +2687,12 @@ def _wlt_size(w: Dict, symbol: str, chain: str, liq: float,
         # Wallet has an explicit ticket cap — use it as the sizing target.
         # Skip global per_token/per_chain caps (designed for the shadow's large vault,
         # not for a wallet with an explicit per-trade size).
-        base = cap * _conviction_mult(hype, buy_ratio)
-        base = min(base, cap)
+        base = cap * _conviction_mult(hype, buy_ratio) * _symbol_tier_mult(addr)
+        base = min(base, cap * 2.0)   # tier can exceed the flat cap, up to the 2x ceiling
     else:
         mode_cfg = CONFIG["modes"].get(mode_name, CONFIG["modes"].get(CONFIG["mode"], {}))
         base = CONFIG["base_size_usd"] * mode_cfg.get("size_mult", 1.0)
-        base *= _conviction_mult(hype, buy_ratio)
+        base *= _conviction_mult(hype, buy_ratio) * _symbol_tier_mult(addr)
         dep  = _wlt_deployable(w)
         per_token = CONFIG["per_token_cap_pct"] * dep
         per_chain = CONFIG["per_chain_cap_pct"].get(chain, 0.25) * dep
@@ -2821,15 +2838,28 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         pos["deployed_usd"] = deployed - s_cost
         proceeds = s_units * price
         pnl      = proceeds - s_cost
+        pos["episode_pnl"] = pos.get("episode_pnl", 0.0) + pnl   # tracks the WHOLE holding cycle, not just this leg
         gas      = _gas_usd(pos.get("chain", "sol"))
         w["vault_usd"]       += proceeds - gas
         w["cur_deployed_usd"] = max(0.0, w.get("cur_deployed_usd", 0.0) - sell_usd)
     else:
         proceeds = pos["units"] * price
         pnl      = proceeds - deployed
+        episode_pnl = pos.get("episode_pnl", 0.0) + pnl   # full episode total, including any earlier TP rungs
         gas      = _gas_usd(pos.get("chain", "sol"))
         w["vault_usd"]       += proceeds - gas
         w["cur_deployed_usd"] = max(0.0, w.get("cur_deployed_usd", 0.0) - pos.get("usd", 0))
+        # Confidence-tier update: a profitable episode (net across every rung, not
+        # just this final leg) advances the tier for next time we re-enter this
+        # token; any losing episode drops straight back to tier 0. This is what
+        # drives the pyramid sizing in _wlt_size() — stay flat or grow on wins,
+        # reset on a loss, never gradually shrink.
+        _addr = pos.get("address", "")
+        if _addr:
+            _tiers = STATE.setdefault("symbol_tier", {})
+            _cur_tier = _tiers.get(_addr, {}).get("tier", 0)
+            _tiers[_addr] = {"tier": (_cur_tier + 1) if episode_pnl > 0 else 0,
+                             "last_episode_pnl": round(episode_pnl, 2)}
         w["positions"].pop(symbol, None)
         w.setdefault("recently_exited", {})[symbol] = {
             "ts": time.time(), "price": price, "pnl": pnl,
@@ -3437,7 +3467,7 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
             _miss(w, "entry_prob")
             continue
 
-        usd = _wlt_size(w, symbol, chain, liq, hype=hype, buy_ratio=buy_ratio)
+        usd = _wlt_size(w, symbol, chain, liq, addr=addr, hype=hype, buy_ratio=buy_ratio)
         # ticket_cap_usd wallets bypass the global min-ticket check (cap itself is the floor)
         cap = float(w.get("ticket_cap_usd") or 0)
         _min_t = max(1.0, cap * 0.5) if cap > 0 else _mode_min_ticket(w.get("mode") or CONFIG["mode"])
@@ -7546,6 +7576,7 @@ def scan_candidates():
         STATE["token_pnl_today"]   = {}   # cumulative PnL per symbol today (loss escalation)
         STATE["symbol_peaks"]      = {}   # highest price seen WHILE HOLDING a position per symbol today (lower-high guard)
         STATE["candidate_ticks"]   = {}   # rolling recent-price history per address (confirmed-upswing gate)
+        STATE["symbol_tier"]       = {}   # per-address confidence tier for pyramid sizing on re-entry
         STATE["peak_deployed_usd"] = 0.0
         STATE["peak_open_count"]   = 0
         STATE["last_daily_reset"] = today
