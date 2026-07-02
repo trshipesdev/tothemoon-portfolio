@@ -3469,11 +3469,14 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
 
         exit_reason: Optional[str] = None
         _sf = w.get("safety", {})  # per-wallet safety overrides
-        # User-controlled pause: blocks every "normal" exit (dollar stop, velocity,
-        # trailing stop, TP ladder, fixed SL) so the user can manually hold a position
-        # through the dashboard. Liquidity-based protection (sudden RUG drop and slow
-        # LIQ DRAIN) stays active regardless — pausing means "I want to pick the exit
-        # timing," not "let this go to zero unprotected."
+        # User-controlled pause: blocks downside "noise" exits (dollar stop, velocity,
+        # trailing stop, fixed SL) so the user can manually hold a position through
+        # the dashboard. Liquidity-based protection (sudden RUG drop and slow LIQ
+        # DRAIN) stays active regardless — pausing means "I want to pick the exit
+        # timing," not "let this go to zero unprotected." Tiered TP ladder profit-taking
+        # ALSO stays active while held (2026-07-02: "when im also holding them, they
+        # are allowed to do the tiered profits still") — banking profit on the way up
+        # isn't the noise HOLD is meant to silence.
         _manual_grace = time.time() < pos.get("manual_grace_until", 0)
         _sell_paused = bool(pos.get("sell_paused")) or _manual_grace
 
@@ -3529,20 +3532,32 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
             _wlt_sell(wid, w, symbol, price, exit_reason)
             continue
 
+        # TP ladder (partial sells) — runs regardless of HOLD. User (2026-07-02):
+        # "when im also holding them, they are allowed to do the tiered profits
+        # still" — HOLD is meant to pause downside "noise" exits (dollar stop,
+        # velocity, trailing stop, fixed SL), not stop the bot from banking
+        # profits on the way up. Tiered TP is the opposite of noise — it's the
+        # explicit "let $2 become $6 first, bank it" behavior, so it stays live.
+        deployed      = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
+        moonbag_floor = moonbag_frac * deployed
+        tp_index      = pos.get("tp_index", 0)
+        for i, (gain, frac) in enumerate(ladder):
+            if i < tp_index:
+                continue
+            if price >= pos["avg"] * (1 + gain):
+                sellable  = max(0.0, pos["usd"] - moonbag_floor)
+                sell_usd  = min(frac * deployed, sellable)
+                pos["tp_index"] = i + 1
+                if sell_usd > 0.01:
+                    _wlt_sell(wid, w, symbol, price, f"TP rung {i+1}", sell_usd=sell_usd)
+            break
+
         if _sell_paused:
-            # TP ladder / fixed SL would-fire checks, same "tell but don't act" treatment.
-            deployed      = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
-            moonbag_floor = moonbag_frac * deployed
-            tp_index      = pos.get("tp_index", 0)
-            if _would_reason is None:
-                for i, (gain, frac) in enumerate(ladder):
-                    if i < tp_index:
-                        continue
-                    if price >= pos["avg"] * (1 + gain):
-                        _would_reason = f"TP rung {i+1} +{gain*100:.0f}%"
-                    break
+            # fixed_sl would-fire check, same "tell but don't act" treatment as the
+            # dollar stop / velocity / trailing stop checks above — this is the last
+            # downside-only exit still blocked while held (TP already ran for real above).
             sl_level = pos.get("sl_override") or mode_cfg.get("sl", 0.18)
-            if _would_reason is None and price <= pos["avg"] * (1 - sl_level):
+            if _would_reason is None and pos.get("units", 0) > 0 and price <= pos["avg"] * (1 - sl_level):
                 _would_reason = "fixed_sl"
             if _would_reason:
                 _now = time.time()
@@ -3557,22 +3572,7 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
                         f"⏸️👀 {symbol} on {w.get('label', wid)} would have sold — "
                         f"{_would_reason} — but {_why}. Still watching.",
                         critical=True)
-            continue   # skip TP ladder + fixed SL execution — fully user-controlled from here
-
-        # TP ladder (partial sells)
-        deployed     = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
-        moonbag_floor = moonbag_frac * deployed
-        tp_index      = pos.get("tp_index", 0)
-        for i, (gain, frac) in enumerate(ladder):
-            if i < tp_index:
-                continue
-            if price >= pos["avg"] * (1 + gain):
-                sellable  = max(0.0, pos["usd"] - moonbag_floor)
-                sell_usd  = min(frac * deployed, sellable)
-                pos["tp_index"] = i + 1
-                if sell_usd > 0.01:
-                    _wlt_sell(wid, w, symbol, price, f"TP rung {i+1}", sell_usd=sell_usd)
-                break
+            continue   # skip fixed SL execution only — TP ladder already ran above
 
         # Fixed SL fallback
         sl_level = pos.get("sl_override") or mode_cfg.get("sl", 0.18)
@@ -6578,9 +6578,10 @@ def api_wallet_positions(wid):
 @app.route("/api/wallets/<wid>/positions/<symbol>/pause", methods=["POST"])
 @_dash_auth
 def api_wallet_position_pause(wid, symbol):
-    """Toggle manual hold on one open position. Blocks the bot's normal exits
-    (dollar stop, velocity, trailing stop, TP ladder, fixed SL) so the user picks
-    the exit themselves — liquidity-based rug/drain protection stays active either way."""
+    """Toggle manual hold on one open position. Blocks downside "noise" exits
+    (dollar stop, velocity, trailing stop, fixed SL) so the user picks the exit
+    themselves — liquidity-based rug/drain protection AND tiered TP ladder
+    profit-taking both stay active either way."""
     w = STATE.get("wallets", {}).get(wid)
     if not w:
         return jsonify({"error": "wallet not found"}), 404
