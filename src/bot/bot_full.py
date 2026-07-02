@@ -2519,8 +2519,20 @@ def _sol_find_receive_price(owner_addr: str, mint: str, max_sigs: int = 40) -> O
     return None
 
 
-def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict:
-    """Submit a real Jupiter buy for a live wallet. Returns {price, units, sig} or {error}."""
+def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str,
+                  ref_price: float = 0.0) -> Dict:
+    """Submit a real Jupiter buy for a live wallet. Returns {price, units, sig} or {error}.
+
+    ref_price (optional): the market price the candidate was scanned at (DexScreener).
+    Real price impact is checked directly — quoted effective price vs this reference
+    — NOT via Jupiter's own priceImpactPct field, which is unreliable for pump.fun
+    pools (confirmed live 2026-07-02: it reported "0" impact on a quote Phantom
+    correctly flagged as 73.29% — the bot's own crude order/liquidity ESTIMATE let
+    that trade through, and it lost -$18.42/-48% in 96 seconds). Comparing the
+    quote's real execution price against the market price it was scanned at can't
+    silently report zero the way Jupiter's own field can. ref_price=0 skips the
+    check (used by the manual test-trade endpoint, which is tiny/deliberate).
+    """
     kp = _wallet_keypairs.get(wid)
     if not kp:
         return {"error": "no_keypair — set W_<wid>_PK in .env"}
@@ -2535,6 +2547,17 @@ def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict
         quote = _jupiter_get_quote(base_mint, addr, in_units, slip_bps)
         if not quote or not quote.get("outAmount"):
             return {"error": "no_jupiter_route"}
+        if ref_price > 0:
+            tok_dec  = _sol_token_decimals(addr)
+            out_raw  = int(quote.get("outAmount") or 0)
+            if out_raw > 0:
+                quoted_units = out_raw / 10 ** tok_dec
+                quoted_price = usd / quoted_units
+                real_impact  = (quoted_price / ref_price) - 1   # positive = paying more than market
+                max_impact   = CONFIG["moonshot"].get("price_impact_max", 0.02)
+                if real_impact > max_impact:
+                    return {"error": f"real_price_impact_too_high: paying {real_impact*100:.1f}% "
+                                     f"above scan price (max {max_impact*100:.0f}%)"}
         tx_b64 = _jupiter_get_swap_tx(quote, str(kp.pubkey()))
         if not tx_b64:
             return {"error": "jupiter_swap_build_failed"}
@@ -2752,7 +2775,7 @@ def _wlt_can_enter(w: Dict, symbol: str, chain: str) -> bool:
 def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
              usd: float, price: float, liq: float, addr: str):
     if w.get("live") and chain == "sol" and addr:
-        result = _wlt_live_buy(wid, w, symbol, usd, addr)
+        result = _wlt_live_buy(wid, w, symbol, usd, addr, ref_price=price)
         if "error" in result:
             log(f"[W:{wid}] LIVE BUY FAILED {symbol}: {result['error']}")
             w.setdefault("trade_log", []).append({
