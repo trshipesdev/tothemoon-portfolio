@@ -1456,17 +1456,31 @@
         <template x-if="Object.keys(walletPositions).length > 0">
           <div class="space-y-1">
             <template x-for="[sym, p] in Object.entries(walletPositions)" :key="sym">
-              <div class="flex items-center justify-between bg-gray-900 rounded-lg px-3 py-2 text-sm border"
+              <div class="bg-gray-900 rounded-lg px-3 py-2 text-sm border"
                    :class="p.sell_paused ? 'border-amber-700' : 'border-gray-800'">
-                <span class="font-semibold text-white" x-text="sym"></span>
-                <span class="text-xs text-gray-500" x-text="p.entry_mode || '—'"></span>
-                <span class="font-mono text-blue-400" x-text="'$' + (p.usd || 0).toFixed(2) + ' in'"></span>
-                <button @click="togglePositionPause(walletDetail, sym)"
-                        :class="p.sell_paused ? 'bg-amber-700 hover:bg-amber-600 text-white' : 'bg-gray-800 hover:bg-gray-700 text-gray-400'"
-                        class="ml-2 px-2 py-1 rounded text-xs font-semibold shrink-0"
-                        :title="p.sell_paused ? 'Bot will not auto-sell this — click to resume' : 'Click to hold — bot will not auto-sell (rug protection stays on)'">
-                  <span x-text="p.sell_paused ? '⏸ HOLD' : 'Auto'"></span>
-                </button>
+                <div class="flex items-center justify-between">
+                  <span class="font-semibold text-white" x-text="sym"></span>
+                  <span class="text-xs text-gray-500" x-text="p.entry_mode || '—'"></span>
+                  <span class="font-mono text-blue-400" x-text="'$' + (p.usd || 0).toFixed(2) + ' in'"></span>
+                  <button @click="togglePositionPause(walletDetail, sym)"
+                          :class="p.sell_paused ? 'bg-amber-700 hover:bg-amber-600 text-white' : 'bg-gray-800 hover:bg-gray-700 text-gray-400'"
+                          class="ml-2 px-2 py-1 rounded text-xs font-semibold shrink-0"
+                          :title="p.sell_paused ? 'Bot will not auto-sell this — click to resume' : 'Click to hold — bot will not auto-sell (rug protection stays on)'">
+                    <span x-text="p.sell_paused ? '⏸ HOLD' : 'Auto'"></span>
+                  </button>
+                </div>
+                <div class="flex items-center gap-2 mt-1.5 text-xs">
+                  <button @click="manageSellTrigger(walletDetail, sym, p)"
+                          :class="p.sell_trigger ? 'bg-emerald-800 text-emerald-200' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+                          class="px-2 py-0.5 rounded">
+                    <span x-text="p.sell_trigger ? '🎯 sell @ $' + p.sell_trigger.value_usd.toFixed(2) : '+ sell target'"></span>
+                  </button>
+                  <button @click="manageBuyTrigger(walletDetail, sym, p)"
+                          :class="p.buy_trigger ? 'bg-sky-800 text-sky-200' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+                          class="px-2 py-0.5 rounded">
+                    <span x-text="p.buy_trigger ? '🎯 +$' + p.buy_trigger.add_usd.toFixed(2) + ' @ $' + p.buy_trigger.value_usd.toFixed(2) + (p.buy_trigger.repeat ? ' (repeat)' : '') : '+ buy-more trigger'"></span>
+                  </button>
+                </div>
               </div>
             </template>
           </div>
@@ -1844,16 +1858,30 @@
                 </div>
                 <div class="space-y-1">
                   <template x-for="[sym, p] in Object.entries(walletPositions)" :key="sym">
-                    <div class="flex items-center justify-between bg-gray-750 rounded-lg px-3 py-2 text-sm">
-                      <span class="font-semibold text-white" x-text="sym"></span>
-                      <span class="text-xs text-gray-400" x-text="p.entry_mode || '—'"></span>
-                      <span class="font-mono text-gray-300" x-text="'$'+p.usd.toFixed(2)+' in'"></span>
-                      <button @click="togglePositionPause(wid, sym)"
-                              :class="p.sell_paused ? 'bg-amber-700 hover:bg-amber-600 text-white' : 'bg-gray-800 hover:bg-gray-700 text-gray-400'"
-                              class="ml-2 px-2 py-1 rounded text-xs font-semibold shrink-0"
-                              :title="p.sell_paused ? 'Bot will not auto-sell this — click to resume' : 'Click to hold — bot will not auto-sell (rug protection stays on)'">
-                        <span x-text="p.sell_paused ? '⏸ HOLD' : 'Auto'"></span>
-                      </button>
+                    <div class="bg-gray-750 rounded-lg px-3 py-2 text-sm">
+                      <div class="flex items-center justify-between">
+                        <span class="font-semibold text-white" x-text="sym"></span>
+                        <span class="text-xs text-gray-400" x-text="p.entry_mode || '—'"></span>
+                        <span class="font-mono text-gray-300" x-text="'$'+p.usd.toFixed(2)+' in'"></span>
+                        <button @click="togglePositionPause(wid, sym)"
+                                :class="p.sell_paused ? 'bg-amber-700 hover:bg-amber-600 text-white' : 'bg-gray-800 hover:bg-gray-700 text-gray-400'"
+                                class="ml-2 px-2 py-1 rounded text-xs font-semibold shrink-0"
+                                :title="p.sell_paused ? 'Bot will not auto-sell this — click to resume' : 'Click to hold — bot will not auto-sell (rug protection stays on)'">
+                          <span x-text="p.sell_paused ? '⏸ HOLD' : 'Auto'"></span>
+                        </button>
+                      </div>
+                      <div class="flex items-center gap-2 mt-1.5 text-xs">
+                        <button @click="manageSellTrigger(wid, sym, p)"
+                                :class="p.sell_trigger ? 'bg-emerald-800 text-emerald-200' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+                                class="px-2 py-0.5 rounded">
+                          <span x-text="p.sell_trigger ? '🎯 sell @ $' + p.sell_trigger.value_usd.toFixed(2) : '+ sell target'"></span>
+                        </button>
+                        <button @click="manageBuyTrigger(wid, sym, p)"
+                                :class="p.buy_trigger ? 'bg-sky-800 text-sky-200' : 'bg-gray-800 text-gray-500 hover:text-gray-300'"
+                                class="px-2 py-0.5 rounded">
+                          <span x-text="p.buy_trigger ? '🎯 +$' + p.buy_trigger.add_usd.toFixed(2) + ' @ $' + p.buy_trigger.value_usd.toFixed(2) + (p.buy_trigger.repeat ? ' (repeat)' : '') : '+ buy-more trigger'"></span>
+                        </button>
+                      </div>
                     </div>
                   </template>
                 </div>
@@ -3045,6 +3073,37 @@ function app() {
       } else {
         this.showToast(r?.error || 'Failed to toggle hold', false);
       }
+    },
+    async manageSellTrigger(wid, sym, p) {
+      const cur = p.sell_trigger?.value_usd ?? '';
+      const input = prompt(`Sell ${sym} entirely once this position's value reaches $ (currently $${(p.usd||0).toFixed(2)}). Leave blank to clear.`, cur);
+      if (input === null) return;
+      const body = input.trim() === '' ? { clear: true } : { value_usd: parseFloat(input) };
+      if (!body.clear && (!body.value_usd || body.value_usd <= 0)) { this.showToast('Invalid amount', false); return; }
+      const r = await this.post(`/api/wallets/${wid}/positions/${encodeURIComponent(sym)}/sell_trigger`, body);
+      if (r?.ok) { p.sell_trigger = r.sell_trigger; this.showToast(r.sell_trigger ? `Sell target set for ${sym}` : `Sell target cleared for ${sym}`); }
+      else       this.showToast(r?.error || 'Failed to set sell target', false);
+    },
+    async manageBuyTrigger(wid, sym, p) {
+      const curV = p.buy_trigger?.value_usd ?? '';
+      const valInput = prompt(`Buy more ${sym} once this position's value reaches $ (currently $${(p.usd||0).toFixed(2)}). Leave blank to clear.`, curV);
+      if (valInput === null) return;
+      if (valInput.trim() === '') {
+        const r = await this.post(`/api/wallets/${wid}/positions/${encodeURIComponent(sym)}/buy_trigger`, { clear: true });
+        if (r?.ok) { p.buy_trigger = null; this.showToast(`Buy-more trigger cleared for ${sym}`); }
+        else       this.showToast(r?.error || 'Failed to clear', false);
+        return;
+      }
+      const value_usd = parseFloat(valInput);
+      if (!value_usd || value_usd <= 0) { this.showToast('Invalid amount', false); return; }
+      const addInput = prompt(`Add how much USD when it hits $${value_usd}?`, p.buy_trigger?.add_usd ?? '10');
+      if (addInput === null) return;
+      const add_usd = parseFloat(addInput);
+      if (!add_usd || add_usd <= 0) { this.showToast('Invalid amount', false); return; }
+      const repeat = confirm(`Repeat every time it re-crosses $${value_usd} after dipping back below? OK = repeat, Cancel = fire once.`);
+      const r = await this.post(`/api/wallets/${wid}/positions/${encodeURIComponent(sym)}/buy_trigger`, { value_usd, add_usd, repeat });
+      if (r?.ok) { p.buy_trigger = r.buy_trigger; this.showToast(`Buy-more trigger set for ${sym}`); }
+      else       this.showToast(r?.error || 'Failed to set buy-more trigger', false);
     },
     async refreshWalletPositions(wid) {
       // Manual force-refresh — bypasses the 3s timer entirely so a deploy or any

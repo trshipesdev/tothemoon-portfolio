@@ -3508,6 +3508,41 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         if len(liq_ticks) > MS["liq_drain_ticks"] + 1:
             liq_ticks[:] = liq_ticks[-(MS["liq_drain_ticks"] + 1):]
 
+        # Manual price-value triggers — user (2026-07-02): "like the hold thing, i
+        # would also like to be able to control their buy and sells... if the price
+        # reaches this buy more. if the price reaches this sell." Denominated in
+        # position USD VALUE, not raw per-token price — the user's own framing was
+        # "$5 position, sell at $10," and per-token price on a fraction-of-a-cent
+        # memecoin is confusing to reason about directly. Runs unconditionally
+        # (same as TP ladder, NOT gated by _sell_paused) — this is deliberate
+        # profit-taking/pyramid-adding, not the downside noise HOLD is meant to
+        # silence, and it stacks with (does not replace) dollar stop/trailing/TP,
+        # per the user's explicit "i dont want to lose the full $5" — that
+        # downside protection stays active regardless of any trigger set here.
+        _cur_val_now = pos["units"] * price
+        _sell_trig = pos.get("sell_trigger")
+        if _sell_trig and _cur_val_now >= _sell_trig.get("value_usd", float("inf")):
+            _wlt_sell(wid, w, symbol, price, f"MANUAL TARGET ${_sell_trig['value_usd']:.2f}")
+            pos["sell_trigger"] = None
+            continue
+        _buy_trig = pos.get("buy_trigger")
+        if _buy_trig and pos.get("units", 0) > 0:
+            _target = _buy_trig.get("value_usd", float("inf"))
+            if _cur_val_now < _target:
+                _buy_trig["armed"] = True   # re-arm only after value drops back below target
+            elif _buy_trig.get("armed", True):
+                add_usd = min(float(_buy_trig.get("add_usd") or 0), max(0.0, w["vault_usd"] - 3.0))
+                if add_usd >= 1.0:
+                    _wlt_buy(wid, w, symbol, pos.get("chain", "sol"), add_usd, price, liq,
+                             pos.get("address", ""))
+                    send_alert(
+                        f"🎯 MANUAL BUY TRIGGER — {symbol} on {w.get('label', wid)} hit "
+                        f"${_target:.2f}, added ${add_usd:.2f}.", critical=True)
+                if _buy_trig.get("repeat"):
+                    _buy_trig["armed"] = False   # needs a fresh dip below target before firing again
+                else:
+                    pos["buy_trigger"] = None
+
         mode_name = pos.get("entry_mode") or w.get("mode") or CONFIG["mode"]
         mode_cfg  = CONFIG["modes"].get(mode_name, CONFIG["modes"][CONFIG["mode"]])
 
@@ -6709,6 +6744,66 @@ def api_wallet_position_pause(wid, symbol):
            if paused else "bot's normal exits are back in control."),
         critical=True)
     return jsonify({"ok": True, "symbol": symbol, "sell_paused": paused})
+
+
+@app.route("/api/wallets/<wid>/positions/<symbol>/sell_trigger", methods=["POST"])
+@_dash_auth
+def api_wallet_position_sell_trigger(wid, symbol):
+    """Set or clear a manual sell target for one position, denominated in the
+    position's total USD value (not raw per-token price — clearer for
+    fraction-of-a-cent memecoins). Fires the full position closed, alongside
+    (not instead of) the bot's normal exits — dollar stop still caps downside."""
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "wallet not found"}), 404
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        return jsonify({"error": "position not found"}), 404
+    data = flask_request.get_json() or {}
+    if data.get("clear"):
+        pos["sell_trigger"] = None
+        save_state()
+        return jsonify({"ok": True, "symbol": symbol, "sell_trigger": None})
+    value_usd = float(data.get("value_usd") or 0)
+    if value_usd <= 0:
+        return jsonify({"error": "value_usd must be > 0"}), 400
+    pos["sell_trigger"] = {"value_usd": value_usd}
+    save_state()
+    send_alert(f"🎯 {symbol} on {w.get('label', wid)} — sell target set at ${value_usd:.2f}.",
+               critical=True)
+    return jsonify({"ok": True, "symbol": symbol, "sell_trigger": pos["sell_trigger"]})
+
+
+@app.route("/api/wallets/<wid>/positions/<symbol>/buy_trigger", methods=["POST"])
+@_dash_auth
+def api_wallet_position_buy_trigger(wid, symbol):
+    """Set or clear a manual add-to-position trigger, denominated in the
+    position's total USD value. repeat=false (default) fires once and clears;
+    repeat=true re-arms after value drops back below the target so it can fire
+    again on a later re-cross (never fires twice in a row without a real dip
+    back below the target first)."""
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "wallet not found"}), 404
+    pos = w.get("positions", {}).get(symbol)
+    if not pos or pos.get("units", 0) <= 0:
+        return jsonify({"error": "position not found"}), 404
+    data = flask_request.get_json() or {}
+    if data.get("clear"):
+        pos["buy_trigger"] = None
+        save_state()
+        return jsonify({"ok": True, "symbol": symbol, "buy_trigger": None})
+    value_usd = float(data.get("value_usd") or 0)
+    add_usd   = float(data.get("add_usd") or 0)
+    if value_usd <= 0 or add_usd <= 0:
+        return jsonify({"error": "value_usd and add_usd must both be > 0"}), 400
+    pos["buy_trigger"] = {"value_usd": value_usd, "add_usd": add_usd,
+                          "repeat": bool(data.get("repeat")), "armed": True}
+    save_state()
+    send_alert(f"🎯 {symbol} on {w.get('label', wid)} — buy-more trigger set at "
+               f"${value_usd:.2f} (+${add_usd:.2f}"
+               f"{', repeats' if data.get('repeat') else ''}).", critical=True)
+    return jsonify({"ok": True, "symbol": symbol, "buy_trigger": pos["buy_trigger"]})
 
 
 @app.route("/api/wallets/<wid>/test_trade", methods=["POST"])
