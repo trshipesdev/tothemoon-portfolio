@@ -1526,7 +1526,16 @@ def fetch_positions_prices() -> Dict[str, Dict]:
                         bd_liq = float(bd.get("liquidity") or 0) or p.get("entry_liq", 0) or 0
                         result[sym] = _px_dict(float(bd["value"]), bd_liq)
                         continue
+                # Both DexScreener and Birdeye returned nothing for this position.
+                # A real, live token almost always has SOME price source; total silence
+                # from both is itself a signal — usually liquidity has genuinely collapsed
+                # (a rug) and the pair dropped out of both indexes. Mark it so callers can
+                # react urgently instead of silently trusting this synthetic stand-in price
+                # (2026-07-02: two real positions — ROBINSEM, 黑牛模式 — rode this fallback
+                # for 58min and 3hrs before finally exiting at -98.6%/-98.8% from peak,
+                # because nothing treated "no data" as different from "at cost basis").
                 result[sym] = _px_dict(p.get("avg", 1.0) * 1.02)
+                result[sym]["no_data"] = True
         _pos_price_cache["ts"] = now
         _pos_price_cache["data"] = dict(result)
         _pos_price_cache["open_pos_key"] = open_key
@@ -3437,6 +3446,30 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         _fail_cooldown = pos.get("sell_fail_cooldown", 60)
         if time.time() - pos.get("sell_fail_ts", 0) < _fail_cooldown:
             continue
+
+        # Lost price feed from BOTH DexScreener and Birdeye — a real, live token
+        # almost always has SOME price source; total silence from both usually means
+        # liquidity has actually collapsed and the pair dropped out of both indexes.
+        # User (2026-07-02): ROBINSEM/黑牛模式 rode this exact silent fallback (price
+        # snapped to ~entry, liq snapped to 0) for 58min/3hrs before finally exiting
+        # at -98.6%/-98.8% from peak — nothing treated "no data" as different from
+        # "roughly at cost basis" until the trailing stop eventually, coincidentally
+        # caught up. One miss can be a transient API hiccup; require two in a row
+        # (~16s) before treating it as urgent, then sell immediately at whatever
+        # price is available rather than waiting on a synthetic comparison.
+        if px.get("no_data"):
+            pos["price_misses"] = pos.get("price_misses", 0) + 1
+            if pos["price_misses"] >= 2:
+                send_alert(
+                    f"🆘 LOST PRICE FEED — {symbol} on {w.get('label', wid)} — both "
+                    f"DexScreener and Birdeye have returned nothing for "
+                    f"{pos['price_misses']} checks in a row. This usually means "
+                    f"liquidity collapsed. Attempting an emergency exit now at the "
+                    f"best price available.", critical=True)
+                _wlt_sell(wid, w, symbol, price, "PRICE FEED LOST — urgent stop")
+                continue
+        else:
+            pos["price_misses"] = 0
 
         # Track peak
         if price > pos.get("peak_price", 0):
@@ -8168,6 +8201,16 @@ def manage_positions():
         change_m5 = px["change_m5"]
         entry_ts  = datetime.fromisoformat(p.get("time", now_utc().isoformat())).timestamp()
         _record_tick(s, p, px)   # forward recorder: real per-tick price/liq for backtests
+
+        # Same lost-price-feed protection as the wallet engine (2026-07-02) — both
+        # DexScreener and Birdeye silent usually means liquidity actually collapsed.
+        if px.get("no_data"):
+            p["price_misses"] = p.get("price_misses", 0) + 1
+            if p["price_misses"] >= 2:
+                shadow_sell(s, p["units"] * price, price, liq, "PRICE FEED LOST — urgent stop")
+                continue
+        else:
+            p["price_misses"] = 0
 
         # Track peak and trough price
         if price > p.get("peak_price", 0):
