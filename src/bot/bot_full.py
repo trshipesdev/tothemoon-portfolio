@@ -4829,13 +4829,16 @@ AI_SYSTEM = (
     "expectancy is genuinely negative AND it's not explained by noise stops. "
     "Otherwise prefer default or hype/degen. Pull back to 'default' (not 'safe') when market is BTC-dominated "
     "or candidates are thin.\n\n"
-    "IMPORTANT: the context includes both PAPER engine stats (instant, zero-slippage simulated "
-    "fills — always looks better than reality) and real_wallet_execution (what's actually happening "
-    "with real money — real swaps can fail, take seconds to land, and give back most of a fast move "
-    "waiting to retry). Weight real_wallet_execution heavily when it disagrees with the paper numbers — "
-    "if real_sell_failures_recent is high or real_win_rate is meaningfully worse than the paper win "
-    "rate, that's a signal the current mode's aggressiveness is outrunning what real execution can "
-    "actually capture, regardless of how good the paper backtest looks.\n\n"
+    "IMPORTANT — data priority: `primary_signal` tells you which block to base your "
+    "recommendation on. When it's 'real_wallet', that block (real_wallet) is REAL money — "
+    "actual on-chain execution, actual fills, actual failures. Base your recommendation on "
+    "it, not on paper_shadow_reference. paper_shadow_reference assumes instant, zero-slippage "
+    "fills and is provided only as loose comparison context — real trading is always worse than "
+    "that number, never better, so don't let a good paper expectancy talk you into staying "
+    "aggressive if real_wallet shows real losses or real_sell_failures_recent is high. "
+    "When `primary_signal` is 'paper_fallback_insufficient_real_history' (fewer than 5 real "
+    "trades so far), you may lean on paper_shadow_reference since there isn't enough real "
+    "data yet — but say so explicitly in your reasoning and keep confidence modest.\n\n"
     "Return strict JSON only: {recommended_mode, confidence (0-1), aggressive (bool), reasoning (one sentence)}"
 )
 
@@ -4879,16 +4882,41 @@ def _ai_exit_breakdown(n: int = 50) -> Dict[str, Any]:
     return breakdown
 
 
+def _ai_wallet_exit_breakdown(n: int = 50) -> Dict[str, Any]:
+    """Same bucketing as _ai_exit_breakdown, sourced from real live-wallet sells."""
+    sells: List[Dict] = []
+    for w in STATE.get("wallets", {}).values():
+        if not w.get("live"):
+            continue
+        sells.extend(t for t in w.get("trade_log", [])
+                     if t.get("side") == "sell" and t.get("pnl") is not None)
+    sells.sort(key=lambda t: t.get("ts", ""))
+    breakdown: Dict[str, Dict] = {}
+    for r in sells[-n:]:
+        reason_raw = r.get("exit_reason", "unknown") or "unknown"
+        if reason_raw.startswith("TP"):           key = "TP_hit"
+        elif reason_raw.startswith("RUG"):         key = "RUG_guard"
+        elif reason_raw.startswith("fixed_sl"):    key = "fixed_sl"
+        elif reason_raw.startswith("DOLLAR STOP"): key = "dollar_stop"
+        elif reason_raw.startswith("VELOCITY"):    key = "velocity"
+        elif reason_raw.startswith("TRAIL"):       key = "trail_stop"
+        else:                                      key = "other"
+        b = breakdown.setdefault(key, {"count": 0, "total_pnl": 0.0})
+        b["count"] += 1
+        b["total_pnl"] = round(b["total_pnl"] + (r.get("pnl") or 0), 2)
+    for b in breakdown.values():
+        b["avg_pnl"] = round(b["total_pnl"] / b["count"], 2) if b["count"] else 0
+    return breakdown
+
+
 def _ai_wallet_reality(n: int = 30) -> Dict[str, Any]:
-    """Real hot-wallet execution stats — separate from the paper engine's theoretical
-    numbers above. Paper trades assume instant, zero-slippage fills; real swaps can
-    fail, take seconds to land, and give back most of a move while waiting to retry
-    (DIRT, 2026-07-02: paper banked ~$42 on a spike, the real wallet banked $2.95
-    after a failed sell forced a 60s wait). The mode recommendation governs REAL
-    money via the wallet, so it needs to see execution reality, not just backtest math."""
+    """Real hot-wallet execution stats. Paper trades assume instant, zero-slippage
+    fills; real swaps can fail, take seconds to land, and give back most of a move
+    while waiting to retry (DIRT, 2026-07-02: paper banked ~$42 on a spike, the real
+    wallet banked $2.95 after a failed sell forced a 60s wait)."""
     live_wallets = [w for w in STATE.get("wallets", {}).values() if w.get("live")]
     if not live_wallets:
-        return {"live_wallets": 0}
+        return {"live_wallets": 0, "real_recent_trades": 0}
     sells = []
     fails = 0
     for w in live_wallets:
@@ -4897,26 +4925,44 @@ def _ai_wallet_reality(n: int = 30) -> Dict[str, Any]:
                 sells.append(t)
             elif t.get("side") == "sell_failed":
                 fails += 1
+    sells.sort(key=lambda t: t.get("ts", ""))
     sells = sells[-n:]
-    pnls = [t.get("pnl", 0) for t in sells]
-    wr = (sum(1 for p in pnls if p > 0) / len(pnls)) if pnls else 0.0
+    pnls  = [t.get("pnl", 0) for t in sells]
+    wins  = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    wr = (len(wins) / len(pnls)) if pnls else 0.0
+    avg_win  = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0.0
     return {
         "live_wallets":       len(live_wallets),
         "real_recent_trades": len(pnls),
         "real_win_rate":      round(wr, 2),
+        "real_avg_win":       round(avg_win, 2),
+        "real_avg_loss":      round(avg_loss, 2),
+        "real_expectancy_per_trade": round(wr * avg_win + (1 - wr) * avg_loss, 2),
         "real_recent_pnl":    round(sum(pnls), 2),
         "real_sell_failures_recent": fails,
+        "real_exit_reason_breakdown": _ai_wallet_exit_breakdown(50),
     }
 
 
 def _ai_market_context() -> Dict[str, Any]:
+    """Real hot-wallet performance is the PRIMARY signal — user (2026-07-02): 'i
+    need the ai mode to truly monitor my own phantom hot wallet... i dont mind the
+    shadow rec help when its fixed' (shadow isn't yet tuned to match real execution
+    — no slippage/fail simulation — so it's demoted to reference-only context, not
+    the driver). Falls back to paper stats as the primary signal ONLY when there
+    isn't enough real trade history yet to judge (min 5 real trades)."""
+    real = _ai_wallet_reality(30)
     hist     = STATE.get("pnl_hist", [])[-30:]
     wins_l   = [x for x in hist if x > 0]
     losses_l = [x for x in hist if x <= 0]
-    wr       = (len(wins_l) / len(hist)) if hist else 0.0
-    avg_win  = (sum(wins_l) / len(wins_l)) if wins_l else 0.0
-    avg_loss = (sum(losses_l) / len(losses_l)) if losses_l else 0.0
-    expectancy = wr * avg_win + (1 - wr) * avg_loss
+    p_wr       = (len(wins_l) / len(hist)) if hist else 0.0
+    p_avg_win  = (sum(wins_l) / len(wins_l)) if wins_l else 0.0
+    p_avg_loss = (sum(losses_l) / len(losses_l)) if losses_l else 0.0
+    p_expectancy = p_wr * p_avg_win + (1 - p_wr) * p_avg_loss
+
+    enough_real = real.get("real_recent_trades", 0) >= 5
     return {
         "current_mode":         CONFIG["mode"],
         "allowed_modes":        CONFIG["ai"].get("allowed_modes", ["safe", "default", "hype", "degen"]),
@@ -4926,20 +4972,23 @@ def _ai_market_context() -> Dict[str, Any]:
         "vault_start":          round(STATE.get("vault_start", 0), 2),
         "take_home_usd":        round(STATE.get("take_home_usd", 0), 2),
         "open_positions":       sum(1 for p in STATE.get("positions", {}).values() if p.get("units", 0) > 0),
-        "recent_trades":        len(hist),
-        "recent_win_rate":      round(wr, 2),
-        "avg_win":              round(avg_win, 2),
-        "avg_loss":             round(avg_loss, 2),
-        "expectancy_per_trade": round(expectancy, 2),
-        "biggest_recent_win":   round(max(hist), 2) if hist else 0,
-        "recent_pnl":           round(sum(hist), 2),
-        "exit_reason_breakdown": _ai_exit_breakdown(50),
-        "scout_last_40":        _scout_reason_summary(40),
         "drawdown_brake":       drawdown_brake_active(),
-        "note":                 "the above (recent_trades, win_rate, pnl, exit_reason_breakdown) is the "
-                                 "PAPER engine — instant, zero-slippage simulated fills. See "
-                                 "real_wallet_execution below for what's actually happening with real money.",
-        "real_wallet_execution": _ai_wallet_reality(30),
+        "scout_last_40":        _scout_reason_summary(40),
+        # PRIMARY — real hot wallet. Base your mode recommendation on this.
+        "primary_signal": "real_wallet" if enough_real else "paper_fallback_insufficient_real_history",
+        "real_wallet": real,
+        # SECONDARY — paper/shadow engine. Reference only, NOT the primary driver:
+        # it assumes instant zero-slippage fills and doesn't yet reflect real
+        # execution constraints (failed sells, retry delays, slippage on fast moves).
+        "paper_shadow_reference": {
+            "recent_trades":        len(hist),
+            "recent_win_rate":      round(p_wr, 2),
+            "avg_win":              round(p_avg_win, 2),
+            "avg_loss":             round(p_avg_loss, 2),
+            "expectancy_per_trade": round(p_expectancy, 2),
+            "recent_pnl":           round(sum(hist), 2),
+            "exit_reason_breakdown": _ai_exit_breakdown(50),
+        },
     }
 
 
@@ -7622,13 +7671,18 @@ def scan_candidates():
         # re-buying each successively weaker bounce after the first good catch, ~$5-10
         # each time) has zero protection once that window passes. No expiry — only a
         # real new high (while holding) clears it.
-        # Tolerance tightened 20%→5% same day: BARNEY re-entered 14% below its peak
-        # (inside the old 20% band) and immediately lost money — still clearly the same
-        # lower-high sawtooth pattern as MONK, just a bit closer to the old high. A
-        # rebuy should mean actually reclaiming the previous peak, not just being in
-        # its neighborhood.
+        # Tolerance tightened 20%→5%→0% same day: BARNEY re-entered 14% below its
+        # peak (inside the old 20% band) and immediately lost money — still clearly
+        # the same lower-high sawtooth pattern as MONK, just a bit closer to the old
+        # high. This is the exit half of a deliberate trail-and-rebuy strategy (user,
+        # 2026-07-02): trailing stop exits near a peak (e.g. +1000% -> sell around
+        # +890%, "catching the dip off the top"), then WAIT — only rebuy once price
+        # genuinely reclaims the old peak (a real breakout continuation), never on a
+        # weaker bounce below it. Sacrifices the exact top/bottom of each swing in
+        # exchange for never round-tripping a full pump back to a loss. Now requires
+        # an actual new high, not just "close to" the old one.
         _peak = STATE.get("symbol_peaks", {}).get(symbol, 0)
-        if _peak > 0 and price < _peak * 0.95:
+        if _peak > 0 and price < _peak:
             _scout(symbol, chain, "rejected",
                    f"lower high — {(1 - price/_peak)*100:.0f}% below its own session peak "
                    f"(${_peak:.6g} → ${price:.6g})", sc, addr)

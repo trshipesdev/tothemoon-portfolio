@@ -2114,17 +2114,24 @@ class TestAIAdvisor(unittest.TestCase):
             del os.environ["ANTHROPIC_API_KEY"]
 
     def test_market_context_shape(self):
+        # Paper/shadow stats now live under paper_shadow_reference (secondary
+        # context) — real_wallet is the primary signal (2026-07-02 restructuring:
+        # the AI mode advisor must be driven by real hot-wallet execution, not the
+        # paper engine's unrealistic instant-fill numbers).
         bot.STATE["pnl_hist"] = [10, -5, 8]   # 2 wins (10, 8), 1 loss (-5)
+        bot.STATE["wallets"] = {}             # no live wallets -> falls back to paper
         ctx = bot._ai_market_context()
-        self.assertEqual(ctx["recent_trades"], 3)
-        self.assertAlmostEqual(ctx["recent_win_rate"], 2 / 3, places=2)
-        self.assertAlmostEqual(ctx["avg_win"], 9.0)          # (10+8)/2
-        self.assertAlmostEqual(ctx["avg_loss"], -5.0)
+        ref = ctx["paper_shadow_reference"]
+        self.assertEqual(ref["recent_trades"], 3)
+        self.assertAlmostEqual(ref["recent_win_rate"], 2 / 3, places=2)
+        self.assertAlmostEqual(ref["avg_win"], 9.0)          # (10+8)/2
+        self.assertAlmostEqual(ref["avg_loss"], -5.0)
         # expectancy = 2/3*9 + 1/3*(-5) = 6 - 1.67 = +4.33 (positive)
-        self.assertGreater(ctx["expectancy_per_trade"], 0)
-        self.assertEqual(ctx["biggest_recent_win"], 10)
+        self.assertGreater(ref["expectancy_per_trade"], 0)
         self.assertIn("scout_last_40", ctx)
         self.assertIn("current_mode", ctx)
+        self.assertEqual(ctx["primary_signal"], "paper_fallback_insufficient_real_history")
+        self.assertIn("real_wallet", ctx)
 
     def test_scout_reason_summary(self):
         bot.STATE["scout_log"] = []
