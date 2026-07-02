@@ -1660,17 +1660,18 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
         "max_age_min", CONFIG["scan"]["new_max_age_min"])
     if sc.age_min > max_age:
         return f"age {sc.age_min:.0f}m over {max_age:.0f}m limit"
-    # User (2026-07-02): "i do not want it joining coins that are less than an hour or
-    # so old unless theyre up like 1000%... irresponsible and a waste when it affects
-    # the pool that much." A brand-new coin is also a brand-new (thin) pool — a normal
-    # full-size ticket into it causes real price impact (see the LOVE incident same day:
-    # 73% real impact, -48% in 96 seconds) even when every other filter passes cleanly.
-    # Below 20min old the h1/h6 checks above are exempted entirely (no real history
-    # yet) — meaning young tokens currently get an easier bar, not a harder one. Flip
-    # that: under 1h old, require an extreme, unmistakable pump on at least one window
-    # before it's worth the risk at all.
-    if sc.age_min < 60 and max(sc.price_chg_m5, sc.price_chg_h1, sc.price_chg_h6) < 1000:
-        return f"under 1h old and not up 1000%+ yet (best window {max(sc.price_chg_m5, sc.price_chg_h1, sc.price_chg_h6):.0f}%)"
+    # User (2026-07-02): originally required under-1h-old coins to already be up
+    # 1000%+ before entering at all — a brand-new coin is also a brand-new (thin)
+    # pool, and a normal full-size ticket into it causes real price impact (the
+    # LOVE incident same day: 73% real impact, -48% in 96 seconds). Superseded by
+    # "spray mode" instead: young coins now enter through the SAME filters as
+    # everything else (liquidity, hype, free-fall/sustained-decline) but get
+    # routed into a completely different, tightly-bounded execution profile — see
+    # SPRAY_TP_USD/SPRAY_STOP_PCT/SPRAY_MAX_CONCURRENT and the spray branch in
+    # _manage_wallet_positions. "these are sprays... must be mathematically
+    # impossible to drain a wallet" — the $5 flat ticket (YOUNG_COIN_TICKET_CAP)
+    # and tight stop replace the old blanket 1000%+ requirement as the real-money
+    # safety mechanism, instead of just refusing entry outright.
     # Skip the 24h trend check for tokens under 5 minutes old (no h24 history yet) OR
     # when m5 is strongly positive (≥10%) — an active pump overrides a stale 24h window.
     # Meme coins often launch, consolidate, then spike: h24 looks negative while m5 is +80%.
@@ -2752,6 +2753,19 @@ def _wlt_deployable(w: Dict) -> float:
 # oversized bet on a single token.
 _TIER_MULTS = [1.0, 0.5, 1.0, 1.25, 1.5, 2.0]
 
+# Spray mode (2026-07-02): young coins (<1h old) get a deliberately different,
+# tightly-bounded strategy instead of requiring a 1000%+ pump to enter at all.
+# "these are sprays... must be mathematically impossible to drain a wallet."
+# With SPRAY_MAX_CONCURRENT sprays open at once, each capped at a $5 ticket
+# (YOUNG_COIN_TICKET_CAP) with a SPRAY_STOP_PCT stop, the worst possible
+# simultaneous loss from this sub-strategy is bounded: 5 × ($5 × 0.30) = $7.50,
+# regardless of how bad a streak gets. Wins repeat via a fixed $2 partial
+# take-profit instead of a percentage ladder — see the spray branch in
+# _manage_wallet_positions.
+SPRAY_TP_USD         = 2.0
+SPRAY_STOP_PCT        = 0.30
+SPRAY_MAX_CONCURRENT  = 5
+
 
 def _symbol_tier_mult(addr: str) -> float:
     tier = STATE.get("symbol_tier", {}).get(addr, {}).get("tier", 0)
@@ -3575,6 +3589,12 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         _cost        = pos.get("usd", 0) or 1e-9
         _cur_val     = pos["units"] * price
         _eff_stop    = max(_dollar_stop, _cost * 0.10)
+        if pos.get("spray"):
+            # Sprays need a real, tight mathematical ceiling regardless of the
+            # wallet's normal (much wider) dollar stop — user (2026-07-02):
+            # "mathematically impossible to drain a wallet." SPRAY_STOP_PCT caps
+            # loss at 30% of remaining cost basis on every single spray, always.
+            _eff_stop = _cost * SPRAY_STOP_PCT
         if _cur_val < 0.01:
             w.get("positions", {}).pop(symbol, None)
             continue
@@ -3626,19 +3646,37 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         # velocity, trailing stop, fixed SL), not stop the bot from banking
         # profits on the way up. Tiered TP is the opposite of noise — it's the
         # explicit "let $2 become $6 first, bank it" behavior, so it stays live.
-        deployed      = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
-        moonbag_floor = moonbag_frac * deployed
-        tp_index      = pos.get("tp_index", 0)
-        for i, (gain, frac) in enumerate(ladder):
-            if i < tp_index:
-                continue
-            if price >= pos["avg"] * (1 + gain):
-                sellable  = max(0.0, pos["usd"] - moonbag_floor)
-                sell_usd  = min(frac * deployed, sellable)
-                pos["tp_index"] = i + 1
-                if sell_usd > 0.01:
-                    _wlt_sell(wid, w, symbol, price, f"TP rung {i+1}", sell_usd=sell_usd)
-            break
+        if pos.get("spray"):
+            # Spray positions (young coins, <1h old at entry) use a repeating fixed-
+            # dollar take-profit instead of the normal % ladder. User (2026-07-02):
+            # "instead of reaching $2 profit and getting out, making it should be
+            # just keep taking out the $2 profits and letting it ride until the bot
+            # thinks its time to pull it." Every time UNREALIZED gain on the
+            # remaining units reaches $2, bank exactly $2 of profit (not $2 of
+            # position value) and let the rest keep riding — repeats indefinitely.
+            # Once gain stalls under $2, the position just falls through to the
+            # normal trailing-stop/rug logic below like any other position — that's
+            # "until the bot thinks it's time to pull it."
+            _gain_usd = _cur_val_now - pos["usd"]
+            if _gain_usd >= SPRAY_TP_USD:
+                _frac     = SPRAY_TP_USD / _gain_usd   # solves proceeds-cost=$2 exactly
+                _sell_usd = pos["usd"] * _frac
+                if _sell_usd > 0.01:
+                    _wlt_sell(wid, w, symbol, price, "SPRAY TP +$2", sell_usd=_sell_usd)
+        else:
+            deployed      = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
+            moonbag_floor = moonbag_frac * deployed
+            tp_index      = pos.get("tp_index", 0)
+            for i, (gain, frac) in enumerate(ladder):
+                if i < tp_index:
+                    continue
+                if price >= pos["avg"] * (1 + gain):
+                    sellable  = max(0.0, pos["usd"] - moonbag_floor)
+                    sell_usd  = min(frac * deployed, sellable)
+                    pos["tp_index"] = i + 1
+                    if sell_usd > 0.01:
+                        _wlt_sell(wid, w, symbol, price, f"TP rung {i+1}", sell_usd=sell_usd)
+                break
 
         if _sell_paused:
             # fixed_sl would-fire check, same "tell but don't act" treatment as the
@@ -3725,6 +3763,15 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
             # wallet's normal 50%-of-cap floor (~$19) force it back up, or force-reject
             # it as "too small." $5 IS the intended size here, not a shortfall.
             _min_t = 1.0
+            # Hard concurrency cap — this is the actual "mathematically impossible to
+            # drain a wallet" mechanism: with SPRAY_MAX_CONCURRENT sprays open at once,
+            # each capped at $5 with a 30% stop, worst-case simultaneous loss is bounded
+            # at 5 × $1.50 = $7.50 no matter how bad a streak gets.
+            _open_sprays = sum(1 for p in w.get("positions", {}).values()
+                               if p.get("units", 0) > 0 and p.get("spray"))
+            if _open_sprays >= SPRAY_MAX_CONCURRENT:
+                _miss(w, "spray_cap")
+                continue
         else:
             _min_t = max(1.0, cap * 0.5) if cap > 0 else _mode_min_ticket(w.get("mode") or CONFIG["mode"])
         if usd < _min_t:
@@ -3739,6 +3786,10 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
             usd = min(usd, cap)
 
         _wlt_buy(wid, w, symbol, chain, usd, price, liq, addr)
+        if age_min < 60:
+            _new_pos = w.get("positions", {}).get(symbol)
+            if _new_pos:
+                _new_pos["spray"] = True
         scan_entered.setdefault(wid, set()).add(symbol)
 
 
@@ -8126,8 +8177,17 @@ def scan_candidates():
         # weaker bounce below it. Sacrifices the exact top/bottom of each swing in
         # exchange for never round-tripping a full pump back to a loss. Now requires
         # an actual new high, not just "close to" the old one.
+        # Spray exemption (2026-07-02): both the lower-high guard and the profit-chase
+        # cooldown below were built for the OTHER strategy — patient, trend-following,
+        # bigger bets where "don't rebuy a weaker bounce, wait for a real breakout"
+        # makes sense. Sprays are the opposite shape on purpose: tiny ($5), tightly
+        # stopped (30%) bets meant to cycle fast — "slow upward churn, repeatedly
+        # cycle quick small wins." Waiting for a genuine new high or an 8% pullback
+        # defeats that; the risk is already bounded by SPRAY_STOP_PCT and
+        # SPRAY_MAX_CONCURRENT regardless of how often it re-enters.
+        _spray_eligible = sc.age_min < 60
         _peak = STATE.get("symbol_peaks", {}).get(symbol, 0)
-        if _peak > 0 and price < _peak:
+        if not _spray_eligible and _peak > 0 and price < _peak:
             _scout(symbol, chain, "rejected",
                    f"lower high — {(1 - price/_peak)*100:.0f}% below its own session peak "
                    f"(${_peak:.6g} → ${price:.6g})", sc, addr)
@@ -8173,7 +8233,7 @@ def scan_candidates():
                                f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, cumul=${_eff_pnl:.2f})", sc, addr)
                         continue
                 # eff_pnl in (-5, 0): no cooldown — small losses re-enter freely
-            if _rex_pnl >= 0 and _rex_elapsed < 15 * 60:
+            if not _spray_eligible and _rex_pnl >= 0 and _rex_elapsed < 15 * 60:
                 # Hard minimum: never re-enter within 60s of a profit exit regardless of price.
                 # TOPDOG re-bought 0s after selling — no time for price to have pulled back.
                 if _rex_elapsed < 60:
