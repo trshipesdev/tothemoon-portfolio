@@ -2739,7 +2739,12 @@ def _wlt_size(w: Dict, symbol: str, chain: str, liq: float, addr: str = "",
     # ticket causes real price impact ("irresponsible... wipes out my small climbs").
     # Treat it exactly like a fresh tier-1 seed bet regardless of this symbol's actual
     # tier state — same principle as the pyramid: earn size, don't start with it.
-    tier_mult = min(_symbol_tier_mult(addr), 0.5) if age_min < 60 else _symbol_tier_mult(addr)
+    # User (2026-07-02): "it should be doing $5's if anything... let $2 become $6
+    # first, bank it" — a percentage cut of the normal ticket ($38 base → ~$19) was
+    # still way too large for a coin that's only proven itself for minutes. Young
+    # coins get a genuinely tiny flat ticket, sized up only after it actually earns it.
+    YOUNG_COIN_TICKET_CAP = 5.0
+    tier_mult = _symbol_tier_mult(addr)
     cap = float(w.get("ticket_cap_usd") or 0)
     if cap > 0:
         # Wallet has an explicit ticket cap — use it as the sizing target.
@@ -2763,7 +2768,10 @@ def _wlt_size(w: Dict, symbol: str, chain: str, liq: float, addr: str = "",
     d_stop = _mode_dollar_stop(mode_name)
     mult   = float(w.get("safety", {}).get("dollar_stop_pos_mult") or
                    CONFIG["moonshot"].get("dollar_stop_pos_mult", 4.0))
-    return min(base, d_stop * mult)
+    base = min(base, d_stop * mult)
+    if age_min < 60:
+        base = min(base, YOUNG_COIN_TICKET_CAP)
+    return base
 
 
 def _wlt_can_enter(w: Dict, symbol: str, chain: str) -> bool:
@@ -3363,6 +3371,15 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
             "deployed_usd": usd, "entry_mode": entry_mode,
             "tp_index": 0,
         }
+        if src == "manual_buy_detected":
+            # User (2026-07-02): "if i manually add it, it needs to wait 5 min" —
+            # a manual Phantom buy gets adopted on the next ~30s reconcile tick, right
+            # into a live scan cycle already in progress; the exit checks below can
+            # fire within seconds on a token the bot never evaluated the trend on,
+            # -$11 gone before the user even sees it show up on the dashboard. Give it
+            # a real 5-minute grace window — same "tell but don't act" treatment as
+            # the manual HOLD toggle (rug/liq-drain protection still active).
+            w["positions"][symbol]["manual_grace_until"] = time.time() + 300
         w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + usd
         log(f"[W:{wid}] RECONCILE ADOPT {symbol}: {ui:.4f} on-chain tokens from "
             f"{src} @ {entry_ts[:19]} — now tracked and exit-managed")
@@ -3433,7 +3450,8 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         # through the dashboard. Liquidity-based protection (sudden RUG drop and slow
         # LIQ DRAIN) stays active regardless — pausing means "I want to pick the exit
         # timing," not "let this go to zero unprotected."
-        _sell_paused = bool(pos.get("sell_paused"))
+        _manual_grace = time.time() < pos.get("manual_grace_until", 0)
+        _sell_paused = bool(pos.get("sell_paused")) or _manual_grace
 
         # Dollar stop — wallet override → mode default → base $12
         # Use pos["usd"] (cost basis of REMAINING units, reduced on each partial sell)
@@ -3509,9 +3527,11 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
                 if _would_reason != _last_reason or _now - _last_ts >= 300:
                     pos["hold_alert_reason"] = _would_reason
                     pos["hold_alert_ts"]     = _now
+                    _why = (f"still settling in — {int(pos['manual_grace_until'] - _now)}s left "
+                            f"on its 5min manual-add grace window" if _manual_grace else "it's on HOLD")
                     send_alert(
                         f"⏸️👀 {symbol} on {w.get('label', wid)} would have sold — "
-                        f"{_would_reason} — but it's on HOLD. Still watching.",
+                        f"{_would_reason} — but {_why}. Still watching.",
                         critical=True)
             continue   # skip TP ladder + fixed SL execution — fully user-controlled from here
 
@@ -3588,7 +3608,13 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
         usd = _wlt_size(w, symbol, chain, liq, addr=addr, hype=hype, buy_ratio=buy_ratio, age_min=age_min)
         # ticket_cap_usd wallets bypass the global min-ticket check (cap itself is the floor)
         cap = float(w.get("ticket_cap_usd") or 0)
-        _min_t = max(1.0, cap * 0.5) if cap > 0 else _mode_min_ticket(w.get("mode") or CONFIG["mode"])
+        if age_min < 60:
+            # _wlt_size already capped this at the $5 young-coin ticket — don't let the
+            # wallet's normal 50%-of-cap floor (~$19) force it back up, or force-reject
+            # it as "too small." $5 IS the intended size here, not a shortfall.
+            _min_t = 1.0
+        else:
+            _min_t = max(1.0, cap * 0.5) if cap > 0 else _mode_min_ticket(w.get("mode") or CONFIG["mode"])
         if usd < _min_t:
             _miss(w, "min_ticket")
             continue
