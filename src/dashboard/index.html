@@ -1331,91 +1331,245 @@
     </div>
 
     <!-- WALLETS -->
-    <div x-show="tab === 'Hot Wallet'" class="space-y-4">
-      <div class="flex items-center justify-between flex-wrap gap-2">
-        <p class="text-gray-400 text-sm">Independent vaults running the same scanner — each with its own balance, mode, and trade history.</p>
-        <div class="flex gap-2">
-          <button @click="loadWallets()" class="text-xs px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300">↻ Refresh</button>
-          <button @click="showAddWallet = !showAddWallet" class="text-xs px-3 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-white">+ Add Wallet</button>
+    <div x-show="tab === 'Hot Wallet'" class="max-w-2xl mx-auto">
+
+      <!-- ── Big balance header ── -->
+      <div class="text-center py-6">
+        <div class="text-gray-500 text-xs uppercase tracking-wider mb-1">
+          Hot Wallet
+          <span x-show="wallets[walletDetail]?.live" class="text-red-400">· live</span>
+          <span x-show="!wallets[walletDetail]?.live" class="text-yellow-500">· shadow</span>
+        </div>
+        <div class="text-4xl font-bold" x-text="'$' + fmt(wallets[walletDetail]?.vault_usd ?? 0)"></div>
+        <div class="font-mono text-blue-400 text-sm mt-1"
+             x-show="(wallets[walletDetail]?.on_chain_usd ?? 0) > 0"
+             x-text="'◎ $' + fmt(wallets[walletDetail]?.on_chain_usd ?? 0) + ' on-chain'"></div>
+        <div class="mt-2 text-sm">
+          <span :class="(wallets[walletDetail]?.net_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
+                x-text="((wallets[walletDetail]?.net_pnl ?? 0) >= 0 ? '▲ +$' : '▼ -$') + fmt(Math.abs(wallets[walletDetail]?.net_pnl ?? 0))"></span>
+          <span class="text-gray-500"> all-time</span>
+          <span class="text-gray-600 mx-1">·</span>
+          <span :class="walletTrades.filter(t=>t.side==='sell'&&t.ts&&new Date(t.ts)>new Date(new Date().setHours(0,0,0,0))).reduce((s,t)=>s+(t.pnl||0),0)>=0?'text-green-400':'text-red-400'"
+                x-text="(walletTrades.filter(t=>t.side==='sell'&&t.ts&&new Date(t.ts)>new Date(new Date().setHours(0,0,0,0))).reduce((s,t)=>s+(t.pnl||0),0)>=0?'+$':'-$')+fmt(Math.abs(walletTrades.filter(t=>t.side==='sell'&&t.ts&&new Date(t.ts)>new Date(new Date().setHours(0,0,0,0))).reduce((s,t)=>s+(t.pnl||0),0)))+' today'"></span>
         </div>
       </div>
 
-      <!-- Bulk Actions -->
-      <div class="bg-gray-900 border border-gray-700 rounded-xl p-3">
-        <div class="text-xs text-gray-500 uppercase tracking-wider mb-2">Bulk actions — all wallets</div>
-        <div class="flex flex-wrap gap-2 items-center">
-          <button @click="bulkWalletAction('clear_cooldowns')"
-                  class="text-xs px-3 py-1.5 bg-red-900/40 hover:bg-red-900/70 border border-red-700/40 rounded-lg text-red-300">
-            Clear all cooldowns
-          </button>
-          <button @click="bulkWalletAction('clear_entry_caps')"
-                  class="text-xs px-3 py-1.5 bg-yellow-900/30 hover:bg-yellow-900/60 border border-yellow-700/30 rounded-lg text-yellow-300">
-            Reset entry caps
-          </button>
-          <button @click="bulkWalletAction('clear_reject_cache')"
-                  class="text-xs px-3 py-1.5 bg-blue-900/30 hover:bg-blue-900/60 border border-blue-700/30 rounded-lg text-blue-300">
-            Clear reject cache
-          </button>
-          <div class="flex items-center gap-1.5 ml-auto">
-            <span class="text-xs text-gray-500">Set all modes:</span>
-            <select x-model="bulkMode" class="text-xs bg-gray-800 border border-gray-600 rounded-lg px-2 py-1 text-gray-200 focus:outline-none">
-              <option value="">— pick —</option>
+      <!-- ── Stats grid ── -->
+      <div class="grid grid-cols-4 gap-2 mb-4 text-center">
+        <div class="bg-gray-900 rounded-xl p-3">
+          <div class="text-gray-500 text-xs mb-1">On-chain</div>
+          <div class="font-bold text-sm text-blue-400" x-text="'$' + fmt(wallets[walletDetail]?.on_chain_usd ?? 0)"></div>
+        </div>
+        <div class="bg-gray-900 rounded-xl p-3">
+          <div class="text-gray-500 text-xs mb-1">In positions</div>
+          <div class="font-bold text-sm" x-text="'$' + fmt(wallets[walletDetail]?.open_pos_usd ?? 0)"></div>
+        </div>
+        <div class="bg-gray-900 rounded-xl p-3">
+          <div class="text-gray-500 text-xs mb-1">Net P&L</div>
+          <div class="font-bold text-sm" :class="(wallets[walletDetail]?.net_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
+               x-text="((wallets[walletDetail]?.net_pnl ?? 0) >= 0 ? '+$' : '-$') + fmt(Math.abs(wallets[walletDetail]?.net_pnl ?? 0))"></div>
+        </div>
+        <div class="bg-emerald-950 border border-emerald-800/40 rounded-xl p-3">
+          <div class="text-emerald-500 text-xs mb-1">→ Cold</div>
+          <div class="font-bold text-sm text-emerald-400" x-text="'$' + fmt(wallets[walletDetail]?.total_swept_usd ?? 0)"></div>
+        </div>
+      </div>
+
+      <!-- ── Status + Controls card ── -->
+      <template x-if="wallets[walletDetail]">
+        <div class="bg-gray-900 border border-gray-700 rounded-xl p-4 mb-4">
+          <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <div class="flex items-center gap-2 flex-wrap">
+              <div :class="wallets[walletDetail].active ? 'bg-green-400' : 'bg-gray-500'" class="w-2 h-2 rounded-full flex-shrink-0"></div>
+              <span class="font-semibold text-white" x-text="wallets[walletDetail].label"></span>
+              <span class="text-xs px-2 py-0.5 rounded-full bg-indigo-900 text-indigo-300" x-text="wallets[walletDetail].mode"></span>
+              <span x-show="wallets[walletDetail].live" class="text-xs px-2 py-0.5 rounded-full bg-red-950 text-red-300 font-bold">🔴 LIVE</span>
+              <span x-show="!wallets[walletDetail].active" class="text-xs px-2 py-0.5 rounded-full bg-gray-800 text-gray-500">paused</span>
+              <span x-show="wallets[walletDetail].at_floor" class="text-xs px-2 py-0.5 rounded-full bg-red-900 text-red-300">⛔ at floor</span>
+            </div>
+            <a x-show="wallets[walletDetail].address"
+               :href="'https://solscan.io/account/' + wallets[walletDetail].address" target="_blank"
+               class="text-xs font-mono text-indigo-600 hover:text-indigo-400"
+               x-text="(wallets[walletDetail].address || '').slice(0,10) + '…'"></a>
+          </div>
+          <div class="grid grid-cols-3 gap-3 text-center text-xs mb-3 border-b border-gray-800 pb-3">
+            <div>
+              <div class="text-gray-500">Trades</div>
+              <div class="font-mono text-gray-300" x-text="wallets[walletDetail].trade_count ?? 0"></div>
+            </div>
+            <div>
+              <div class="text-gray-500">Win rate</div>
+              <div class="font-mono" :class="(wallets[walletDetail].win_rate ?? 0) >= 40 ? 'text-green-400' : 'text-yellow-400'"
+                   x-text="(wallets[walletDetail].win_rate ?? 0) + '%'"></div>
+            </div>
+            <div>
+              <div class="text-gray-500">Starting</div>
+              <div class="font-mono text-gray-400" x-text="'$' + fmt(wallets[walletDetail].starting_usd ?? 0)"></div>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2 items-center">
+            <button @click="toggleWalletActive(walletDetail)"
+                    :class="wallets[walletDetail].active ? 'bg-yellow-700 hover:bg-yellow-600' : 'bg-green-700 hover:bg-green-600'"
+                    class="text-xs px-3 py-1.5 rounded-lg text-white">
+              <span x-text="wallets[walletDetail].active ? 'Pause' : 'Resume'"></span>
+            </button>
+            <select @change="setWalletMode(walletDetail, $event.target.value)"
+                    class="bg-gray-800 text-white text-xs rounded-lg px-3 py-1.5 border border-gray-700">
+              <option value="">— Global mode —</option>
               <template x-for="m in (state.modes || [])" :key="m">
-                <option :value="m" x-text="m"></option>
+                <option :value="m" :selected="m === wallets[walletDetail].mode" x-text="m"></option>
               </template>
             </select>
-            <button @click="bulkSetMode()" :disabled="!bulkMode"
-                    class="text-xs px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-30 rounded-lg text-white">
-              Apply
+            <button @click="toggleWalletLive(walletDetail)"
+                    :class="wallets[walletDetail].live ? 'bg-green-800 hover:bg-yellow-700 text-green-300 hover:text-white' : 'bg-gray-700 hover:bg-green-800 text-gray-400 hover:text-green-300'"
+                    class="text-xs px-3 py-1.5 rounded-lg">
+              <span x-text="wallets[walletDetail].live ? '🔴 Live — switch off' : (wallets[walletDetail].keypair_loaded ? '⚪ Go Live' : '🔑 Key needed')"></span>
             </button>
           </div>
         </div>
-      </div>
+      </template>
 
-      <!-- Add Wallet Form -->
-      <div x-show="showAddWallet" class="bg-gray-800 rounded-xl p-4 border border-gray-700 space-y-3">
-        <p class="text-sm font-semibold text-gray-200">New Wallet</p>
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <label class="text-xs text-gray-400 block mb-1">Label</label>
-            <input x-model="newWallet.label" placeholder="e.g. Degen Wallet" class="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 border border-gray-600 focus:outline-none focus:border-indigo-500" />
+      <!-- ── Open Positions ── -->
+      <template x-if="Object.keys(walletPositions).length > 0">
+        <div class="mb-4">
+          <p class="text-xs font-semibold text-gray-400 mb-2">Open Positions</p>
+          <div class="space-y-1">
+            <template x-for="[sym, p] in Object.entries(walletPositions)" :key="sym">
+              <div class="flex items-center justify-between bg-gray-900 rounded-lg px-3 py-2 text-sm border border-gray-800">
+                <span class="font-semibold text-white" x-text="sym"></span>
+                <span class="text-xs text-gray-500" x-text="p.entry_mode || '—'"></span>
+                <span class="font-mono text-blue-400" x-text="'$' + (p.usd || 0).toFixed(2) + ' in'"></span>
+              </div>
+            </template>
           </div>
-          <div>
-            <label class="text-xs text-gray-400 block mb-1">Starting USD</label>
-            <input x-model="newWallet.starting_usd" type="number" min="10" placeholder="100" class="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 border border-gray-600 focus:outline-none focus:border-indigo-500" />
-          </div>
-          <div>
-            <label class="text-xs text-gray-400 block mb-1">Mode <span class="text-gray-600">(blank = inherit global)</span></label>
-            <select x-model="newWallet.mode" class="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 border border-gray-600 focus:outline-none focus:border-indigo-500">
-              <option value="">— Global mode —</option>
-              <template x-for="m in (state.modes || [])" :key="m">
-                <option :value="m" x-text="m"></option>
-              </template>
-            </select>
-          </div>
-          <div>
-            <label class="text-xs text-gray-400 block mb-1">Solana Address <span class="text-gray-600">(live trading, optional)</span></label>
-            <input x-model="newWallet.address" placeholder="Leave blank for shadow mode" class="w-full bg-gray-700 text-white text-sm rounded-lg px-3 py-2 border border-gray-600 focus:outline-none focus:border-indigo-500" />
-          </div>
-        </div>
-        <div class="flex gap-2 pt-1">
-          <button @click="addWallet()" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-lg">Create</button>
-          <button @click="showAddWallet = false" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm rounded-lg">Cancel</button>
-        </div>
-      </div>
-
-      <!-- Empty state -->
-      <template x-if="!wallets || Object.keys(wallets).length === 0">
-        <div class="text-center py-16 text-gray-500">
-          <div class="text-4xl mb-3">💼</div>
-          <div>No wallets yet. Click <strong>+ Add Wallet</strong> to create one.</div>
-          <div class="text-xs mt-2 text-gray-600">Each wallet runs independently — same scanner, own vault, own mode.</div>
         </div>
       </template>
 
-      <!-- Wallet cards -->
-      <template x-for="[wid, w] in Object.entries(wallets || {})" :key="wid">
-        <div class="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      <!-- ── Trade History ── -->
+      <div class="mb-4">
+        <p class="text-xs font-semibold text-gray-400 mb-2">Recent Trades <span class="text-gray-600 font-normal">(newest first)</span></p>
+        <template x-if="walletTrades.length === 0">
+          <div class="text-center py-6 text-gray-600 text-sm">No trades yet.</div>
+        </template>
+        <div class="space-y-1 max-h-72 overflow-y-auto">
+          <template x-for="(t, i) in walletTrades" :key="i">
+            <!-- sell row -->
+            <div x-show="t.side === 'sell'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-gray-800/60 text-xs">
+              <span class="font-semibold text-white w-14 truncate" x-text="t.symbol"></span>
+              <span :class="(t.pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
+                    class="font-mono w-16 text-right"
+                    x-text="(t.pnl != null ? ((t.pnl >= 0 ? '+$' : '-$') + Math.abs(t.pnl).toFixed(2)) : '—')"></span>
+              <span class="text-gray-500 truncate flex-1" x-text="t.exit_reason || ''"></span>
+              <template x-if="t.sig">
+                <a :href="'https://solscan.io/tx/' + t.sig" target="_blank"
+                   class="text-indigo-500 hover:text-indigo-300 font-mono shrink-0"
+                   x-text="t.sig.slice(0,8) + '…'" title="View on Solscan"></a>
+              </template>
+              <template x-if="!t.sig">
+                <span class="text-red-700 font-semibold shrink-0 text-xs">UNVERIFIED</span>
+              </template>
+              <span class="text-gray-600 shrink-0" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+            </div>
+            <!-- buy row -->
+            <div x-show="t.side === 'buy'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-gray-800/40 text-xs border-l-2 border-blue-900">
+              <span class="text-gray-500 w-14 truncate" x-text="t.symbol"></span>
+              <span class="text-blue-500 font-mono w-16 text-right" x-text="'in $' + (t.usd || 0).toFixed(2)"></span>
+              <span class="text-gray-700 flex-1">entry</span>
+              <template x-if="t.sig">
+                <a :href="'https://solscan.io/tx/' + t.sig" target="_blank"
+                   class="text-indigo-500 hover:text-indigo-300 font-mono shrink-0"
+                   x-text="t.sig.slice(0,8) + '…'" title="View on Solscan"></a>
+              </template>
+              <template x-if="!t.sig">
+                <span class="text-red-700 font-semibold shrink-0 text-xs">UNVERIFIED</span>
+              </template>
+              <span class="text-gray-700 shrink-0" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+            </div>
+            <!-- buy failed row -->
+            <div x-show="t.side === 'buy_failed'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-red-950/40 text-xs border-l-2 border-red-700">
+              <span class="text-red-400 font-semibold w-14 truncate" x-text="t.symbol"></span>
+              <span class="text-red-600 font-mono w-16 text-right">BUY FAIL</span>
+              <span class="text-red-800 truncate flex-1" x-text="t.error || ''"></span>
+              <span class="text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+            </div>
+            <!-- sell failed row -->
+            <div x-show="t.side === 'sell_failed'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-orange-950/40 text-xs border-l-2 border-orange-700">
+              <span class="text-orange-400 font-semibold w-14 truncate" x-text="t.symbol"></span>
+              <span class="text-orange-600 font-mono w-16 text-right">SELL FAIL</span>
+              <span class="text-orange-800 truncate flex-1" x-text="t.error || t.exit_reason || ''"></span>
+              <span class="text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+            </div>
+            <!-- reconcile auto-close row -->
+            <div x-show="t.side === 'closed'" class="flex items-center gap-3 px-3 py-2 rounded-lg bg-purple-950/40 text-xs border-l-2 border-purple-800">
+              <span class="text-purple-400 font-semibold w-14 truncate" x-text="t.symbol"></span>
+              <span class="text-purple-600 font-mono w-16 text-right">CLOSED</span>
+              <span class="text-purple-800 truncate flex-1" x-text="t.exit_reason || 'reconciled'"></span>
+              <span class="text-gray-600" x-text="fmtTime(t.ts)" :title="fmtTimeUTC(t.ts)"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- ── Shadow Misses ── -->
+      <template x-if="walletMisses.length > 0">
+        <div class="mb-4">
+          <p class="text-xs font-semibold text-gray-400 mb-2">Shadow Misses <span class="text-gray-600 font-normal">(why wallet skipped)</span></p>
+          <div class="space-y-1 max-h-48 overflow-y-auto">
+            <template x-for="(m, i) in walletMisses" :key="i">
+              <div class="flex items-center gap-3 px-3 py-1.5 rounded-lg bg-gray-800/60 text-xs border-l-2 border-yellow-900">
+                <span class="font-semibold text-yellow-300 w-14 truncate" x-text="m.symbol"></span>
+                <span class="text-yellow-600 w-24 truncate" x-text="m.reason"></span>
+                <span class="text-gray-600 flex-1 text-right" x-text="fmtTime(m.ts)" :title="fmtTimeUTC(m.ts)"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+
+      <!-- ── Cold wallet / sweep log ── -->
+      <template x-if="wallets[walletDetail]">
+        <div class="bg-gray-900 rounded-xl p-4 mb-4">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <div class="text-xs text-gray-500 uppercase tracking-wider">Banked to cold wallet</div>
+              <div class="text-xl font-bold text-emerald-400 mt-1"
+                   x-text="'$' + fmt(wallets[walletDetail].take_home_usd ?? 0)"></div>
+              <div class="text-xs text-gray-500 mt-0.5">50% of wins ≥ $15 swept on-chain</div>
+            </div>
+            <div class="text-right">
+              <div class="text-xs text-gray-500">Total swept</div>
+              <div class="text-sm font-mono text-emerald-400"
+                   x-text="'$' + fmt(wallets[walletDetail].total_swept_usd ?? 0)"></div>
+              <div x-show="wallets[walletDetail].sweep_address"
+                   class="text-xs font-mono text-gray-600 mt-0.5"
+                   x-text="(wallets[walletDetail].sweep_address || '').slice(0,10) + '…'"></div>
+            </div>
+          </div>
+          <template x-if="(wallets[walletDetail].sweep_log ?? []).length > 0">
+            <div class="space-y-1 max-h-40 overflow-y-auto">
+              <div class="text-xs text-gray-600 uppercase tracking-wider mb-1">Sweep history</div>
+              <template x-for="(e, i) in [...(wallets[walletDetail].sweep_log ?? [])].reverse()" :key="i">
+                <div class="flex items-center justify-between text-xs px-2 py-1.5 rounded bg-gray-800">
+                  <span class="text-gray-500" x-text="fmtTime(e.ts)"></span>
+                  <span :class="e.type === 'take_home' ? 'text-emerald-400' : 'text-blue-400'"
+                        x-text="e.type === 'take_home' ? '💸 take home' : '🔄 sweep'"></span>
+                  <span class="font-mono text-white" x-text="'$' + (e.amount_usd ?? 0).toFixed(2)"></span>
+                  <a :href="'https://solscan.io/tx/' + e.sig" target="_blank"
+                     class="text-indigo-400 hover:text-indigo-300 font-mono truncate max-w-24"
+                     x-text="(e.sig ?? '').slice(0,12) + '…'"></a>
+                </div>
+              </template>
+            </div>
+          </template>
+          <template x-if="!(wallets[walletDetail].sweep_log ?? []).length">
+            <div class="text-xs text-gray-600">No sweeps yet — fires automatically on $15+ wins when live.</div>
+          </template>
+        </div>
+      </template>
+
+      <!-- ── end Hot Wallet tab ── -->
+      <template x-if="false">
+        <div>
           <!-- Header row -->
           <div class="flex items-center gap-4 p-4 cursor-pointer" @click="openWallet(wid)">
             <!-- Active dot -->
