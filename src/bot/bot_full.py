@@ -311,6 +311,11 @@ CONFIG: Dict[str, Any] = {
         # Whitelist: AI may ONLY recommend these modes. Keeps it off custom modes with
         # tight SLs (e.g. "testing 3" at 3% SL produced 0% WR on 63 trades).
         "allowed_modes":  ["safe", "default", "hype", "degen"],
+        # Position watcher (2026-07-02): reviews open LIVE positions during idle
+        # moments, telegrams a suggestion (good/bad entry, hold/exit read). Advisory
+        # only — never touches the position or overrides an exit rule.
+        "position_review_enabled":     True,
+        "position_review_interval_min": 5,
     },
 }
 
@@ -5020,6 +5025,121 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
     save_state()
     return decision
 
+
+# ---------------------------------------------------------------------------
+# AI position watcher — reviews open LIVE positions during idle moments and
+# telegrams a suggestion. Advisory only: it does NOT touch the position, override
+# any exit rule, or execute anything. User (2026-07-02): "when we have a few empty
+# moments to spare... if it realizes it got in bad, double check how to fix it. or
+# if it got in good, double check how to keep it... suggestions should be
+# telegramed to me." Deliberately NOT wired to auto-act — an LLM call is too slow
+# and too fallible to trust with live overriding of a stop-loss/trailing-stop; if
+# it's wrong about "this is just a dip," an autonomous hold could turn a
+# controlled loss into a much bigger one. This is the advisory layer; auto-apply
+# would be a separate, explicit decision.
+# ---------------------------------------------------------------------------
+AI_POSITION_SYSTEM = (
+    "You are reviewing ONE open position for a live crypto memecoin scalping bot. "
+    "This is advisory only — you cannot sell, hold, or change anything. Your job is to give "
+    "the trader a sharp, honest read they can act on themselves.\n\n"
+    "Think about:\n"
+    "- Did this look like a good entry (bought into real momentum) or a bad one (bought on a "
+    "downswing / dead-cat bounce / already-peaked token)? Use entry_context (m5/h1/h6 trend and "
+    "buy_ratio at entry, and the scout_history showing how this candidate looked over recent scans) "
+    "to judge this, not just the current pnl.\n"
+    "- If it's up nicely: is this a genuine bull run worth protecting/letting run further, or does "
+    "the current trend already look like it's rolling over (lower highs, fading buy_ratio, "
+    "liquidity draining)?\n"
+    "- If it's down: is this recoverable (real dip inside a genuine uptrend) or is the token "
+    "structurally done (rugged liquidity, crashed and flat, no buy pressure)?\n"
+    "- If the position is currently on manual HOLD (sell_paused), the bot's normal exits are "
+    "disabled — your read on whether to keep holding or resume selling matters more here, not less.\n\n"
+    "Return strict JSON only: {read: 'good_entry'|'bad_entry'|'uncertain', "
+    "trend_now: 'still_climbing'|'rolling_over'|'flat'|'crashed', "
+    "suggestion (one clear actionable sentence — e.g. 'let it ride, trend is still strong' or "
+    "'consider selling now, buy pressure is fading and this looks like it topped'), "
+    "confidence (0-1), reasoning (one sentence)}"
+)
+
+
+def _ai_position_context(wid: str, w: Dict, symbol: str, pos: Dict, price: float) -> Dict[str, Any]:
+    entry_px  = pos.get("avg", 0) or 1e-9
+    gain_now  = (price / entry_px) - 1
+    peak      = pos.get("peak_price", entry_px)
+    addr      = pos.get("address", "")
+    scout_history = [
+        {"ts": e.get("ts"), "dec": e.get("dec"), "rsn": e.get("rsn"),
+         "m5": e.get("m5"), "h1": e.get("h1"), "h6": e.get("h6"), "br": e.get("br")}
+        for e in STATE.get("scout_log", [])[-300:] if e.get("addr") == addr
+    ][-8:]
+    return {
+        "symbol":           symbol,
+        "wallet":           w.get("label", wid),
+        "entry_price":      entry_px,
+        "current_price":    price,
+        "gain_now_pct":     round(gain_now * 100, 1),
+        "peak_price":       peak,
+        "drop_from_peak_pct": round(((price / peak) - 1) * 100, 1) if peak else 0,
+        "minutes_held":     round((time.time() - _parse_pos_ts(pos)) / 60, 1),
+        "sell_paused":      bool(pos.get("sell_paused")),
+        "entry_mode":       pos.get("entry_mode"),
+        "entry_context": {
+            "m5": pos.get("entry_m5"), "hype": pos.get("entry_hype"), "buy_ratio": pos.get("entry_br"),
+        },
+        "scout_history":    scout_history,
+    }
+
+
+def _parse_pos_ts(pos: Dict) -> float:
+    try:
+        return datetime.fromisoformat(pos.get("time") or "").timestamp()
+    except Exception:
+        return time.time()
+
+
+def ai_review_position(wid: str, w: Dict, symbol: str, pos: Dict, price: float) -> Optional[Dict[str, Any]]:
+    """Advisory-only review of one open position. Telegrams a suggestion; never acts."""
+    A = CONFIG["ai"]
+    if not A.get("position_review_enabled") or not os.getenv(ANTHROPIC_KEY_ENV):
+        return None
+    try:
+        import anthropic  # lazy
+    except ImportError:
+        return None
+    ctx = _ai_position_context(wid, w, symbol, pos, price)
+    text = ""
+    try:
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model=A.get("model", "claude-sonnet-4-6"),
+            max_tokens=300,
+            system=AI_POSITION_SYSTEM,
+            messages=[{"role": "user", "content": json.dumps(ctx)}],
+        )
+        text = next((b.text for b in resp.content if b.type == "text"), "")
+        _clean = text.strip()
+        if _clean.startswith("```"):
+            _clean = _clean.split("```")[1]
+            if _clean.startswith("json"):
+                _clean = _clean[4:]
+            _clean = _clean.strip()
+        decision = json.loads(_clean)
+    except Exception as e:
+        log(f"AI position review failed for {symbol}: {e} | raw: {text[:300]!r}")
+        return None
+
+    emoji = {"good_entry": "✅", "bad_entry": "⚠️", "uncertain": "🤔"}.get(decision.get("read"), "🤖")
+    send_alert(
+        f"{emoji} AI review — {symbol} on {w.get('label', wid)} ({ctx['gain_now_pct']:+.1f}%)\n"
+        f"{decision.get('suggestion', '')}\n"
+        f"({decision.get('read')}, trend {decision.get('trend_now')}, "
+        f"{decision.get('confidence', 0):.0%} sure) — {decision.get('reasoning', '')}",
+        critical=True)
+    log(f"[W:{wid}] AI REVIEW {symbol}: {decision.get('read')} / {decision.get('trend_now')} "
+        f"— {decision.get('suggestion','')}")
+    return decision
+
+
 # ---------------------------------------------------------------------------
 # Flask
 # ---------------------------------------------------------------------------
@@ -8002,6 +8122,7 @@ def engine_loop():
     last_vault_refresh = 0.0
     last_gas_refresh  = 0.0
     last_ai_run       = 0.0
+    last_ai_review    = 0.0
     digest_date       = None
     digest_hour       = int(CONFIG["telegram"]["daily_digest_utc"].split(":")[0])
     last_scan         = 0.0
@@ -8060,6 +8181,30 @@ def engine_loop():
             except Exception:
                 pass
             last_ai_run = time.time()
+        # AI position watcher — reviews each open LIVE position on its own slow
+        # cadence, one API call per position, advisory only (telegrams a
+        # suggestion, never acts). Only runs when there's something open to look
+        # at — this is exactly the "empty moments to spare" cadence the user asked
+        # for, piggybacking on the existing AI timer rather than adding hot-path cost.
+        review_due = (time.time() - last_ai_review
+                      > CONFIG["ai"].get("position_review_interval_min", 5) * 60)
+        if CONFIG["ai"].get("position_review_enabled") and review_due:
+            try:
+                live_prices_now = fetch_positions_prices()
+                for _wid, _wlt in STATE.get("wallets", {}).items():
+                    if not _wlt.get("live"):
+                        continue
+                    for _sym, _pos in list(_wlt.get("positions", {}).items()):
+                        if _pos.get("units", 0) <= 0:
+                            continue
+                        if time.time() - _parse_pos_ts(_pos) < 60:
+                            continue   # too fresh to have a meaningful trend yet
+                        _px = live_prices_now.get(_sym, {}).get("price") or _pos.get("avg", 0)
+                        if _px > 0:
+                            ai_review_position(_wid, _wlt, _sym, _pos, _px)
+            except Exception:
+                traceback.print_exc()
+            last_ai_review = time.time()
         # Position checks read WS_PRICES (in-memory) — no API cost.
         # 0.1s = 10 checks/sec; catches gap-downs ~5× faster than 0.5s.
         time.sleep(0.1)
