@@ -1609,6 +1609,15 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     _m5_overrides_h24 = sc.price_chg_m5 >= 10.0
     if not sc.positive and sc.age_min >= 5 and not _m5_overrides_h24:
         return "price trend is negative (24h)"
+    # 1-hour trend must be green — NOT overridable by hype or a short m5 pop.
+    # MONK (2026-07-02): h1 was -70% while a brief m5 bounce (+15-47%) kept clearing
+    # the m5 check and hype sat at 100 — the bot bought FOUR times into an hour-long
+    # crash because nothing ever looked at the hour in between "last 5 min" and "last
+    # 24h". A dead-cat bounce inside a real downtrend is exactly what this misses.
+    # Exempt tokens under 20 min old: they haven't traded a real hour yet, so
+    # DexScreener's h1 field is just "since launch" and not a meaningful signal.
+    if sc.age_min >= 20 and sc.price_chg_h1 <= 0:
+        return f"1h trend is red — {sc.price_chg_h1:.1f}%"
     # Require active upward momentum in the last 5 minutes.
     # h24 is useless for new tokens (compares to launch price, not the recent peak) — a token
     # can show +300% h24 while actively crashing right now. Only enter when the recent candle
