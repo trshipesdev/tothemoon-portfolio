@@ -16,7 +16,7 @@ except Exception:
 from flask import Flask, jsonify, request as flask_request, abort, send_from_directory
 from functools import wraps
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ---------------------------------------------------------------------------
 # Config
@@ -2777,6 +2777,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
             f"🔴 SOLD {symbol} — real pnl ${pnl:+.2f} [{exit_reason}] on {w.get('label', wid)}\n"
             f"https://solscan.io/tx/{_sell_sig}", critical=True)
     _wallet_drawdown_check(wid, w)
+    _wlt_night_mode_record_sell(wid, w, pnl)
     _wlt_tiered_sweep(wid, w, pnl)
     save_state()
 
@@ -2893,6 +2894,68 @@ def _wallet_drawdown_check(wid: str, w: Dict):
         alerted.pop("watch", None)
     elif drawdown < 50:
         alerted.pop("warning", None)
+
+
+# ---------------------------------------------------------------------------
+# Night mode — user-armed circuit breaker: "good night" arms it, and if the
+# wallet loses $40+ realized within a rolling 1-hour window, new buys pause
+# (existing positions keep trading normally) and a Telegram alert repeats
+# every 10 minutes until the user replies "ok" (false alarm, resume buying,
+# stays armed) or "hello" (good morning, stop pinging, but leave the pause
+# in place for the user to clear manually).
+# ---------------------------------------------------------------------------
+_NIGHT_MODE_LOSS_USD   = 40.0
+_NIGHT_MODE_WINDOW_SEC = 3600
+_NIGHT_MODE_REALERT_SEC = 600
+_NIGHT_MODE_EXPIRE_SEC  = 10 * 3600
+
+
+def _wlt_night_mode_record_sell(wid: str, w: Dict, pnl: float):
+    """Feed a realized sell's pnl into the night-mode rolling-loss tracker."""
+    nm = w.get("night_mode")
+    if not nm or not nm.get("armed") or nm.get("tripped"):
+        return
+    now = time.time()
+    events = nm.setdefault("loss_events", [])
+    events.append((now, pnl))
+    cutoff = now - _NIGHT_MODE_WINDOW_SEC
+    events[:] = [(t, p) for t, p in events if t >= cutoff]
+    net = sum(p for _, p in events)
+    if net <= -_NIGHT_MODE_LOSS_USD:
+        nm["tripped"]        = True
+        nm["trip_ts"]        = now
+        nm["trip_loss"]      = net
+        nm["last_alert_ts"]  = now
+        label = w.get("label", wid)
+        send_alert(
+            f"🌙🚨 NIGHT MODE TRIPPED — {label}\n"
+            f"Lost ${abs(net):.2f} realized in the last hour. New buys are paused — existing "
+            f"positions still trade normally.\n"
+            f"Reply 'ok' if this is a false alarm (resumes buying), or 'hello' when you're up "
+            f"and will handle it yourself.",
+            critical=True)
+        log(f"[W:{wid}] NIGHT MODE TRIPPED — ${abs(net):.2f} realized loss in 1h")
+
+
+def _wlt_night_mode_tick(wid: str, w: Dict):
+    """Auto-expire armed night mode after 10h, and re-send the tripped alert every 10 min."""
+    nm = w.get("night_mode")
+    if not nm or not nm.get("armed"):
+        return
+    now = time.time()
+    if now - nm.get("armed_ts", now) > _NIGHT_MODE_EXPIRE_SEC:
+        nm["armed"] = False
+        log(f"[W:{wid}] night mode auto-expired after 10h")
+        return
+    if nm.get("tripped") and now - nm.get("last_alert_ts", 0) >= _NIGHT_MODE_REALERT_SEC:
+        nm["last_alert_ts"] = now
+        label = w.get("label", wid)
+        loss  = nm.get("trip_loss", 0.0)
+        send_alert(
+            f"🌙🚨 NIGHT MODE — {label} still paused\n"
+            f"Lost ${abs(loss):.2f} realized in the hour before this tripped. New buys still paused.\n"
+            f"Reply 'ok' (false alarm, resume) or 'hello' (good morning, I'll handle it).",
+            critical=True)
 
 
 def _wlt_sync_vault(wid: str, w: Dict, live_prices: Dict):
@@ -3193,6 +3256,9 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
             continue
         if w.get("paused_new_entries"):
             _miss(w, "drawdown_pause")
+            continue
+        if w.get("night_mode", {}).get("tripped"):
+            _miss(w, "night_mode_tripped")
             continue
         if symbol in scan_entered.get(wid, set()):
             continue
@@ -6785,6 +6851,67 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Free-text night-mode control: 'good night' arms it, 'ok' clears a false-alarm
+    trip (stays armed), 'hello' turns off night mode (leaves any active pause for the
+    user to clear manually). Only acts on live wallets; ignores unrelated chat."""
+    text = (update.message.text or "").strip().lower()
+    live_wallets = [(wid, w) for wid, w in STATE.get("wallets", {}).items() if w.get("live")]
+    if not live_wallets:
+        return
+
+    if text.startswith("good night") or text.startswith("goodnight"):
+        for _, w in live_wallets:
+            nm = w.setdefault("night_mode", {})
+            nm["armed"]         = True
+            nm["armed_ts"]      = time.time()
+            nm["tripped"]       = False
+            nm["trip_ts"]       = 0.0
+            nm["last_alert_ts"] = 0.0
+            nm["loss_events"]   = []
+        save_state()
+        await update.message.reply_text(
+            "🌙 Night mode armed. If a wallet loses $40+ realized within an hour, new buys "
+            "pause and I'll ping you every 10 min until you say 'ok' or 'hello'. Sleep well.")
+        return
+
+    if text == "ok" or text.startswith("ok "):
+        changed = False
+        for wid, w in live_wallets:
+            nm = w.get("night_mode") or {}
+            if nm.get("tripped"):
+                nm["tripped"]       = False
+                nm["trip_ts"]       = 0.0
+                nm["last_alert_ts"] = 0.0
+                nm["loss_events"]   = []
+                changed = True
+                log(f"[W:{wid}] night mode cleared by 'ok' — resuming buys")
+        if changed:
+            save_state()
+            await update.message.reply_text(
+                "👍 False alarm cleared — buys resumed. Night mode still armed for the rest of the night.")
+        return
+
+    if text == "hello" or text.startswith("hello "):
+        changed = False
+        still_paused = False
+        for wid, w in live_wallets:
+            nm = w.get("night_mode") or {}
+            if nm.get("armed") or nm.get("tripped"):
+                nm["armed"] = False
+                changed = True
+                if nm.get("tripped"):
+                    still_paused = True
+        if changed:
+            save_state()
+            msg = "☀️ Good morning — night mode off."
+            msg += (" New buys stay paused until you resume them yourself."
+                    if still_paused else " Everything's normal, have a good day.")
+            await update.message.reply_text(msg)
+        return
+
+
+@require_auth
 async def cmd_skim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         val = context.args[0].lower()
@@ -7559,6 +7686,7 @@ def manage_positions():
     for _wid, _wlt in STATE.get("wallets", {}).items():
         if _wlt.get("live") and _wlt.get("address"):
             _wlt_periodic_chain_sync(_wid, _wlt, live_prices)
+            _wlt_night_mode_tick(_wid, _wlt)
         # Run the exit loop for each additional wallet
         if _wlt.get("active") and _wlt.get("positions"):
             _manage_wallet_positions(_wid, _wlt, live_prices)
@@ -7687,6 +7815,7 @@ def start_telegram():
     tg.add_handler(CommandHandler("shadow",       cmd_shadow))
     tg.add_handler(CommandHandler("version",      cmd_version))
     tg.add_handler(CommandHandler("restart",      cmd_restart))
+    tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_night_mode))
     if not STATE.get("telegram", {}).get("owner_chat_id"):
         log("WARN Telegram: owner_chat_id not set — proactive alerts (drawdown/sell/rug/digest) "
             "won't send until you message the bot once (any command works, e.g. /status)")
