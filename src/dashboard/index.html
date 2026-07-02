@@ -938,12 +938,15 @@
           <span class="px-2 py-1 rounded bg-gray-800 text-gray-400" x-text="'rejected ' + (scoutCounts.rejected ?? 0)"></span>
         </div>
       </div>
-      <div class="flex gap-2 mb-3 text-xs">
+      <div class="flex gap-2 mb-3 text-xs items-center">
         <template x-for="f in ['all','entered','suggested','rejected']" :key="f">
           <button @click="scoutFilter = f"
                   :class="scoutFilter === f ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'"
                   class="px-3 py-1 rounded-lg" x-text="f"></button>
         </template>
+        <input type="text" x-model="scoutSearch" placeholder="filter reason or symbol…"
+               class="ml-2 px-3 py-1 rounded-lg bg-gray-800 text-gray-200 placeholder-gray-600 border border-gray-700 w-56">
+        <button x-show="scoutSearch" @click="scoutSearch = ''" class="text-gray-500 hover:text-gray-300">✕ clear</button>
       </div>
       <template x-if="scout.length === 0">
         <div class="text-center py-16 text-gray-600">
@@ -961,7 +964,8 @@
               <th class="text-right py-2 pr-3 font-normal">Hype</th>
               <th class="text-right py-2 pr-3 font-normal">Liq</th>
               <th class="text-right py-2 pr-3 font-normal">Age</th>
-              <th class="text-left py-2 font-normal">Reason</th>
+              <th class="text-left py-2 pr-3 font-normal">Reason</th>
+              <th class="text-left py-2 font-normal">Manual</th>
             </tr>
           </thead>
           <tbody>
@@ -980,7 +984,14 @@
                 <td class="py-1.5 pr-3 text-right text-gray-400" x-text="e.hype ?? '—'"></td>
                 <td class="py-1.5 pr-3 text-right text-gray-400" x-text="e.liq != null ? '$' + fmt(e.liq) : '—'"></td>
                 <td class="py-1.5 pr-3 text-right text-gray-400" x-text="e.age_min != null ? e.age_min + 'm' : '—'"></td>
-                <td class="py-1.5 text-gray-400" x-text="e.reason"></td>
+                <td class="py-1.5 pr-3 text-gray-400" x-text="e.reason"></td>
+                <td class="py-1.5">
+                  <button x-show="e.decision !== 'entered' && e.address"
+                          @click="manualBuy(e)"
+                          class="px-2 py-0.5 bg-gray-800 hover:bg-emerald-800 rounded text-emerald-400 hover:text-white font-semibold">
+                    Buy
+                  </button>
+                </td>
               </tr>
             </template>
           </tbody>
@@ -2670,6 +2681,7 @@ function app() {
     scout:        [],
     scoutCounts:  {},
     scoutFilter:  'all',
+    scoutSearch:  '',
     arenas:       {},
     wallets:      {},
     walletDetail: null,    // wid of currently expanded wallet
@@ -2736,7 +2748,23 @@ function app() {
     get pos_count() { return this.posEntries.length; },
     get total_pnl()  { return this.posEntries.reduce((s, [, p]) => s + (p.pnl_usd || 0), 0); },
     get filteredScout() {
-      return this.scoutFilter === 'all' ? this.scout : this.scout.filter(e => e.decision === this.scoutFilter);
+      let list = this.scoutFilter === 'all' ? this.scout : this.scout.filter(e => e.decision === this.scoutFilter);
+      const q = (this.scoutSearch || '').trim().toLowerCase();
+      if (q) list = list.filter(e => (e.reason || '').toLowerCase().includes(q) || (e.symbol || '').toLowerCase().includes(q));
+      return list;
+    },
+    async manualBuy(e) {
+      const wid = this.walletDetail || Object.keys(this.wallets)[0];
+      if (!wid) { this.showToast('No live wallet selected', false); return; }
+      const usdStr = prompt(`Manual buy ${e.symbol} on ${this.wallets[wid]?.label || wid} — amount in USD:`, '10');
+      if (usdStr === null) return;
+      const usd = parseFloat(usdStr);
+      if (!usd || usd <= 0) { this.showToast('Invalid amount', false); return; }
+      const r = await this.post(`/api/wallets/${wid}/manual_buy`, {
+        symbol: e.symbol, address: e.address, chain: e.chain, usd,
+      });
+      if (r?.ok) this.showToast(`Bought $${r.usd} of ${e.symbol}`);
+      else       this.showToast(r?.error || 'Buy failed', false);
     },
     // Realized P&L broken into gained / lost / net, for a date window
     _pnlBreakdown(sells) {

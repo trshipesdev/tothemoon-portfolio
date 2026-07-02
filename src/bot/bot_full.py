@@ -6608,6 +6608,52 @@ def api_wallet_positions(wid):
     return jsonify({s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0})
 
 
+@app.route("/api/wallets/<wid>/manual_buy", methods=["POST"])
+@_dash_auth
+def api_wallet_manual_buy(wid):
+    """Manually buy a specific token, bypassing scan filters — for the Scout tab:
+    the user reviews a candidate the bot rejected (or any token) and decides to
+    enter it themselves. Still runs through the normal buy path (real Jupiter
+    quote, real price-impact check, standard trade_log record) so it's tracked
+    and exit-managed identically to an automatic entry from here on — same TP
+    ladder, stops, and HOLD toggle available on it afterward."""
+    w = STATE.get("wallets", {}).get(wid)
+    if not w:
+        return jsonify({"error": "wallet not found"}), 404
+    if not w.get("live"):
+        return jsonify({"error": "wallet is not live — flip to live mode first"}), 400
+    data   = flask_request.get_json() or {}
+    symbol = (data.get("symbol") or "").strip()[:20]
+    addr   = (data.get("address") or "").strip()
+    chain  = (data.get("chain") or "sol").strip()
+    usd    = float(data.get("usd") or 0)
+    if not symbol or not addr:
+        return jsonify({"error": "symbol and address required"}), 400
+    if usd <= 0:
+        return jsonify({"error": "usd must be > 0"}), 400
+    if w.get("positions", {}).get(symbol, {}).get("units", 0) > 0:
+        return jsonify({"error": f"{symbol} is already an open position"}), 400
+    usd = min(usd, max(0.0, w["vault_usd"] - 3.0))
+    if usd < 1.0:
+        return jsonify({"error": "insufficient cash after reserving gas"}), 400
+    price, liq = 0.0, 0.0
+    if chain == "sol":
+        dex = fetch_dexscreener_token(addr)
+        if dex and dex.get("pairs"):
+            p0    = dex["pairs"][0]
+            price = float(p0.get("priceUsd") or 0)
+            liq   = float((p0.get("liquidity") or {}).get("usd") or 0)
+    if price <= 0:
+        return jsonify({"error": "could not fetch a current price for this token"}), 400
+    _wlt_buy(wid, w, symbol, chain, usd, price, liq, addr)
+    save_state()
+    send_alert(
+        f"🖐️ MANUAL BUY {symbol} on {w.get('label', wid)} — ${usd:.2f} "
+        f"(dashboard override — bypassed scan filters, same exit management from here).",
+        critical=True)
+    return jsonify({"ok": True, "symbol": symbol, "usd": round(usd, 2)})
+
+
 @app.route("/api/wallets/<wid>/positions/<symbol>/pause", methods=["POST"])
 @_dash_auth
 def api_wallet_position_pause(wid, symbol):
