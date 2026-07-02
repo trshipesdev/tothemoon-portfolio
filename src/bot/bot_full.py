@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # crypto bot — shadow mode by default; see PENDING.md for live-trading TODOs
 
-import os, io, json, time, random, asyncio, threading, traceback, base64, struct, hashlib
+import os, io, json, time, random, re, asyncio, threading, traceback, base64, struct, hashlib
 from collections import deque, Counter
 from datetime import datetime, timezone, timedelta
 import requests
@@ -3197,20 +3197,24 @@ def _wlt_night_mode_record_sell(wid: str, w: Dict, pnl: float):
     cutoff = now - _NIGHT_MODE_WINDOW_SEC
     events[:] = [(t, p) for t, p in events if t >= cutoff]
     net = sum(p for _, p in events)
-    if net <= -_NIGHT_MODE_LOSS_USD:
+    # Custom threshold (2026-07-02): "pause losses at 20 or $20 and its like my
+    # goodnight thing but custom" — reuses this exact mechanism, just with a
+    # user-set $ trigger instead of the fixed $40 default.
+    threshold = nm.get("loss_threshold_usd", _NIGHT_MODE_LOSS_USD)
+    if net <= -threshold:
         nm["tripped"]        = True
         nm["trip_ts"]        = now
         nm["trip_loss"]      = net
         nm["last_alert_ts"]  = now
         label = w.get("label", wid)
         send_alert(
-            f"🌙🚨 NIGHT MODE TRIPPED — {label}\n"
-            f"Lost ${abs(net):.2f} realized in the last hour. New buys are paused — existing "
-            f"positions still trade normally.\n"
+            f"🌙🚨 LOSS PAUSE TRIPPED — {label}\n"
+            f"Lost ${abs(net):.2f} realized in the last hour (threshold ${threshold:.0f}). "
+            f"New buys are paused — existing positions still trade normally.\n"
             f"Reply 'ok' if this is a false alarm (resumes buying), or 'hello' when you're up "
             f"and will handle it yourself.",
             critical=True)
-        log(f"[W:{wid}] NIGHT MODE TRIPPED — ${abs(net):.2f} realized loss in 1h")
+        log(f"[W:{wid}] LOSS PAUSE TRIPPED — ${abs(net):.2f} realized loss in 1h (threshold ${threshold:.0f})")
 
 
 def _wlt_night_mode_tick(wid: str, w: Dict):
@@ -3228,7 +3232,7 @@ def _wlt_night_mode_tick(wid: str, w: Dict):
         label = w.get("label", wid)
         loss  = nm.get("trip_loss", 0.0)
         send_alert(
-            f"🌙🚨 NIGHT MODE — {label} still paused\n"
+            f"🌙🚨 LOSS PAUSE — {label} still paused\n"
             f"Lost ${abs(loss):.2f} realized in the hour before this tripped. New buys still paused.\n"
             f"Reply 'ok' (false alarm, resume) or 'hello' (good morning, I'll handle it).",
             critical=True)
@@ -7829,10 +7833,35 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nm["trip_ts"]       = 0.0
             nm["last_alert_ts"] = 0.0
             nm["loss_events"]   = []
+            nm.pop("loss_threshold_usd", None)   # back to the $40 default
         save_state()
         await update.message.reply_text(
             "🌙 Night mode armed. If a wallet loses $40+ realized within an hour, new buys "
             "pause and I'll ping you every 10 min until you say 'ok' or 'hello'. Sleep well.")
+        return
+
+    # "pause losses at 20" / "pause losses at $20" — user: "like my goodnight
+    # thing but custom." Same exact mechanism as night mode (1hr rolling
+    # realized-loss window, repeat alert every 10min, cleared with 'ok'/
+    # 'hello') but with a user-chosen $ threshold instead of the fixed $40,
+    # and armed immediately rather than needing "good night" first.
+    _loss_at = re.match(r"pause losses? at\s+\$?(\d+(?:\.\d+)?)", text)
+    if _loss_at:
+        threshold = float(_loss_at.group(1))
+        for _, w in live_wallets:
+            nm = w.setdefault("night_mode", {})
+            nm["armed"]             = True
+            nm["armed_ts"]          = time.time()
+            nm["tripped"]           = False
+            nm["trip_ts"]           = 0.0
+            nm["last_alert_ts"]     = 0.0
+            nm["loss_events"]       = []
+            nm["loss_threshold_usd"] = threshold
+        save_state()
+        await update.message.reply_text(
+            f"🛑 Armed — if a wallet loses ${threshold:.0f}+ realized within an hour, new buys "
+            f"pause (selling keeps running) and I'll ping you every 10 min until you say "
+            f"'ok' (false alarm, resume) or 'hello' (I'll handle it myself).")
         return
 
     if text == "ok" or text.startswith("ok "):
