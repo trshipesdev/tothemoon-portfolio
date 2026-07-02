@@ -7931,17 +7931,14 @@ def scan_candidates():
         addr = c.get("address", "")
         link = _dex_link(chain, addr)
 
-        # Confirmed-upswing tracker: record this candidate's price every scan cycle
-        # (~8s apart), regardless of accept/reject, so entry can check the IMMEDIATE
-        # last few readings — not just a window's net % change. m5/h1/h6 can all read
-        # positive while the token spiked mid-window and has been falling ever since;
-        # buying into that tail is buying the downswing, which is the exact pattern
-        # that kept stopping out immediately (user, 2026-07-02: "the bot keeps buying
-        # on the down swing... I always lose"). Capped at 5 readings (~40s of history).
+        # Confirmed-momentum tracker: record this candidate's price every scan cycle
+        # (~8s apart), regardless of accept/reject, so entry can check real recent
+        # price action instead of just a window's net % change. Keep 5 minutes of
+        # history (capped at 60 readings as a safety net) — see the gate below for
+        # why this widened from the original ~40s.
         _tick_hist = STATE.setdefault("candidate_ticks", {}).setdefault(addr, [])
         _tick_hist.append((time.time(), price))
-        if len(_tick_hist) > 5:
-            _tick_hist[:] = _tick_hist[-5:]
+        _tick_hist[:] = [(ts, px) for ts, px in _tick_hist if time.time() - ts <= 300][-60:]
 
         # Reject cache: skip re-evaluation unless price has spiked enough since last reject.
         # Saves API calls and stops the scanner from asking the same question 20+ times.
@@ -7971,21 +7968,37 @@ def scan_candidates():
             _scout(symbol, chain, "rejected",
                    f"at max open positions ({CONFIG.get('max_open_positions', 12)})", sc, addr)
             continue
-        # Confirmed-upswing gate — require the IMMEDIATE recent price direction to
-        # actually be up, not just some window's net % change. A token can show
-        # +m5/+h1/+h6 while its last few ticks are falling from a mid-window spike;
-        # entering there is buying the downswing, which stops out almost instantly
-        # since the position starts underwater from tick one. Exempt on <2 readings
-        # (a token's very first sighting) — the user explicitly wants the earliest
-        # entries caught, so this only blocks re-checks that show active decline,
-        # never a brand-new candidate we have no history on yet.
+        # Confirmed-momentum gate — redesigned 2026-07-02 after auditing real outcomes.
+        # The original version rejected on ANY dip vs the oldest of the last 5 ~8s
+        # ticks (~30-40s, zero tolerance) — comparing against pure tick noise, not a
+        # real trend. Sampled 11 real rejections: 8 went on to gain 69%-785% within a
+        # day. The 2 real losers weren't even the biggest dips — LR, the SMALLEST dip
+        # in the sample (-0.1%), was one of only two tokens that kept declining. Dip
+        # size over a ~30s window carried essentially no predictive signal.
+        # Replaced with two checks — a real crash still gets caught fast, normal chop
+        # within an uptrend no longer does:
+        #  1. FREE-FALL — a genuine crash in the last ~60s (>20% down) is still
+        #     worth blocking immediately, tight window on purpose.
+        #  2. SUSTAINED DECLINE — down more than 10% over a real 5-minute window.
+        #     Wide enough to separate noise from an actual bleed; the existing h1/h6
+        #     trend checks elsewhere already require the longer trend to be green,
+        #     so this only needs to catch what those miss.
+        # Exempt on <2 readings (a token's very first sighting) — never blocks a
+        # brand-new candidate with no history yet.
         if len(_tick_hist) >= 2:
-            _oldest_recent_px = _tick_hist[0][1]
-            if _oldest_recent_px > 0 and price < _oldest_recent_px:
-                _dip_pct = (price / _oldest_recent_px - 1) * 100
+            _now_ts   = time.time()
+            _recent_1m = [px for ts, px in _tick_hist if _now_ts - ts <= 60]
+            if _recent_1m and _recent_1m[0] > 0 and price < _recent_1m[0] * 0.80:
+                _dip_pct = (price / _recent_1m[0] - 1) * 100
                 _scout(symbol, chain, "rejected",
-                       f"still on the downswing — {_dip_pct:.1f}% over last "
-                       f"{len(_tick_hist)} scans (~{int((time.time()-_tick_hist[0][0]))}s)", sc, addr)
+                       f"free-fall — {_dip_pct:.1f}% in the last ~60s", sc, addr)
+                continue
+            _oldest_5m = _tick_hist[0][1]
+            if _oldest_5m > 0 and price < _oldest_5m * 0.90:
+                _dip_pct = (price / _oldest_5m - 1) * 100
+                _scout(symbol, chain, "rejected",
+                       f"sustained decline — {_dip_pct:.1f}% over last "
+                       f"{max(1, int((_now_ts - _tick_hist[0][0]) / 60))}min", sc, addr)
                 continue
         # Lower-high guard — blocks buying a WEAKER bounce than a peak the bot itself
         # already HELD a position through today, no matter how long ago or how many
