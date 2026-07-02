@@ -1271,7 +1271,12 @@ def fetch_birdeye_sol_candidates() -> List[Dict[str, Any]]:
                     "symbol": sym, "chain": "sol", "price": price,
                     "liq": liq, "age_min": age_min, "hype": hype,
                     "positive": positive24h,
+                    # Birdeye's tokenlist has no m5/h1/h6 granularity — proxy all three
+                    # from the 24h direction (same trick already used for m5) so the
+                    # newer h1/h6 trend checks don't misread "no data" as "red".
                     "price_chg_m5": 1.0 if positive24h else -1.0,
+                    "price_chg_h1": 1.0 if positive24h else -1.0,
+                    "price_chg_h6": 1.0 if positive24h else -1.0,
                     "address": addr, "source": "birdeye",
                 })
         return out
@@ -1367,9 +1372,10 @@ def _pair_to_candidate(pair: Dict[str, Any], our_chain: str) -> Optional[Dict[st
         price_chg    = float((pair.get("priceChange") or {}).get("h24") or 0)
         price_chg_m5 = float((pair.get("priceChange") or {}).get("m5") or 0)
         price_chg_h1 = float((pair.get("priceChange") or {}).get("h1") or 0)
+        price_chg_h6 = float((pair.get("priceChange") or {}).get("h6") or 0)
         return {"symbol": symbol, "chain": our_chain, "price": price_usd,
                 "liq": liq, "age_min": age_min, "hype": hype, "positive": price_chg > 0,
-                "price_chg_m5": price_chg_m5, "price_chg_h1": price_chg_h1,
+                "price_chg_m5": price_chg_m5, "price_chg_h1": price_chg_h1, "price_chg_h6": price_chg_h6,
                 "vol_h1": vol_h1, "buy_ratio": buy_ratio,
                 "address": (pair.get("baseToken") or {}).get("address", "")}
     except Exception:
@@ -1554,7 +1560,7 @@ def _effective_ms(mode_name: Optional[str] = None) -> Dict:
 class Score:
     def __init__(self, hype: int, liq: float, age_min: float, positive: bool,
                  buy_ratio: Optional[float] = None, price: float = 0.0,
-                 price_chg_m5: float = 0.0, price_chg_h1: float = 0.0):
+                 price_chg_m5: float = 0.0, price_chg_h1: float = 0.0, price_chg_h6: float = 0.0):
         self.hype          = hype
         self.liq           = liq
         self.age_min       = age_min
@@ -1563,6 +1569,7 @@ class Score:
         self.price         = price
         self.price_chg_m5  = price_chg_m5  # DexScreener m5 price change %
         self.price_chg_h1  = price_chg_h1  # DexScreener h1 price change %
+        self.price_chg_h6  = price_chg_h6  # DexScreener h6 price change %
 
 
 def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
@@ -1618,6 +1625,14 @@ def moonshot_reject_reason(sc: Score, chain: str = "sol") -> Optional[str]:
     # DexScreener's h1 field is just "since launch" and not a meaningful signal.
     if sc.age_min >= 20 and sc.price_chg_h1 <= 0:
         return f"1h trend is red — {sc.price_chg_h1:.1f}%"
+    # 6-hour trend must also be green — catches a coin that bounced green on the last
+    # hour but was bleeding for the hours before that (h1 alone can't see that). There's
+    # no weekly data available from DexScreener at all (only m5/h1/h6/h24 are exposed),
+    # and it wouldn't mean much anyway — every candidate here is under this mode's own
+    # ~2h max-age cap, so h6 already covers effectively its whole trading lifetime.
+    # Same exemption window as h1: under 20 min old, there's no real 6h history yet.
+    if sc.age_min >= 20 and sc.price_chg_h6 <= 0:
+        return f"6h trend is red — {sc.price_chg_h6:.1f}%"
     # Require active upward momentum in the last 5 minutes.
     # h24 is useless for new tokens (compares to launch price, not the recent peak) — a token
     # can show +300% h24 while actively crashing right now. Only enter when the recent candle
@@ -1703,6 +1718,8 @@ def _scout(symbol: str, chain: str, decision: str, reason: str,
             "age":  round(sc.age_min, 1),
             "br":   round(sc.buy_ratio, 3) if sc.buy_ratio is not None else None,
             "m5":   round(sc.price_chg_m5, 2),
+            "h1":   round(sc.price_chg_h1, 2),
+            "h6":   round(sc.price_chg_h6, 2),
         })
     try:
         with open(SCAN_LOG_FILE, "a") as _f:
@@ -7197,7 +7214,8 @@ def scan_candidates():
         sc     = Score(c.get("hype", 0), liq, c["age_min"], c.get("positive", True),
                        buy_ratio=c.get("buy_ratio"), price=price,
                        price_chg_m5=c.get("price_chg_m5", 0.0),
-                       price_chg_h1=c.get("price_chg_h1", 0.0))
+                       price_chg_h1=c.get("price_chg_h1", 0.0),
+                       price_chg_h6=c.get("price_chg_h6", 0.0))
         is_new = c["age_min"] <= CONFIG["scan"]["new_max_age_min"]
 
         addr = c.get("address", "")
