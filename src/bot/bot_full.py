@@ -3314,6 +3314,30 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
             pos["units"] = actual
             pos["usd"]   = pos.get("usd", 0.0) * frac
             changed = True
+        elif actual > pos["units"] * 1.1:
+            # User (2026-07-02): manually bought $5 more LUFFY on top of an already-
+            # tracked position (leftover dust from an earlier bot trade) — orphan-adopt
+            # below only fires for mints NOT already tracked, so a top-up on an existing
+            # position was invisible: on-chain balance was 100,279 tokens, tracked was
+            # 34,154. The other ~66,000 (the real $5 buy) had zero stop-loss/rug
+            # protection and the dashboard kept showing the stale, tiny dust value.
+            added_units = actual - pos["units"]
+            added_px = _sol_find_receive_price(owner_addr, mint)
+            if added_px is not None:
+                added_usd = added_px * added_units
+                pos["units"] = actual
+                pos["usd"]   = pos.get("usd", 0.0) + added_usd
+                pos["avg"]   = pos["usd"] / max(actual, 1e-9)   # blended cost basis
+                pos["deployed_usd"] = pos.get("deployed_usd", pos["usd"]) + added_usd
+                pos["manual_grace_until"] = time.time() + 300   # same 5min room as a fresh manual adopt
+                w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + added_usd
+                log(f"[W:{wid}] RECONCILE {symbol}: manual top-up detected, +{added_units:.4f} units "
+                    f"(${added_usd:.2f}) merged, new avg {pos['avg']:.8f}")
+                send_alert(f"🔎 Added to {symbol} on {w.get('label', wid)}: manual buy of "
+                           f"${added_usd:.2f} merged into the tracked position (now managing "
+                           f"{actual:.0f} units total) — 5min grace protection applied.",
+                           critical=True)
+                changed = True
 
     # Adopt orphans: on-chain tokens this bot bought (there's a buy/buy_failed
     # record) but no longer tracks. Without adoption nothing ever sells them —
