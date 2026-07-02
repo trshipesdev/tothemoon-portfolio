@@ -3213,8 +3213,15 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         if _cur_val < 0.01:
             w.get("positions", {}).pop(symbol, None)
             continue
-        if not _sell_paused and _dollar_stop > 0 and (_cur_val - _cost) < -_eff_stop:
-            exit_reason = f"DOLLAR STOP -${abs(_cur_val - _cost):.2f}"
+        # _would_reason tracks what the bot WOULD do even while paused, so a held
+        # position can still tell the user "I would have sold here" instead of just
+        # going silent. Kept separate from exit_reason (which only the two always-on
+        # liquidity checks below can set while paused).
+        _would_reason: Optional[str] = None
+        if _dollar_stop > 0 and (_cur_val - _cost) < -_eff_stop:
+            _would_reason = f"DOLLAR STOP -${abs(_cur_val - _cost):.2f}"
+            if not _sell_paused:
+                exit_reason = _would_reason
 
         # Rug liq drop — wallet override → global. NEVER gated by _sell_paused.
         _rug_drop = _sf.get("rug_liq_drop_pct") or MS["rug_liq_drop"]
@@ -3225,8 +3232,10 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
 
         # Velocity — wallet override → global
         _vel_pct = _sf.get("velocity_m5_pct") or MS["velocity_exit_pct"]
-        if not _sell_paused and exit_reason is None and change_m5 < -(_vel_pct * 100):
-            exit_reason = f"VELOCITY {change_m5:.1f}% in 5m"
+        if exit_reason is None and _would_reason is None and change_m5 < -(_vel_pct * 100):
+            _would_reason = f"VELOCITY {change_m5:.1f}% in 5m"
+            if not _sell_paused:
+                exit_reason = _would_reason
 
         # Slow liq drain — wallet override → global. NEVER gated by _sell_paused
         # (same reasoning as RUG liq drop — this is the gradual version of the same risk).
@@ -3237,15 +3246,42 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
             exit_reason = f"LIQ DRAIN {liq_ticks[0]:.0f}→{liq:.0f}"
 
         # Trailing stop
-        if not _sell_paused and exit_reason is None and price <= peak * (1 - trail_pct):
-            exit_reason = f"TRAIL STOP {((price/peak)-1)*100:.1f}% from peak"
+        if exit_reason is None and _would_reason is None and price <= peak * (1 - trail_pct):
+            _would_reason = f"TRAIL STOP {((price/peak)-1)*100:.1f}% from peak"
+            if not _sell_paused:
+                exit_reason = _would_reason
 
         if exit_reason:
             _wlt_sell(wid, w, symbol, price, exit_reason)
             continue
 
         if _sell_paused:
-            continue   # skip TP ladder + fixed SL too — fully user-controlled from here
+            # TP ladder / fixed SL would-fire checks, same "tell but don't act" treatment.
+            deployed      = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
+            moonbag_floor = moonbag_frac * deployed
+            tp_index      = pos.get("tp_index", 0)
+            if _would_reason is None:
+                for i, (gain, frac) in enumerate(ladder):
+                    if i < tp_index:
+                        continue
+                    if price >= pos["avg"] * (1 + gain):
+                        _would_reason = f"TP rung {i+1} +{gain*100:.0f}%"
+                    break
+            sl_level = pos.get("sl_override") or mode_cfg.get("sl", 0.18)
+            if _would_reason is None and price <= pos["avg"] * (1 - sl_level):
+                _would_reason = "fixed_sl"
+            if _would_reason:
+                _now = time.time()
+                _last_reason = pos.get("hold_alert_reason")
+                _last_ts     = pos.get("hold_alert_ts", 0)
+                if _would_reason != _last_reason or _now - _last_ts >= 300:
+                    pos["hold_alert_reason"] = _would_reason
+                    pos["hold_alert_ts"]     = _now
+                    send_alert(
+                        f"⏸️👀 {symbol} on {w.get('label', wid)} would have sold — "
+                        f"{_would_reason} — but it's on HOLD. Still watching.",
+                        critical=True)
+            continue   # skip TP ladder + fixed SL execution — fully user-controlled from here
 
         # TP ladder (partial sells)
         deployed     = pos.get("deployed_usd", pos["usd"]) or pos["usd"]
@@ -6043,6 +6079,9 @@ def api_wallet_position_pause(wid, symbol):
         return jsonify({"error": "position not found"}), 404
     paused = bool((flask_request.get_json() or {}).get("paused", True))
     pos["sell_paused"] = paused
+    if not paused:
+        pos.pop("hold_alert_reason", None)
+        pos.pop("hold_alert_ts", None)
     save_state()
     send_alert(
         f"{'⏸️ HOLD' if paused else '▶️ RESUMED'} {symbol} on {w.get('label', wid)} (dashboard) — "
