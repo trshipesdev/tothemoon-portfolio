@@ -2,7 +2,7 @@
 # crypto bot — shadow mode by default; see PENDING.md for live-trading TODOs
 
 import os, io, json, time, random, asyncio, threading, traceback, base64, struct, hashlib
-from collections import deque
+from collections import deque, Counter
 from datetime import datetime, timezone, timedelta
 import requests
 from typing import Dict, List, Optional, Any, Tuple
@@ -7731,6 +7731,85 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Owner chat linked (id {cid}). Proactive alerts will be sent here.")
 
 
+# ---------------------------------------------------------------------------
+# Chat report generators (2026-07-02) — used by the natural-language router
+# below. "audit"/"history"/"scout" needed a Telegram-sized summary, not the
+# full 300-entry dump the dashboard shows, so these are the same kind of
+# analysis done manually in this session (exit-reason breakdown, win rate,
+# scout rejection reasons grouped by count) condensed into one message.
+# ---------------------------------------------------------------------------
+
+def _tg_audit_report(wid: str, w: Dict) -> str:
+    sells = [t for t in w.get("trade_log", []) if t.get("side") == "sell" and t.get("pnl") is not None]
+    if not sells:
+        return f"📊 {w.get('label', wid)} — no completed trades yet to audit."
+    wins   = [t for t in sells if t["pnl"] > 0]
+    losses = [t for t in sells if t["pnl"] <= 0]
+    win_rate = 100 * len(wins) / len(sells)
+    avg_win  = sum(t["pnl"] for t in wins) / max(len(wins), 1)
+    avg_loss = sum(t["pnl"] for t in losses) / max(len(losses), 1)
+    net      = sum(t["pnl"] for t in sells)
+    reason_pnl: Dict[str, list] = {}
+    for t in sells:
+        r = (t.get("exit_reason") or "?").split(" ")[0].split("-")[0]
+        reason_pnl.setdefault(r, []).append(t["pnl"])
+    top = sorted(reason_pnl.items(), key=lambda kv: -sum(kv[1]))[:8]
+    lines = [f"  {r}: {len(v)}x, total ${sum(v):.2f}" for r, v in top]
+    fails = len([t for t in w.get("trade_log", []) if t.get("side") == "sell_failed"])
+    return (
+        f"📊 Audit — {w.get('label', wid)}\n"
+        f"{len(sells)} closed trades, {win_rate:.0f}% win rate, net ${net:.2f}\n"
+        f"avg win ${avg_win:.2f} / avg loss ${avg_loss:.2f}\n\n"
+        f"By exit type:\n" + "\n".join(lines) + "\n\n"
+        f"Sell failures (all-time): {fails}\n"
+        f"Equity: ${_wlt_equity(w):.2f}  Mode: {w.get('mode')}  "
+        f"Active: {'yes' if w.get('active') else 'PAUSED'}"
+    )
+
+
+def _tg_history_report(w: Dict, n: int = 12) -> str:
+    trades = w.get("trade_log", [])[-n:]
+    if not trades:
+        return "📜 No trades yet."
+    lines = []
+    for t in reversed(trades):
+        side   = t.get("side", "?")
+        sym    = t.get("symbol", "?")
+        usd    = t.get("usd", 0) or 0
+        pnl    = t.get("pnl")
+        pnl_s  = f" pnl=${pnl:.2f}" if pnl is not None else ""
+        reason = f" ({t['exit_reason']})" if t.get("exit_reason") else ""
+        lines.append(f"{t.get('ts', '')[11:19]} {side:5s} {sym:<10s} ${usd:.2f}{pnl_s}{reason}")
+    return f"📜 History — last {len(trades)} trades\n\n" + "\n".join(lines)
+
+
+def _tg_scout_report(decision_filter: Optional[str] = None) -> str:
+    scout = STATE.get("scout_log", [])
+    filtered = [s for s in scout if s.get("decision") == decision_filter] if decision_filter else scout
+    if not filtered:
+        return f"🔍 No scout entries{' for ' + decision_filter if decision_filter else ''} yet."
+    counts = Counter(s.get("decision") for s in scout)
+    lines = []
+    if not decision_filter:
+        lines.append(f"entered: {counts.get('entered', 0)}  suggested: {counts.get('suggested', 0)}  "
+                     f"rejected: {counts.get('rejected', 0)}\n")
+    if decision_filter in (None, "rejected"):
+        reasons = Counter()
+        for s in filtered:
+            if s.get("decision") != "rejected" and decision_filter is None:
+                continue
+            r = (s.get("reason") or "?").split(" — ")[0].split(":")[0][:35]
+            reasons[r] += 1
+        if reasons:
+            lines.append("Top rejection reasons:")
+            lines += [f"  {c}x  {r}" for r, c in reasons.most_common(8)]
+    recent = filtered[-8:]
+    lines.append("\nMost recent:")
+    lines += [f"  {s.get('symbol', '?')}: {(s.get('reason') or '')[:55]}" for s in reversed(recent)]
+    title = decision_filter.upper() if decision_filter else "OVERVIEW"
+    return f"🔍 Scout — {title}\n\n" + "\n".join(lines)
+
+
 @require_auth
 async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Free-text night-mode control: 'good night' arms it, 'ok' clears a false-alarm
@@ -7805,6 +7884,133 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += (" New buys stay paused until you resume them yourself."
                     if still_paused else " Everything's normal, have a good day.")
             await update.message.reply_text(msg)
+        return
+
+    # -----------------------------------------------------------------------
+    # Natural-language wallet control (2026-07-02) — user: "i prefer to talk
+    # to it like chat." All of these act on every live wallet (there's
+    # currently only one; this generalizes cleanly if more get added).
+    # -----------------------------------------------------------------------
+
+    # Mode: "hype" / "change to hype" / "switch to degen" / "mode safe"
+    _valid_modes = list(CONFIG["modes"].keys())
+    for m in _valid_modes:
+        if text in (m, f"change to {m}", f"switch to {m}", f"mode {m}", f"go {m}", f"set mode {m}"):
+            for _, w in live_wallets:
+                w["mode"] = m
+            save_state()
+            send_alert(f"⚙️ Mode changed to {m} (Telegram chat)", critical=True)
+            await update.message.reply_text(f"Mode set to {m}.")
+            return
+
+    # pause = stop NEW BUYS only, selling/exits keep running.
+    # stop  = stop everything, including selling/exits.
+    # resume/start are the opposites, respectively.
+    if text == "pause":
+        for _, w in live_wallets:
+            w["paused_new_entries"] = True
+        save_state()
+        await update.message.reply_text(
+            "⏸️ Paused — no new buys. Selling and exits keep running normally. Say 'resume' to undo.")
+        return
+    if text == "resume":
+        for _, w in live_wallets:
+            w["paused_new_entries"] = False
+        save_state()
+        await update.message.reply_text("▶️ Resumed — buying is back on.")
+        return
+    if text == "stop":
+        for _, w in live_wallets:
+            w["active"] = False
+        save_state()
+        await update.message.reply_text(
+            "🛑 Stopped — buying AND selling are both paused now. Say 'start' to undo.")
+        return
+    if text == "start":
+        for _, w in live_wallets:
+            w["active"] = True
+        save_state()
+        await update.message.reply_text("✅ Started — everything's back to normal.")
+        return
+
+    # "hold SYMBOL [on|off]"
+    if text.startswith("hold "):
+        parts  = text.split()
+        symbol = parts[1].upper() if len(parts) > 1 else ""
+        arg    = parts[2] if len(parts) > 2 else None
+        for wid, w in live_wallets:
+            pos = w.get("positions", {}).get(symbol)
+            if pos and pos.get("units", 0) > 0:
+                paused = (arg == "on") if arg in ("on", "off") else not pos.get("sell_paused")
+                pos["sell_paused"] = paused
+                if not paused:
+                    pos.pop("hold_alert_reason", None)
+                    pos.pop("hold_alert_ts", None)
+                save_state()
+                await update.message.reply_text(f"{symbol} is now {'⏸️ HOLD' if paused else '▶️ auto'}.")
+                return
+        await update.message.reply_text(f"No open position in {symbol or '(?)'}.")
+        return
+
+    # "check SYMBOL" — user: "check this is the right move, reanalyze (and it
+    # needs to actually)" — runs a REAL fresh AI review right now, not the
+    # cached/periodic one. Runs in a background thread since the Anthropic
+    # call takes a few seconds and would otherwise block the bot from
+    # answering anything else meanwhile; ai_review_position telegrams its
+    # own result when done.
+    if text.startswith("check "):
+        symbol = text.split(maxsplit=1)[1].upper()
+        for wid, w in live_wallets:
+            pos = w.get("positions", {}).get(symbol)
+            if pos and pos.get("units", 0) > 0:
+                await update.message.reply_text(f"🔎 Checking {symbol} now, one sec…")
+                def _run_check(_wid=wid, _w=w, _sym=symbol, _pos=pos):
+                    live = fetch_positions_prices()
+                    px = live.get(_sym, {}).get("price") or _pos.get("avg", 0)
+                    if px > 0:
+                        ai_review_position(_wid, _w, _sym, _pos, px)
+                threading.Thread(target=_run_check, daemon=True).start()
+                return
+        await update.message.reply_text(f"No open position in {symbol}.")
+        return
+
+    # "watch SYMBOL" — user: "im not sure i trust this one, be sharp and
+    # quick" — flags the position for review every ~60s instead of the
+    # normal 5min cadence (see the watch-loop in engine_loop()).
+    if text.startswith("watch "):
+        symbol = text.split(maxsplit=1)[1].upper()
+        for wid, w in live_wallets:
+            pos = w.get("positions", {}).get(symbol)
+            if pos and pos.get("units", 0) > 0:
+                pos["watch"] = True
+                pos["last_watch_review_ts"] = 0   # force a check on the next tick
+                save_state()
+                await update.message.reply_text(
+                    f"👀 Watching {symbol} closely — checking every ~60s instead of the usual 5min.")
+                return
+        await update.message.reply_text(f"No open position in {symbol}.")
+        return
+
+    # "audit" / "history" / "scout" [entries|rejections|suggested]
+    if text == "audit":
+        for wid, w in live_wallets:
+            await update.message.reply_text(_tg_audit_report(wid, w))
+        return
+    if text == "history":
+        for _, w in live_wallets:
+            await update.message.reply_text(_tg_history_report(w))
+        return
+    if text == "scout":
+        await update.message.reply_text(_tg_scout_report())
+        return
+    if text in ("scout entries", "scout entered"):
+        await update.message.reply_text(_tg_scout_report("entered"))
+        return
+    if text in ("scout rejections", "scout rejected"):
+        await update.message.reply_text(_tg_scout_report("rejected"))
+        return
+    if text == "scout suggested":
+        await update.message.reply_text(_tg_scout_report("suggested"))
         return
 
 
@@ -7919,6 +8125,9 @@ async def cmd_doge_band(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
+        "You can also just talk to me: hype/degen/safe/default, pause, resume, "
+        "stop, start, hold SYMBOL, check SYMBOL, watch SYMBOL, audit, history, "
+        "scout / scout entries / scout rejections / scout suggested\n\n"
         "REAL WALLET: /wallet /wmode /wactive /whold /wbuy /wsell /wsell_at /wbuy_at\n"
         "Paper engine: /status /mode /objective /moonshot /auto_old\n"
         "/skim /spray_until /boost /export_state /import_state\n"
@@ -7934,6 +8143,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help_long(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Modes: safe / default / hype / degen\n\n"
+        "── Talk to it like chat (acts on every live wallet) ──\n"
+        "hype / degen / safe / default        — change mode (also: 'change to hype')\n"
+        "pause                                — stop new buys only, selling keeps running\n"
+        "resume                               — opposite of pause\n"
+        "stop                                 — stop everything, buying AND selling\n"
+        "start                                — opposite of stop\n"
+        "hold SYMBOL [on|off]                 — HOLD toggle, no arg toggles\n"
+        "check SYMBOL                         — real fresh AI re-analysis, right now\n"
+        "watch SYMBOL                         — reviews it every ~60s instead of 5min\n"
+        "audit                                — win rate, avg win/loss, exit-type breakdown\n"
+        "history                              — last 12 trades\n"
+        "scout / scout entries / scout rejections / scout suggested — scout log summary\n\n"
         "── REAL WALLET (acts on your live hot wallet) ──\n"
         "/wallet                              — status: mode, equity, open positions, flags\n"
         "/wmode <mode>                        — change the wallet's mode\n"
@@ -9055,6 +9276,32 @@ def engine_loop():
             except Exception:
                 traceback.print_exc()
             last_ai_review = time.time()
+        # Watched positions ("watch SYMBOL" via chat) — user (2026-07-02):
+        # "im not sure i trust this one, be sharp and quick." Reviewed every
+        # ~60s regardless of the normal 5min cadence above, independent
+        # per-position timer so it doesn't wait on the global review_due gate.
+        if CONFIG["ai"].get("position_review_enabled"):
+            try:
+                _any_watched = any(
+                    p.get("units", 0) > 0 and p.get("watch")
+                    for _wlt in STATE.get("wallets", {}).values()
+                    for p in _wlt.get("positions", {}).values())
+                if _any_watched:
+                    _watch_prices = fetch_positions_prices()
+                    for _wid, _wlt in STATE.get("wallets", {}).items():
+                        if not _wlt.get("live"):
+                            continue
+                        for _sym, _pos in list(_wlt.get("positions", {}).items()):
+                            if _pos.get("units", 0) <= 0 or not _pos.get("watch"):
+                                continue
+                            if time.time() - _pos.get("last_watch_review_ts", 0) < 60:
+                                continue
+                            _px = _watch_prices.get(_sym, {}).get("price") or _pos.get("avg", 0)
+                            if _px > 0:
+                                ai_review_position(_wid, _wlt, _sym, _pos, _px)
+                            _pos["last_watch_review_ts"] = time.time()
+            except Exception:
+                traceback.print_exc()
         # Position checks read WS_PRICES (in-memory) — no API cost.
         # 0.1s = 10 checks/sec; catches gap-downs ~5× faster than 0.5s.
         time.sleep(0.1)
