@@ -2862,11 +2862,20 @@ def _wallet_drawdown_check(wid: str, w: Dict):
             alerted.pop("velocity", None)   # reset once pace stabilises
 
     # ── Reset level alerts when equity recovers ───────────────────────────
+    # BUG FIXED 2026-07-02: this used to read `elif drawdown < 70`, which
+    # OVERLAPS the tier-2 trigger band (drawdown >= 50). Any equity sitting
+    # between $50-70 down set alerted["warning"]=True in the check above,
+    # then immediately popped it right back off here in the same call —
+    # re-arming the trigger for the next tick. _wallet_drawdown_check runs
+    # up to ~10x/sec (engine_loop's 0.1s poll) whenever the wallet has an
+    # open position, so this fired the identical WARNING alert dozens of
+    # times in a few seconds. The reset must only fire BELOW the trigger
+    # threshold (an actual recovery), never inside the still-active band.
     if drawdown < 15:
         alerted.clear()
     elif drawdown < 35:
         alerted.pop("watch", None)
-    elif drawdown < 70:
+    elif drawdown < 50:
         alerted.pop("warning", None)
 
 
