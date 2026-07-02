@@ -1044,7 +1044,16 @@ def _on_pumpfun_create(ev: Dict):
             if _ONCHAIN_CREATES[k]["ts"] < cutoff:
                 del _ONCHAIN_CREATES[k]
     log(f"WS-create: ${symbol} ({mint[:8]}…) minted on-chain")
-    _ws_add(symbol, mint)   # subscribe price feed immediately
+    # NOT WS-subscribing here on purpose (2026-07-02 audit): this fires for EVERY
+    # on-chain mint detected, most of which never pass a single filter — WS_PRICES
+    # is only ever read for managing OPEN positions (fetch_positions_prices), never
+    # during candidate scanning. Subscribing here just accumulated an unbounded,
+    # never-cleaned-up subscription list (nothing ever unsubscribes a token that's
+    # never bought), and every WS reconnect tried to resubscribe the entire pile at
+    # once, immediately tripping the server's rate limit and looping forever —
+    # found via live logs showing a reconnect-then-1013-rate-limit cycle every ~6s.
+    # The real subscription happens at buy time (shadow_buy) and on restart-reattach
+    # for existing positions, which is the only time this data is actually used.
     threading.Thread(target=_probe_new_token, args=(mint, symbol), daemon=True).start()
 
 
