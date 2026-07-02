@@ -3784,8 +3784,16 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
             continue
 
         # Entry probability — each wallet independently decides whether to enter.
-        # Default 85%: wallets don't always mirror each other, reducing on-chain correlation.
-        entry_prob = float(w.get("entry_prob", 0.85))
+        # Only meaningful with MULTIPLE live wallets (staggers them so they don't
+        # look like clone bots buying the identical token in the identical block).
+        # User (2026-07-02): "why is there 85% probability. its should be
+        # 100%????" — correct catch: with exactly one live wallet, there's
+        # nothing to "not mirror," so the 85% was just discarding 15% of
+        # already-fully-filtered opportunities for zero benefit, worst of all
+        # during an already-quiet market. Self-adjusts: reactivates automatically
+        # if a second live wallet ever gets added, no manual toggle needed.
+        _live_wallet_count = sum(1 for _w in STATE.get("wallets", {}).values() if _w.get("live"))
+        entry_prob = float(w.get("entry_prob", 0.85)) if _live_wallet_count > 1 else 1.0
         if random.random() > entry_prob:
             log(f"[W:{wid}] SKIP {symbol} — skipped by entry_prob ({entry_prob:.0%})")
             _miss(w, "entry_prob")
