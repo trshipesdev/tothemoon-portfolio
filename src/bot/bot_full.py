@@ -4955,6 +4955,7 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
         return None
 
     ctx = _ai_market_context()
+    text = ""
     try:
         client = anthropic.Anthropic()
         resp = client.messages.create(
@@ -4964,9 +4965,20 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
             messages=[{"role": "user", "content": json.dumps(ctx)}],
         )
         text = next((b.text for b in resp.content if b.type == "text"), "")
-        decision = json.loads(text)
+        # Strip markdown code fences if the model wrapped the JSON in one
+        # (```json ... ``` or plain ``` ... ```) — some models do this even when
+        # told to return strict JSON, and a naive json.loads() on the fenced
+        # text fails with "Expecting value: line 1 column 1" on the leading
+        # backticks, which was silently killing every single advisory run.
+        _clean = text.strip()
+        if _clean.startswith("```"):
+            _clean = _clean.split("```")[1]
+            if _clean.startswith("json"):
+                _clean = _clean[4:]
+            _clean = _clean.strip()
+        decision = json.loads(_clean)
     except Exception as e:
-        log(f"AI advise failed: {e}")
+        log(f"AI advise failed: {e} | raw response: {text[:300]!r}")
         return None
 
     decision["confidence"] = max(0.0, min(1.0, float(decision.get("confidence", 0))))
