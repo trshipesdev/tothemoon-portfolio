@@ -3169,6 +3169,12 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         if price > pos.get("peak_price", 0):
             pos["peak_price"] = price
         peak = pos.get("peak_price", pos["avg"])
+        # Feed the wallet's own tick-resolution peak into the session-wide tracker
+        # (higher resolution than scan-cycle prices) so the lower-high re-entry
+        # guard in scan_candidates() knows about peaks hit while HOLDING.
+        _peaks = STATE.setdefault("symbol_peaks", {})
+        if peak > _peaks.get(symbol, 0):
+            _peaks[symbol] = peak
 
         # Liq history for drain detection
         liq_ticks: List[float] = pos.setdefault("liq_ticks", [])
@@ -7154,6 +7160,7 @@ def scan_candidates():
         STATE["recently_exited"]   = {}   # clear cooldowns at midnight — fresh day, fresh tokens
         STATE["reject_cache"]      = {}   # clear reject cache — tokens get a fresh look each day
         STATE["token_pnl_today"]   = {}   # cumulative PnL per symbol today (loss escalation)
+        STATE["symbol_peaks"]      = {}   # highest price seen WHILE HOLDING a position per symbol today (lower-high guard)
         STATE["peak_deployed_usd"] = 0.0
         STATE["peak_open_count"]   = 0
         STATE["last_daily_reset"] = today
@@ -7248,6 +7255,24 @@ def scan_candidates():
                 and open_count >= CONFIG.get("max_open_positions", 12)):
             _scout(symbol, chain, "rejected",
                    f"at max open positions ({CONFIG.get('max_open_positions', 12)})", sc, addr)
+            continue
+        # Lower-high guard — blocks buying a WEAKER bounce than a peak the bot itself
+        # already HELD a position through today, no matter how long ago or how many
+        # exits happened in between. Deliberately only counts peaks seen while actually
+        # holding (fed from peak_price during open positions) — NOT every price glanced
+        # at during scanning, which would also flag a token's first entry after a
+        # pre-entry wick it never bought (verified: would've wrongly blocked MONK's
+        # first, profitable entry on 2026-07-02). The old profit-chase check below only
+        # remembers the single most recent exit price for 15 minutes; a token that tops
+        # out and grinds down in a series of lower highs over hours (MONK — bot kept
+        # re-buying each successively weaker bounce after the first good catch, ~$5-10
+        # each time) has zero protection once that window passes. No expiry — only a
+        # real new high (while holding) clears it.
+        _peak = STATE.get("symbol_peaks", {}).get(symbol, 0)
+        if _peak > 0 and price < _peak * 0.80:
+            _scout(symbol, chain, "rejected",
+                   f"lower high — {(1 - price/_peak)*100:.0f}% below its own session peak "
+                   f"(${_peak:.6g} → ${price:.6g})", sc, addr)
             continue
         # Post-exit cooldown — applies to ALL tokens regardless of age.
         # Pattern A: after a loss exit, block re-entry for 30 min (token is still dumping).
@@ -7509,6 +7534,11 @@ def manage_positions():
         if price > p.get("peak_price", 0):
             p["peak_price"] = price
             p["peak_ts"]    = time.time()
+            # Feed the paper engine's tick-resolution peak into the session-wide
+            # tracker too — same reasoning as the wallet path above.
+            _peaks = STATE.setdefault("symbol_peaks", {})
+            if price > _peaks.get(s, 0):
+                _peaks[s] = price
         if price < p.get("trough_price", float("inf")):
             p["trough_price"] = price
         peak = p.get("peak_price", p["avg"])
