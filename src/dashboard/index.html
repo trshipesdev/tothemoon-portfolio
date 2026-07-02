@@ -2817,8 +2817,13 @@ function app() {
       if (h) { this.history = h; this.$nextTick(() => this.drawChart(h)); }
       if (al)  this.alerts  = al;
       if (rpc) this.rpc     = rpc;
-      // Keep hot wallet in sync on every refresh tick
-      if (this.tab === 'Hot Wallet') {
+      // Keep hot wallet in sync on every refresh tick — regardless of active tab.
+      // BUG FIXED 2026-07-02: this was gated behind `this.tab === 'Hot Wallet'`,
+      // directly contradicting this comment. Open positions are also rendered
+      // outside that specific tab, so walletPositions just froze stale (or stayed
+      // empty) any time the user wasn't literally on the Hot Wallet tab — this is
+      // why real open positions weren't showing up. Always sync now.
+      {
         const wr = await this.get('/api/wallets');
         if (wr) {
           this.wallets = wr;

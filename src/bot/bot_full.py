@@ -2731,6 +2731,11 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
             log(f"[W:{wid}] LIVE SELL FAILED {symbol} "
                 f"(attempt {int(pos.get('sell_fails', 0)) + 1}): {result['error']}")
             pos["sell_fail_ts"] = time.time()
+            # DIRT (2026-07-02): urgent sell failed (slippage revert), then waited the full
+            # 60s retry cooldown while the token kept moving — by the time the retry landed,
+            # most of the gain was already gone. A fast-crashing/spiking coin can't afford a
+            # flat 60s wait on every failure. Urgent exits retry in 10s instead.
+            pos["sell_fail_cooldown"] = 10 if urgent else 60
             pos["sell_fails"]   = int(pos.get("sell_fails", 0)) + 1
             w.setdefault("trade_log", []).append({
                 "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "sol"),
@@ -3165,9 +3170,12 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         if price <= 0:
             continue
 
-        # Back off 60s after any sell failure — prevents tight retry loop when
-        # Jupiter has no route or a TX fails on-chain
-        if time.time() - pos.get("sell_fail_ts", 0) < 60:
+        # Back off after any sell failure — prevents tight retry loop when Jupiter
+        # has no route or a TX fails on-chain. Urgent failures (rug/velocity/stop)
+        # only wait 10s instead of 60 — a fast-moving coin can't afford a full
+        # minute of forced delay after a failed exit (see DIRT, 2026-07-02).
+        _fail_cooldown = pos.get("sell_fail_cooldown", 60)
+        if time.time() - pos.get("sell_fail_ts", 0) < _fail_cooldown:
             continue
 
         # Track peak
