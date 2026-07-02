@@ -271,6 +271,10 @@ CONFIG: Dict[str, Any] = {
         "daily_digest_utc": "14:00",
     },
 
+    # Stand-out market trend digest (2026-07-02) — bull/bear read on SOL/meme
+    # conditions, sent every hour on top of (not instead of) the daily digest.
+    "market_digest_hourly": True,
+
     "stealth":  {"split_parts": [2, 4], "slip_bps_jitter": 30, "candidate_shuffle": True, "burst_per_30s": 4},
     "presale":  {"min_score": 70},  # legacy — use presale_min_score at top level
     "skim_pct": 0.10,  # fraction of realized profit moved to income_usd when skim is ON
@@ -3284,6 +3288,25 @@ def _wlt_equity(w: Dict) -> float:
         return w.get("equity_usd", 0.0)
     return w.get("vault_usd", 0.0) + sum(
         p.get("usd", 0) for p in w.get("positions", {}).values() if p.get("units", 0) > 0)
+
+
+def _wlt_stats(w: Dict) -> Dict[str, Any]:
+    """net_pnl/win_rate/trade_count/open_pos — computed fresh from trade_log,
+    never stored directly on the wallet dict. Shared by the /api/wallets
+    endpoint and every Telegram wallet report so they can't drift out of sync
+    with each other (found 2026-07-02: the Telegram reports were reading
+    w.get("net_pnl", 0) directly, a key that's never actually set on the raw
+    wallet dict — always silently returning the 0 default)."""
+    open_pos = {s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0}
+    sells    = [t for t in w.get("trade_log", []) if t.get("side") == "sell" and t.get("pnl") is not None]
+    wins     = [t for t in sells if (t.get("pnl") or 0) > 0]
+    net_pnl  = sum(t.get("pnl") or 0 for t in sells)
+    return {
+        "open_pos":    open_pos,
+        "net_pnl":     round(net_pnl, 2),
+        "trade_count": len(sells),
+        "win_rate":    round(len(wins) / max(1, len(sells)) * 100, 1),
+    }
 
 
 def _wlt_periodic_chain_sync(wid: str, w: Dict, live_prices: Dict):
@@ -6522,10 +6545,8 @@ def api_reset_vault_floor():
 def api_wallets_list():
     result = {}
     for wid, w in STATE.get("wallets", {}).items():
-        open_pos = {s: p for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0}
-        sells    = [t for t in w.get("trade_log", []) if t.get("side") == "sell" and t.get("pnl") is not None]
-        wins     = [t for t in sells if (t.get("pnl") or 0) > 0]
-        net_pnl  = sum(t.get("pnl") or 0 for t in sells)
+        stats    = _wlt_stats(w)
+        open_pos = stats["open_pos"]
         floor_pct    = CONFIG.get("absolute_floor_pct", 0.25)
         hot_addr     = w.get("address", "")
         cold_addr    = (w.get("sweep_address") or os.getenv("SWEEP_SOL_ADDRESS", "")).strip()
@@ -6554,9 +6575,9 @@ def api_wallets_list():
             "at_floor":     at_floor,
             "starting_usd": w.get("starting_usd", 0),
             "vault_usd":    round(w.get("vault_usd", 0), 2),
-            "net_pnl":      round(net_pnl, 2),
-            "trade_count":  len(sells),
-            "win_rate":     round(len(wins) / max(1, len(sells)) * 100, 1),
+            "net_pnl":      stats["net_pnl"],
+            "trade_count":  stats["trade_count"],
+            "win_rate":     stats["win_rate"],
             "open_positions": len(open_pos),
             "open_pos_names": list(open_pos.keys()),
             "open_pos_usd":  round(sum(p.get("usd", 0) for p in open_pos.values()), 2),
@@ -7568,6 +7589,89 @@ def send_alert(msg: str, critical: bool = False, paper: bool = False):
     asyncio.run_coroutine_threadsafe(_send(), TG_STATE["loop"])
 
 
+# ---------------------------------------------------------------------------
+# Market trend digest (2026-07-02) — user: "i want telegram to alert me
+# different with a more stand out message that lets me know if the solana
+# crypto and meme market is in a bear run or bull run... for the hour and
+# the day... i want this to be fully informed."
+# ---------------------------------------------------------------------------
+
+def _market_snapshot_tick():
+    """Periodic SOL price + BTC dominance snapshot, kept 7 days so hourly/daily
+    % change can be computed on demand. ~5min resolution — plenty for hour/day
+    trend, no reason to sample more often than that."""
+    hist = STATE.setdefault("market_history", [])
+    now = time.time()
+    if hist and now - hist[-1]["ts"] < 240:
+        return
+    hist.append({
+        "ts": now,
+        "sol_usd": _sol_usd_cached(),
+        "btc_d": STATE.get("signals", {}).get("btc_d"),
+    })
+    cutoff = now - 7 * 86400
+    hist[:] = [h for h in hist if h["ts"] >= cutoff]
+
+
+def _market_trend_report() -> str:
+    """'Fully informed' = real BTC dominance trend (the standard alt/meme-season
+    signal: falling dominance -> alt season, rising -> BTC eating everyone's
+    lunch) + SOL's own price trend + a memecoin-specific breadth signal pulled
+    from the bot's own recent scan rejections (what fraction were declining
+    tokens vs everything else) — not just one generic number."""
+    hist = STATE.get("market_history", [])
+    now = time.time()
+
+    def _chg(field, window_sec):
+        vals = [h for h in hist if now - h["ts"] <= window_sec and h.get(field) is not None]
+        if len(vals) < 2 or not vals[0][field]:
+            return None
+        return (vals[-1][field] / vals[0][field] - 1) * 100
+
+    sol_1h, sol_24h   = _chg("sol_usd", 3600), _chg("sol_usd", 86400)
+    btcd_1h, btcd_24h = _chg("btc_d", 3600), _chg("btc_d", 86400)
+    cur_sol  = hist[-1]["sol_usd"] if hist else _sol_usd_cached()
+    cur_btcd = hist[-1]["btc_d"] if hist else STATE.get("signals", {}).get("btc_d")
+
+    recent   = STATE.get("scout_log", [])[-150:]
+    rejected = [s for s in recent if s.get("decision") == "rejected"]
+    _decline_kw = ("declin", "downswing", "free-fall", "trend is red", "negative", "not trending up")
+    declines = [s for s in rejected if any(k in (s.get("reason") or "").lower() for k in _decline_kw)]
+    breadth  = (100 * (1 - len(declines) / len(rejected))) if rejected else None
+
+    signal = "🟡 CHOPPY / mixed signals"
+    if btcd_24h is not None:
+        if btcd_24h < -0.3 and (sol_24h or 0) >= 0:
+            signal = "🟢 BULL — dominance falling, alt/meme season conditions"
+        elif btcd_24h > 0.3 and (sol_24h or 0) <= 0:
+            signal = "🔴 BEAR — BTC dominance rising, alts under pressure"
+        elif breadth is not None and breadth < 35:
+            signal = "🔴 BEAR — most of what the scanner sees is actively declining"
+        elif breadth is not None and breadth > 70:
+            signal = "🟢 BULL — most of what the scanner sees is holding up or climbing"
+
+    def _f(v):
+        return f"{v:+.1f}%" if v is not None else "n/a"
+
+    lines = [
+        "🚨📊 MARKET PULSE 📊🚨",
+        "━━━━━━━━━━━━━━━━━━━━",
+        signal,
+        "",
+        f"SOL: ${cur_sol:.2f}" + (f"  (1h {_f(sol_1h)}, 24h {_f(sol_24h)})" if hist else " (building history…)"),
+    ]
+    if cur_btcd is not None:
+        lines.append(f"BTC dominance: {cur_btcd:.1f}%" +
+                     (f"  (1h {_f(btcd_1h)}, 24h {_f(btcd_24h)})" if hist else ""))
+    else:
+        lines.append("BTC dominance: n/a")
+    if breadth is not None:
+        lines.append(f"Memecoin breadth: {breadth:.0f}% of last {len(rejected)} scanner "
+                     f"rejections were NOT decline-driven")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
 def send_digest():
     pos_lines = [
         f"  {s} {p['chain']} usd~${p['usd']:.2f} avg~{p['avg']:.6f}"
@@ -7964,6 +8068,33 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # "hold SYMBOL [on|off]"
     if text.startswith("hold "):
+        # Combined form: "hold SYMBOL on sell at 10" / "hold SYMBOL on buy at 10 repeat"
+        # — user (2026-07-02): "hold symbol on sell(or buy) at 10 and that helps
+        # do the custom there." Sets HOLD and the matching price trigger in one message.
+        _combo = re.match(
+            r"hold\s+(\w+)\s+on\s+(sell|buy)\s+at\s+\$?(\d+(?:\.\d+)?)"
+            r"(?:\s+add\s+\$?(\d+(?:\.\d+)?))?(\s+repeat)?", text)
+        if _combo:
+            symbol, kind, value_str, add_str, repeat_str = _combo.groups()
+            symbol    = symbol.upper()
+            value_usd = float(value_str)
+            for wid, w in live_wallets:
+                pos = w.get("positions", {}).get(symbol)
+                if pos and pos.get("units", 0) > 0:
+                    pos["sell_paused"] = True
+                    if kind == "sell":
+                        pos["sell_trigger"] = {"value_usd": value_usd}
+                        extra = f"sell target ${value_usd:.2f}"
+                    else:
+                        add_usd = float(add_str) if add_str else 5.0
+                        pos["buy_trigger"] = {"value_usd": value_usd, "add_usd": add_usd,
+                                              "repeat": bool(repeat_str), "armed": True}
+                        extra = f"buy-more trigger ${value_usd:.2f} (+${add_usd:.2f}{', repeats' if repeat_str else ''})"
+                    save_state()
+                    await update.message.reply_text(f"{symbol} is now ⏸️ HOLD with a {extra}.")
+                    return
+            await update.message.reply_text(f"No open position in {symbol}.")
+            return
         parts  = text.split()
         symbol = parts[1].upper() if len(parts) > 1 else ""
         arg    = parts[2] if len(parts) > 2 else None
@@ -8040,6 +8171,9 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "scout suggested":
         await update.message.reply_text(_tg_scout_report("suggested"))
+        return
+    if text in ("market", "trend", "trends", "market trend", "bull or bear"):
+        await update.message.reply_text(_market_trend_report())
         return
 
 
@@ -8311,12 +8445,14 @@ async def cmd_wallet(update, context):
         if p.get("buy_trigger"):  flags.append(f"buy@${p['buy_trigger']['value_usd']:.0f}")
         flag_str = f" [{', '.join(flags)}]" if flags else ""
         pos_lines.append(f"  {sym}: ${p.get('usd', 0):.2f}{flag_str}")
+    stats = _wlt_stats(w)
     msg = (
         f"Wallet: {w.get('label', wid)}\n"
         f"Mode: {w.get('mode')}  Active: {'yes' if w.get('active') else 'PAUSED'}  "
         f"Live: {'yes' if w.get('live') else 'no'}\n"
-        f"Equity: ${w.get('equity_usd', 0):.2f}  Vault: ${w.get('vault_usd', 0):.2f}\n"
-        f"Net PnL: ${w.get('net_pnl', 0):.2f}  Win rate: {w.get('win_rate', 0):.0f}%\n"
+        f"Equity: ${_wlt_equity(w):.2f}  Vault: ${w.get('vault_usd', 0):.2f}\n"
+        f"Net PnL: ${stats['net_pnl']:.2f}  Win rate: {stats['win_rate']:.0f}% "
+        f"({stats['trade_count']} closed trades)\n"
         f"Open positions ({len(pos_lines)}):\n"
         + ("\n".join(pos_lines) if pos_lines else "  (none)")
     )
@@ -9226,6 +9362,8 @@ def engine_loop():
     digest_date       = None
     digest_hour       = int(CONFIG["telegram"]["daily_digest_utc"].split(":")[0])
     last_scan         = 0.0
+    last_market_snap  = 0.0
+    last_market_digest = 0.0
     _crash_count  = 0
     _last_crash_alert = 0.0
     while not ENGINE_STOP:
@@ -9249,7 +9387,21 @@ def engine_loop():
         now = now_utc()
         if now.hour == digest_hour and now.date() != digest_date:
             send_digest()
+            send_alert(_market_trend_report(), critical=True)
             digest_date = now.date()
+        # Market history snapshot every ~5min, hourly stand-out digest on top.
+        if time.time() - last_market_snap > 240:
+            try:
+                _market_snapshot_tick()
+            except Exception:
+                traceback.print_exc()
+            last_market_snap = time.time()
+        if CONFIG.get("market_digest_hourly", True) and time.time() - last_market_digest > 3600:
+            try:
+                send_alert(_market_trend_report(), critical=True)
+            except Exception:
+                traceback.print_exc()
+            last_market_digest = time.time()
         if time.time() - last_rpc_check > 300:
             try:
                 check_rpc_health()
