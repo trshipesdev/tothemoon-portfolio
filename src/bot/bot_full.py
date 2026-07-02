@@ -2416,20 +2416,40 @@ def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict
             return {"error": "jupiter_swap_build_failed"}
         sig       = _sol_submit_tx(tx_b64, kp)
         _sol_confirm_tx(sig)
-        # Brief pause so the RPC state reflects the confirmed slot before querying balances
-        time.sleep(1)
-        balances  = _sol_get_all_token_balances(str(kp.pubkey()))
-        out_units = balances.get(addr, 0.0)
+        # Balance read after confirm can lag on public RPC — retry up to ~10s
+        out_units = 0.0
+        for delay in (1, 2, 3, 4):
+            time.sleep(delay)
+            out_units = _sol_get_all_token_balances(str(kp.pubkey())).get(addr, 0.0)
+            if out_units > 0:
+                break
         if out_units <= 0:
-            raise RuntimeError("buy confirmed on-chain but 0 tokens received — likely bonding curve edge case")
+            # TX confirmed WITHOUT err — the swap executed, tokens exist; the RPC
+            # just can't see them yet. Fall back to the quoted amount so the
+            # position is tracked and exit-managed (reconcile trues up the exact
+            # units within 30s). The old behavior recorded buy_failed here, which
+            # left real spent-SOL tokens orphaned with no one to sell them.
+            tok_dec   = _sol_token_decimals(addr)
+            out_units = int(quote.get("outAmount") or 0) / 10 ** tok_dec
+            log(f"[W:{wid}] BUY {symbol}: balance reads 0 after confirmed tx {sig[:16]}… — "
+                f"using quoted units {out_units:.4f}, reconcile will true-up")
+        if out_units <= 0:
+            raise RuntimeError(f"buy confirmed on-chain but 0 tokens received (sig={sig})")
         filled_px = usd / out_units
         return {"price": filled_px, "units": out_units, "sig": sig}
     except Exception as e:
         return {"error": str(e)}
 
 
-def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float) -> Dict:
-    """Submit a real Jupiter sell for a live wallet. Returns {proceeds, units_sold, sig} or {error}."""
+def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float,
+                   urgent: bool = False) -> Dict:
+    """Submit a real Jupiter sell for a live wallet. Returns {proceeds, units_sold, sig} or {error}.
+
+    Slippage escalates with consecutive failures (pos['sell_fails']) and starts
+    wider for urgent exits (rug/velocity/SL) — when a token is dumping, getting
+    OUT beats getting a good price. Sell size is clamped to the actual on-chain
+    balance so a stale units figure can never make the swap revert.
+    """
     kp = _wallet_keypairs.get(wid)
     if not kp:
         return {"error": "no_keypair — set W_<wid>_PK in .env"}
@@ -2439,9 +2459,16 @@ def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float) -> Di
             return {"error": "no_token_address"}
         mode_name       = w.get("mode") or CONFIG["mode"]
         slip_bps        = CONFIG["modes"].get(mode_name, {}).get("slip_bps", 150)
+        slip_bps       += 200 * min(int(pos.get("sell_fails", 0)), 6)
+        if urgent:
+            slip_bps = max(slip_bps, 300)
+        slip_bps        = min(slip_bps, 1500)
         base_mint, base_dec = _wlt_base_mint(w)
         tok_dec    = _sol_token_decimals(addr)
         pos_units  = pos.get("units", 0)
+        chain_units = _sol_get_all_token_balances(str(kp.pubkey())).get(addr)
+        if chain_units is not None and 0 < chain_units < pos_units:
+            pos_units = chain_units
         frac       = min(1.0, usd / max(pos_units * price, 1e-9))
         sell_units = int(pos_units * frac * 10 ** tok_dec)
         if sell_units <= 0:
@@ -2643,10 +2670,14 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         return
     if w.get("live") and pos.get("chain") == "sol" and pos.get("address"):
         target_usd = sell_usd or (pos["units"] * price)
-        result     = _wlt_live_sell(wid, w, pos, target_usd, price)
+        urgent     = any(k in (exit_reason or "").lower()
+                         for k in ("rug", "drain", "velocity", "sl", "stop"))
+        result     = _wlt_live_sell(wid, w, pos, target_usd, price, urgent=urgent)
         if "error" in result:
-            log(f"[W:{wid}] LIVE SELL FAILED {symbol}: {result['error']}")
+            log(f"[W:{wid}] LIVE SELL FAILED {symbol} "
+                f"(attempt {int(pos.get('sell_fails', 0)) + 1}): {result['error']}")
             pos["sell_fail_ts"] = time.time()
+            pos["sell_fails"]   = int(pos.get("sell_fails", 0)) + 1
             w.setdefault("trade_log", []).append({
                 "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "sol"),
                 "side": "sell_failed", "usd": target_usd, "error": result["error"],
@@ -2658,6 +2689,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         units_sold = result.get("units_sold", pos["units"])
         price      = result["proceeds"] / units_sold if units_sold else price
         _sell_sig  = result.get("sig", "")
+        pos.pop("sell_fails", None)   # reset slippage escalation on success
         log(f"[W:{wid}] LIVE SELL {symbol} sig={_sell_sig[:16]}…")
     else:
         _sell_sig  = ""
@@ -2904,7 +2936,12 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
         if not mint:
             continue
         try:
-            entry_ts = datetime.fromisoformat(pos.get("entry_ts", "")).timestamp()
+            # Wallet positions store their entry timestamp under "time"
+            # (reading the nonexistent "entry_ts" key made the grace period a
+            # no-op — a lagging RPC read right after a buy ghost-closed real
+            # positions and orphaned the tokens)
+            entry_ts = datetime.fromisoformat(
+                pos.get("time") or pos.get("entry_ts", "")).timestamp()
         except Exception:
             entry_ts = 0
         if now_ts - entry_ts < 60:
@@ -2930,6 +2967,35 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
             pos["units"] = actual
             pos["usd"]   = pos.get("usd", 0.0) * frac
             changed = True
+
+    # Adopt orphans: on-chain tokens this bot bought (there's a buy/buy_failed
+    # record) but no longer tracks. Without adoption nothing ever sells them —
+    # they sit exposed to rugs while Phantom and the dashboard disagree.
+    tracked_mints = {p.get("address") for p in w.get("positions", {}).values()}
+    for mint, ui in balances.items():
+        if mint in tracked_mints or ui <= 0:
+            continue
+        rec = next((t for t in reversed(w.get("trade_log", []))
+                    if t.get("address") == mint and t.get("side") in ("buy", "buy_failed")), None)
+        if not rec:
+            continue   # not a bot purchase (user's own token) — leave it alone
+        symbol = rec.get("symbol") or mint[:6]
+        usd    = float(rec.get("usd") or 0)
+        avg    = usd / ui if ui > 0 else 0.0
+        w["positions"][symbol] = {
+            "chain": "sol", "units": ui, "usd": usd, "avg": avg,
+            "time": rec.get("ts") or now_utc().isoformat(), "address": mint,
+            "peak_price": avg, "trough_price": avg,
+            "entry_liq": 0, "liq_ticks": [],
+            "deployed_usd": usd, "entry_mode": rec.get("mode") or w.get("mode") or CONFIG["mode"],
+            "tp_index": 0,
+        }
+        w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + usd
+        log(f"[W:{wid}] RECONCILE ADOPT {symbol}: {ui:.4f} on-chain tokens from "
+            f"{rec.get('side')} @ {rec.get('ts','')[:19]} — now tracked and exit-managed")
+        send_alert(f"🔎 Adopted orphaned tokens: {symbol} (${usd:.2f} buy) — "
+                   f"the bot found these in the hot wallet and will manage the exit.")
+        changed = True
 
     if changed:
         save_state()
@@ -3059,7 +3125,10 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
 
     def _miss(w: Dict, reason: str):
         ml = w.setdefault("missed_log", [])
-        ml.append({"ts": ts, "symbol": symbol, "chain": chain, "reason": reason})
+        # address + price-at-miss make misses auditable later ("would that
+        # coin have been good for me?") — symbol alone is ambiguous on pump.fun
+        ml.append({"ts": ts, "symbol": symbol, "chain": chain, "reason": reason,
+                   "address": addr, "price": price})
         if len(ml) > 100:
             w["missed_log"] = ml[-100:]
 
