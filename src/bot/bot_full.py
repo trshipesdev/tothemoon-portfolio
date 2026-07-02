@@ -1242,8 +1242,22 @@ def fetch_birdeye_price(token_addr: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_birdeye_candidates_cache: Dict[str, Any] = {"ts": 0.0, "data": []}
+_BIRDEYE_CANDIDATES_TTL = 300.0   # 5 min — a "trending tokens" list doesn't need per-8s freshness
+
+
 def fetch_birdeye_sol_candidates() -> List[Dict[str, Any]]:
-    """Fetch trending Solana tokens from Birdeye token list."""
+    """Fetch trending Solana tokens from Birdeye token list.
+
+    Cached for 5 min. BUG FIXED 2026-07-02: this ran on the raw ~8s candidate-scan
+    cadence with zero caching — over 10,000 uncached calls/day just for a supplementary
+    trending list, which burned a full month's Birdeye credits in about a week. The
+    list doesn't meaningfully change within 5 minutes; DexScreener is already the
+    primary candidate source, this is only ever a supplement.
+    """
+    now = time.time()
+    if now - _birdeye_candidates_cache["ts"] < _BIRDEYE_CANDIDATES_TTL:
+        return _birdeye_candidates_cache["data"]
     key = os.getenv(BIRDEYE_KEY_ENV, "")
     if not key:
         return []
@@ -1284,9 +1298,11 @@ def fetch_birdeye_sol_candidates() -> List[Dict[str, Any]]:
                     "price_chg_h6": 1.0 if positive24h else -1.0,
                     "address": addr, "source": "birdeye",
                 })
+        _birdeye_candidates_cache["ts"]   = now
+        _birdeye_candidates_cache["data"] = out
         return out
     except Exception:
-        return []
+        return []   # don't cache a failure — retry next cycle instead of being stuck empty for 5 min
 
 
 _cg_trending_cache: Dict[str, Any] = {"ts": 0.0, "symbols": {}}  # sym → rank (1=hottest)
