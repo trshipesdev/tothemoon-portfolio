@@ -1430,9 +1430,19 @@
       </template>
 
       <!-- ── Open Positions ── -->
-      <template x-if="Object.keys(walletPositions).length > 0">
-        <div class="mb-4">
-          <p class="text-xs font-semibold text-gray-400 mb-2">Open Positions</p>
+      <div class="mb-4">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-xs font-semibold text-gray-400">Open Positions</p>
+          <button @click="refreshWalletPositions(walletDetail)"
+                  class="text-xs px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white"
+                  title="Force refresh now — don't wait for the auto-refresh timer">
+            ⟳ Refresh
+          </button>
+        </div>
+        <template x-if="Object.keys(walletPositions).length === 0">
+          <div class="text-center py-4 text-gray-600 text-sm">No open positions.</div>
+        </template>
+        <template x-if="Object.keys(walletPositions).length > 0">
           <div class="space-y-1">
             <template x-for="[sym, p] in Object.entries(walletPositions)" :key="sym">
               <div class="flex items-center justify-between bg-gray-900 rounded-lg px-3 py-2 text-sm border"
@@ -1449,8 +1459,8 @@
               </div>
             </template>
           </div>
-        </div>
-      </template>
+        </template>
+      </div>
 
       <!-- ── Trade History ── -->
       <div class="mb-4">
@@ -1813,7 +1823,14 @@
             <!-- Open positions -->
             <template x-if="Object.keys(walletPositions).length > 0 && walletDetail === wid">
               <div>
-                <p class="text-xs font-semibold text-gray-400 mb-2">Open Positions</p>
+                <div class="flex items-center justify-between mb-2">
+                  <p class="text-xs font-semibold text-gray-400">Open Positions</p>
+                  <button @click="refreshWalletPositions(wid)"
+                          class="text-xs px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white"
+                          title="Force refresh now — don't wait for the auto-refresh timer">
+                    ⟳ Refresh
+                  </button>
+                </div>
                 <div class="space-y-1">
                   <template x-for="[sym, p] in Object.entries(walletPositions)" :key="sym">
                     <div class="flex items-center justify-between bg-gray-750 rounded-lg px-3 py-2 text-sm">
@@ -3000,6 +3017,24 @@ function app() {
       } else {
         this.showToast(r?.error || 'Failed to toggle hold', false);
       }
+    },
+    async refreshWalletPositions(wid) {
+      // Manual force-refresh — bypasses the 3s timer entirely so a deploy or any
+      // other change shows up immediately on click instead of waiting for the
+      // next auto-refresh tick (or a full page reload).
+      wid = wid || this.walletDetail;
+      if (!wid) return;
+      const [wr, t, p, m] = await Promise.all([
+        this.get('/api/wallets'),
+        this.get(`/api/wallets/${wid}/trades`),
+        this.get(`/api/wallets/${wid}/positions`),
+        this.get(`/api/wallets/${wid}/missed`),
+      ]);
+      if (wr) this.wallets = wr;
+      if (t) this.walletTrades = t.slice().reverse();
+      if (p) this.walletPositions = p;
+      if (m) this.walletMisses = m.missed || [];
+      this.showToast('Positions refreshed');
     },
     async setWalletMode(wid, mode) {
       const r = await this.patch(`/api/wallets/${wid}`, { mode: mode || null });
