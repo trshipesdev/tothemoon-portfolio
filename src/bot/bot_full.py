@@ -2445,6 +2445,59 @@ def _sol_get_all_token_balances(owner_addr: str) -> Optional[Dict[str, float]]:
         return None
 
 
+def _sol_find_receive_price(owner_addr: str, mint: str, max_sigs: int = 40) -> Optional[float]:
+    """Scan recent wallet transactions for the swap that delivered `mint`, and compute
+    the real entry price paid (SOL spent ÷ tokens received) directly from that transaction.
+
+    A signed on-chain swap explicitly records what was actually paid — used to adopt
+    tokens the user bought manually (Phantom, etc), which have no bot trade_log record,
+    instead of refusing to track them at all (user, 2026-07-02: manually-bought tokens
+    weren't showing on the dashboard because adoption required a trade_log match that
+    can never exist for a purchase the bot didn't make).
+    """
+    rpc = _sol_rpc()
+    try:
+        resp = requests.post(rpc, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+            "params": [owner_addr, {"limit": max_sigs}],
+        }, timeout=15).json()
+        sigs = [s["signature"] for s in resp.get("result", []) if not s.get("err")]
+    except Exception as e:
+        log(f"WARN _sol_find_receive_price sigs: {e}")
+        return None
+    for sig in sigs:
+        try:
+            tx = requests.post(rpc, json={
+                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                "params": [sig, {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
+            }, timeout=15).json().get("result")
+        except Exception:
+            continue
+        if not tx:
+            continue
+        meta = tx.get("meta") or {}
+        pre_tok = {(b.get("owner"), b.get("mint")): float(b.get("uiTokenAmount", {}).get("uiAmount") or 0)
+                   for b in meta.get("preTokenBalances", [])}
+        post_tok = {(b.get("owner"), b.get("mint")): float(b.get("uiTokenAmount", {}).get("uiAmount") or 0)
+                    for b in meta.get("postTokenBalances", [])}
+        key = (owner_addr, mint)
+        received = post_tok.get(key, 0.0) - pre_tok.get(key, 0.0)
+        if received <= 0:
+            continue
+        keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
+        idx = next((i for i, k in enumerate(keys)
+                    if (k.get("pubkey") if isinstance(k, dict) else k) == owner_addr), None)
+        pre_bal  = meta.get("preBalances", [])
+        post_bal = meta.get("postBalances", [])
+        if idx is None or idx >= len(pre_bal) or idx >= len(post_bal):
+            continue
+        sol_spent = (pre_bal[idx] - post_bal[idx]) / 1e9
+        if sol_spent <= 0:
+            continue
+        return (sol_spent * _sol_usd_cached()) / received
+    return None
+
+
 def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict:
     """Submit a real Jupiter buy for a live wallet. Returns {price, units, sig} or {error}."""
     kp = _wallet_keypairs.get(wid)
@@ -3123,30 +3176,44 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
             continue
         rec = next((t for t in reversed(w.get("trade_log", []))
                     if t.get("address") == mint and t.get("side") in ("buy", "buy_failed")), None)
-        if not rec:
-            continue   # not a bot purchase (user's own token) — leave it alone
-        symbol = rec.get("symbol") or mint[:6]
-        # Use the TRUE original per-unit entry price, not (original total $) / (units
-        # left now). If this token was already partially sold before getting spuriously
-        # ghost-closed and re-adopted, dividing the full historical spend by only the
-        # remaining units re-charges money already recovered — inflating cost basis by
-        # up to 6x in one real incident (HOOFS, 2026-07-02) and causing a phantom
-        # "DOLLAR STOP" loss on a position that was actually profitable.
-        rec_units = float(rec.get("units") or 0)
-        entry_px  = float(rec.get("price") or 0) or (float(rec.get("usd") or 0) / max(rec_units, 1e-9))
-        usd       = entry_px * ui
-        avg       = entry_px
+        if rec:
+            # Use the TRUE original per-unit entry price, not (original total $) / (units
+            # left now). If this token was already partially sold before getting spuriously
+            # ghost-closed and re-adopted, dividing the full historical spend by only the
+            # remaining units re-charges money already recovered — inflating cost basis by
+            # up to 6x in one real incident (HOOFS, 2026-07-02) and causing a phantom
+            # "DOLLAR STOP" loss on a position that was actually profitable.
+            rec_units  = float(rec.get("units") or 0)
+            entry_px   = float(rec.get("price") or 0) or (float(rec.get("usd") or 0) / max(rec_units, 1e-9))
+            symbol     = rec.get("symbol") or mint[:6]
+            entry_ts   = rec.get("ts") or now_utc().isoformat()
+            entry_mode = rec.get("mode") or w.get("mode") or CONFIG["mode"]
+            src        = rec.get("side")
+        else:
+            # No bot trade_log record — a manual purchase (Phantom, etc). The signed
+            # on-chain transaction itself explicitly records what was paid, so pull the
+            # real entry price from that instead of refusing to track a real position.
+            entry_px = _sol_find_receive_price(owner_addr, mint)
+            if entry_px is None:
+                continue   # couldn't find the delivering tx in recent history — leave alone
+            dex = fetch_dexscreener_token(mint)
+            symbol = ((dex or {}).get("pairs") or [{}])[0].get("baseToken", {}).get("symbol") or mint[:6]
+            entry_ts   = now_utc().isoformat()
+            entry_mode = w.get("mode") or CONFIG["mode"]
+            src        = "manual_buy_detected"
+        usd = entry_px * ui
+        avg = entry_px
         w["positions"][symbol] = {
             "chain": "sol", "units": ui, "usd": usd, "avg": avg,
-            "time": rec.get("ts") or now_utc().isoformat(), "address": mint,
+            "time": entry_ts, "address": mint,
             "peak_price": avg, "trough_price": avg,
             "entry_liq": 0, "liq_ticks": [],
-            "deployed_usd": usd, "entry_mode": rec.get("mode") or w.get("mode") or CONFIG["mode"],
+            "deployed_usd": usd, "entry_mode": entry_mode,
             "tp_index": 0,
         }
         w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + usd
         log(f"[W:{wid}] RECONCILE ADOPT {symbol}: {ui:.4f} on-chain tokens from "
-            f"{rec.get('side')} @ {rec.get('ts','')[:19]} — now tracked and exit-managed")
+            f"{src} @ {entry_ts[:19]} — now tracked and exit-managed")
         send_alert(f"🔎 Adopted orphaned tokens: {symbol} (${usd:.2f} buy) — "
                    f"the bot found these in the hot wallet and will manage the exit.")
         changed = True
