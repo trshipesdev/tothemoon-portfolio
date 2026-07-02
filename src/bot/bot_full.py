@@ -7268,8 +7268,13 @@ def scan_candidates():
         # re-buying each successively weaker bounce after the first good catch, ~$5-10
         # each time) has zero protection once that window passes. No expiry — only a
         # real new high (while holding) clears it.
+        # Tolerance tightened 20%→5% same day: BARNEY re-entered 14% below its peak
+        # (inside the old 20% band) and immediately lost money — still clearly the same
+        # lower-high sawtooth pattern as MONK, just a bit closer to the old high. A
+        # rebuy should mean actually reclaiming the previous peak, not just being in
+        # its neighborhood.
         _peak = STATE.get("symbol_peaks", {}).get(symbol, 0)
-        if _peak > 0 and price < _peak * 0.80:
+        if _peak > 0 and price < _peak * 0.95:
             _scout(symbol, chain, "rejected",
                    f"lower high — {(1 - price/_peak)*100:.0f}% below its own session peak "
                    f"(${_peak:.6g} → ${price:.6g})", sc, addr)
