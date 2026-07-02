@@ -7246,6 +7246,7 @@ def scan_candidates():
         STATE["reject_cache"]      = {}   # clear reject cache — tokens get a fresh look each day
         STATE["token_pnl_today"]   = {}   # cumulative PnL per symbol today (loss escalation)
         STATE["symbol_peaks"]      = {}   # highest price seen WHILE HOLDING a position per symbol today (lower-high guard)
+        STATE["candidate_ticks"]   = {}   # rolling recent-price history per address (confirmed-upswing gate)
         STATE["peak_deployed_usd"] = 0.0
         STATE["peak_open_count"]   = 0
         STATE["last_daily_reset"] = today
@@ -7313,6 +7314,18 @@ def scan_candidates():
         addr = c.get("address", "")
         link = _dex_link(chain, addr)
 
+        # Confirmed-upswing tracker: record this candidate's price every scan cycle
+        # (~8s apart), regardless of accept/reject, so entry can check the IMMEDIATE
+        # last few readings — not just a window's net % change. m5/h1/h6 can all read
+        # positive while the token spiked mid-window and has been falling ever since;
+        # buying into that tail is buying the downswing, which is the exact pattern
+        # that kept stopping out immediately (user, 2026-07-02: "the bot keeps buying
+        # on the down swing... I always lose"). Capped at 5 readings (~40s of history).
+        _tick_hist = STATE.setdefault("candidate_ticks", {}).setdefault(addr, [])
+        _tick_hist.append((time.time(), price))
+        if len(_tick_hist) > 5:
+            _tick_hist[:] = _tick_hist[-5:]
+
         # Reject cache: skip re-evaluation unless price has spiked enough since last reject.
         # Saves API calls and stops the scanner from asking the same question 20+ times.
         # TTL: safety flags expire after 8 h; liq/generic flags expire after 2 h.
@@ -7341,6 +7354,22 @@ def scan_candidates():
             _scout(symbol, chain, "rejected",
                    f"at max open positions ({CONFIG.get('max_open_positions', 12)})", sc, addr)
             continue
+        # Confirmed-upswing gate — require the IMMEDIATE recent price direction to
+        # actually be up, not just some window's net % change. A token can show
+        # +m5/+h1/+h6 while its last few ticks are falling from a mid-window spike;
+        # entering there is buying the downswing, which stops out almost instantly
+        # since the position starts underwater from tick one. Exempt on <2 readings
+        # (a token's very first sighting) — the user explicitly wants the earliest
+        # entries caught, so this only blocks re-checks that show active decline,
+        # never a brand-new candidate we have no history on yet.
+        if len(_tick_hist) >= 2:
+            _oldest_recent_px = _tick_hist[0][1]
+            if _oldest_recent_px > 0 and price < _oldest_recent_px:
+                _dip_pct = (price / _oldest_recent_px - 1) * 100
+                _scout(symbol, chain, "rejected",
+                       f"still on the downswing — {_dip_pct:.1f}% over last "
+                       f"{len(_tick_hist)} scans (~{int((time.time()-_tick_hist[0][0]))}s)", sc, addr)
+                continue
         # Lower-high guard — blocks buying a WEAKER bounce than a peak the bot itself
         # already HELD a position through today, no matter how long ago or how many
         # exits happened in between. Deliberately only counts peaks seen while actually
