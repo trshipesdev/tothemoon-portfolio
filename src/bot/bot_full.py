@@ -1509,7 +1509,18 @@ def fetch_positions_prices() -> Dict[str, Dict]:
             by_addr: Dict[str, Dict] = {}
             for pair in pairs:
                 addr = ((pair.get("baseToken") or {}).get("address") or "").lower()
-                if addr and addr not in by_addr:
+                if not addr:
+                    continue
+                # A token can have many pools (ANSEM, 2026-07-02: 30 pairs across
+                # pumpswap/meteora/orca/raydium, four of them long-dead at exactly
+                # $0 liquidity while the real pool held $1.7M). Taking "whichever
+                # pair the API lists first" is a coin flip — that exact ordering
+                # produced a false "RUG liq 1.69M→0" and exited a position that
+                # then ran another +35%. Always keep the pair with the highest
+                # liquidity for a given token address, not just the first one seen.
+                cur_liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+                prev    = by_addr.get(addr)
+                if prev is None or cur_liq > float((prev.get("liquidity") or {}).get("usd") or 0):
                     by_addr[addr] = pair
             for addr, sym in addr_map.items():
                 px = _parse_dex_pair(by_addr[addr]) if addr in by_addr else None
@@ -4639,7 +4650,8 @@ def manage_trusted_coins():
         data = fetch_dexscreener_token(addr)
         if not data or not data.get("pairs"):
             continue
-        p0    = data["pairs"][0]
+        # Highest-liquidity pair, not the first one listed (2026-07-02 ANSEM incident).
+        p0    = max(data["pairs"], key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
         price = float(p0.get("priceUsd") or 0)
         liq   = float((p0.get("liquidity") or {}).get("usd") or 100000.0)
         chain = next((k for k, v in CHAIN_IDS.items() if v == p0.get("chainId", "")), "sol")
@@ -4715,7 +4727,14 @@ def check_reentry_watch():
     by_addr: Dict[str, Dict] = {}
     for pair in pairs:
         addr = ((pair.get("baseToken") or {}).get("address") or "").lower()
-        if addr and addr not in by_addr:
+        if not addr:
+            continue
+        # Highest-liquidity pair wins, not just the first one the API lists —
+        # same reasoning as fetch_positions_prices (2026-07-02, ANSEM: 30 pairs,
+        # several long-dead at $0 liq alongside a real $1.7M pool).
+        cur_liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+        prev    = by_addr.get(addr)
+        if prev is None or cur_liq > float((prev.get("liquidity") or {}).get("usd") or 0):
             by_addr[addr] = pair
 
     to_remove: List[str] = []
@@ -6640,7 +6659,9 @@ def api_wallet_manual_buy(wid):
     if chain == "sol":
         dex = fetch_dexscreener_token(addr)
         if dex and dex.get("pairs"):
-            p0    = dex["pairs"][0]
+            # Highest-liquidity pair, not the first one listed — a token can have
+            # many pools, some long-dead at $0 (2026-07-02 ANSEM incident).
+            p0    = max(dex["pairs"], key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
             price = float(p0.get("priceUsd") or 0)
             liq   = float((p0.get("liquidity") or {}).get("usd") or 0)
     if price <= 0:
@@ -6977,7 +6998,9 @@ def api_buy():
     if (price <= 0 or liq <= 0) and address:
         dex = fetch_dexscreener_token(address)
         if dex and dex.get("pairs"):
-            p0    = dex["pairs"][0]
+            # Highest-liquidity pair, not the first one listed — same reasoning
+            # as the other DexScreener call sites (2026-07-02 ANSEM incident).
+            p0    = max(dex["pairs"], key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
             price = price or float(p0.get("priceUsd") or 0)
             liq   = liq   or float((p0.get("liquidity") or {}).get("usd") or 100000.0)
     if price <= 0:
@@ -8190,7 +8213,8 @@ def scan_candidates():
             data = fetch_dexscreener_token(addr)
             w_price, w_liq, w_chain = 1.0, 100000.0, "sol"
             if data and data.get("pairs"):
-                p0      = data["pairs"][0]
+                # Highest-liquidity pair, not the first one listed (2026-07-02 ANSEM incident).
+                p0      = max(data["pairs"], key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
                 w_price = float(p0.get("priceUsd") or 1.0)
                 w_liq   = float((p0.get("liquidity") or {}).get("usd") or 100000.0)
                 cid     = p0.get("chainId", "solana")
