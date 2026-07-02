@@ -148,17 +148,17 @@
                       x-text="(wallets[wid]?.address || '').slice(0,8) + '…'"></span>
               </div>
               <div class="grid grid-cols-3 gap-2 text-center mb-3">
-                <!-- Hot vault: paper + live SOL -->
+                <!-- Hot wallet equity: chain-synced cash + position value -->
                 <div class="bg-gray-800 rounded-lg p-2">
-                  <div class="text-gray-500 text-xs mb-0.5">Vault</div>
-                  <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.vault_usd ?? 0)"></div>
+                  <div class="text-gray-500 text-xs mb-0.5">Wallet</div>
+                  <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.equity_usd ?? wallets[wid]?.vault_usd ?? 0)"></div>
                   <div class="text-blue-400 text-xs font-mono mt-0.5"
                        x-show="(wallets[wid]?.on_chain_usd ?? 0) > 0"
-                       x-text="'◎ $' + fmt(wallets[wid]?.on_chain_usd ?? 0)"></div>
+                       x-text="'◎ $' + fmt(wallets[wid]?.on_chain_usd ?? 0) + ' cash'"></div>
                 </div>
                 <div class="bg-gray-800 rounded-lg p-2">
                   <div class="text-gray-500 text-xs mb-0.5">In positions</div>
-                  <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.open_pos_usd ?? 0)"></div>
+                  <div class="font-bold text-sm" x-text="'$' + fmt(wallets[wid]?.pos_value_usd ?? wallets[wid]?.open_pos_usd ?? 0)"></div>
                 </div>
                 <!-- Cold wallet: swept + live SOL -->
                 <div class="bg-emerald-950 border border-emerald-800/40 rounded-lg p-2">
@@ -1340,10 +1340,10 @@
           <span x-show="wallets[walletDetail]?.live" class="text-red-400">· live</span>
           <span x-show="!wallets[walletDetail]?.live" class="text-yellow-500">· shadow</span>
         </div>
-        <div class="text-4xl font-bold" x-text="'$' + fmt(wallets[walletDetail]?.vault_usd ?? 0)"></div>
+        <div class="text-4xl font-bold" x-text="'$' + fmt(wallets[walletDetail]?.equity_usd ?? wallets[walletDetail]?.vault_usd ?? 0)"></div>
         <div class="font-mono text-blue-400 text-sm mt-1"
-             x-show="(wallets[walletDetail]?.on_chain_usd ?? 0) > 0"
-             x-text="'◎ $' + fmt(wallets[walletDetail]?.on_chain_usd ?? 0) + ' on-chain'"></div>
+             x-show="wallets[walletDetail]?.live"
+             x-text="'◎ ' + (wallets[walletDetail]?.on_chain_sol ?? 0).toFixed(4) + ' SOL cash ($' + fmt(wallets[walletDetail]?.vault_usd ?? 0) + ') · $' + fmt(wallets[walletDetail]?.pos_value_usd ?? 0) + ' in coins'"></div>
         <div class="mt-2 text-sm">
           <span :class="(wallets[walletDetail]?.net_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'"
                 x-text="((wallets[walletDetail]?.net_pnl ?? 0) >= 0 ? '▲ +$' : '▼ -$') + fmt(Math.abs(wallets[walletDetail]?.net_pnl ?? 0))"></span>
@@ -1357,12 +1357,12 @@
       <!-- ── Stats grid ── -->
       <div class="grid grid-cols-4 gap-2 mb-4 text-center">
         <div class="bg-gray-900 rounded-xl p-3">
-          <div class="text-gray-500 text-xs mb-1">On-chain</div>
+          <div class="text-gray-500 text-xs mb-1">Cash (SOL)</div>
           <div class="font-bold text-sm text-blue-400" x-text="'$' + fmt(wallets[walletDetail]?.on_chain_usd ?? 0)"></div>
         </div>
         <div class="bg-gray-900 rounded-xl p-3">
           <div class="text-gray-500 text-xs mb-1">In positions</div>
-          <div class="font-bold text-sm" x-text="'$' + fmt(wallets[walletDetail]?.open_pos_usd ?? 0)"></div>
+          <div class="font-bold text-sm" x-text="'$' + fmt(wallets[walletDetail]?.pos_value_usd ?? wallets[walletDetail]?.open_pos_usd ?? 0)"></div>
         </div>
         <div class="bg-gray-900 rounded-xl p-3">
           <div class="text-gray-500 text-xs mb-1">Net P&L</div>

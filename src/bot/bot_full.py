@@ -631,20 +631,35 @@ _CHAIN_BAL_CACHE: Dict[str, Dict] = {}   # address -> {usd, sol, ts}  (60s TTL)
 
 
 def _sol_usd_cached() -> float:
-    """Return cached SOL/USD, refreshing from CoinGecko if stale (>60s)."""
+    """Return cached SOL/USD, refreshing if stale (>60s).
+
+    CoinGecko primary, Jupiter 1-SOL→USDC quote as fallback (CoinGecko
+    rate-limits cloud IPs hard). Last good price persists in STATE so a
+    restart never falls back to a hardcoded number while feeds are down.
+    """
     if time.time() - _SOL_USD["ts"] > 60:
+        p = 0.0
         try:
             r = requests.get(
                 "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
                 timeout=5
             ).json()
             p = float(r.get("solana", {}).get("usd") or 0)
-            if p > 0:
-                _SOL_USD["price"] = p
-                _SOL_USD["ts"] = time.time()
         except Exception:
-            pass
-    return _SOL_USD["price"] or 180.0
+            p = 0.0
+        if p <= 0:
+            try:
+                q = _jupiter_get_quote(WSOL_MINT, USDC_MINT_SOL, 10 ** SOL_DECIMALS, 50)
+                p = int((q or {}).get("outAmount") or 0) / 10 ** USDC_DECIMALS
+            except Exception:
+                p = 0.0
+        if p > 0:
+            _SOL_USD["price"] = p
+            _SOL_USD["ts"] = time.time()
+            STATE["sol_usd_last"] = p
+        else:
+            _SOL_USD["ts"] = time.time() - 45   # both feeds down — retry in 15s, not every call
+    return _SOL_USD["price"] or STATE.get("sol_usd_last") or 180.0
 
 
 def _chain_bal_usd(address: str, ttl: float = 60.0) -> Dict:
@@ -2348,26 +2363,32 @@ def _sol_get_all_token_balances(owner_addr: str) -> Dict[str, float]:
 
     ui_amount is already adjusted for token decimals (human-readable units, same scale
     as pos['units']). Uses confirmed commitment to avoid stale reads right after a TX.
+    Queries both the classic SPL Token program and Token-2022 — a Token-2022 mint
+    read as 0 here would ghost-close a real position.
     """
     rpc = _sol_rpc()
+    out: Dict[str, float] = {}
     try:
-        resp = requests.post(rpc, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                owner_addr,
-                {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
-                {"encoding": "jsonParsed", "commitment": "confirmed"},
-            ],
-        }, timeout=15).json()
-        out: Dict[str, float] = {}
-        for acct in resp.get("result", {}).get("value", []):
-            info = (acct.get("account", {}).get("data", {})
-                    .get("parsed", {}).get("info", {}))
-            mint = info.get("mint", "")
-            ui   = float(info.get("tokenAmount", {}).get("uiAmount") or 0)
-            if mint and ui > 0:
-                out[mint] = ui
+        for program_id in ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                           "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"):
+            resp = requests.post(rpc, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    owner_addr,
+                    {"programId": program_id},
+                    {"encoding": "jsonParsed", "commitment": "confirmed"},
+                ],
+            }, timeout=15).json()
+            if "result" not in resp:
+                raise RuntimeError(f"getTokenAccountsByOwner RPC error: {resp.get('error')}")
+            for acct in resp.get("result", {}).get("value", []):
+                info = (acct.get("account", {}).get("data", {})
+                        .get("parsed", {}).get("info", {}))
+                mint = info.get("mint", "")
+                ui   = float(info.get("tokenAmount", {}).get("uiAmount") or 0)
+                if mint and ui > 0:
+                    out[mint] = ui
         return out
     except Exception as e:
         log(f"WARN _sol_get_all_token_balances: {e}")
@@ -2444,13 +2465,21 @@ def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float) -> Di
 
 
 def _fetch_sol_native(address: str) -> float:
-    """Return native SOL balance of an address in SOL."""
+    """Return native SOL balance of an address in SOL.
+
+    Raises on RPC errors instead of returning 0 — callers must never mistake
+    a failed fetch for an empty wallet (a silent 0 here used to poison the
+    balance cache and could zero out vault_usd / false-trigger the hard stop).
+    """
     rpc = _sol_rpc()
     resp = requests.post(rpc, json={
         "jsonrpc": "2.0", "id": 1, "method": "getBalance",
         "params": [address],
     }, timeout=10)
-    return resp.json().get("result", {}).get("value", 0) / 1e9
+    j = resp.json()
+    if "result" not in j:
+        raise RuntimeError(f"getBalance RPC error: {j.get('error')}")
+    return j["result"].get("value", 0) / 1e9
 
 
 def _wlt_init(label: str, starting_usd: float, mode: Optional[str] = None,
@@ -2490,7 +2519,9 @@ def _wlt_init(label: str, starting_usd: float, mode: Optional[str] = None,
 
 def _wlt_deployable(w: Dict) -> float:
     floor_pct = CONFIG.get("absolute_floor_pct", 0.25)
-    if w["vault_usd"] <= w.get("starting_usd", w["vault_usd"]) * floor_pct:
+    # Floor is judged on total equity, not cash — a wallet that's 90% deployed
+    # into positions isn't "at floor", it just has its cash working
+    if _wlt_equity(w) <= w.get("starting_usd", w["vault_usd"]) * floor_pct:
         return 0.0
     reserve = w.get("safety", {}).get("reserve_pct") or CONFIG["reserve_pct"]
     return max(0.0, w["vault_usd"] * (1 - reserve))
@@ -2514,8 +2545,11 @@ def _wlt_size(w: Dict, symbol: str, chain: str, liq: float,
         per_token = CONFIG["per_token_cap_pct"] * dep
         per_chain = CONFIG["per_chain_cap_pct"].get(chain, 0.25) * dep
         base = min(base, per_token, per_chain)
-    # Both paths: limit to remaining cash and dollar_stop safety cap
-    base = min(base, max(0.0, w["vault_usd"] - w.get("cur_deployed_usd", 0.0)))
+    # Both paths: limit to cash on hand (keep ~$3 of SOL for gas) and the
+    # dollar_stop safety cap. vault_usd IS cash — the ledger debits every buy
+    # and the chain sync re-anchors it — so cur_deployed_usd must NOT be
+    # subtracted again here (the old double-subtract silently halved sizing).
+    base = min(base, max(0.0, w["vault_usd"] - 3.0))
     d_stop = _mode_dollar_stop(mode_name)
     mult   = float(w.get("safety", {}).get("dollar_stop_pos_mult") or
                    CONFIG["moonshot"].get("dollar_stop_pos_mult", 4.0))
@@ -2688,8 +2722,8 @@ def _wallet_drawdown_check(wid: str, w: Dict):
               let existing open positions run to their own exits. Once all positions
               are closed, fully deactivate the wallet and send a final Telegram alert.
 
-    Equity = vault_usd + open position cost basis (so unrealized losses count).
-    Alerts auto-reset if equity recovers back toward starting_usd.
+    Equity = chain-synced cash + position market value when fresh (so unrealized
+    losses actually count); fallback is ledger cash + open cost basis.
     """
     if not w.get("live"):
         return
@@ -2711,10 +2745,10 @@ def _wallet_drawdown_check(wid: str, w: Dict):
         log(f"[W:{wid}] FULLY PAUSED — all positions closed, wallet deactivated")
         return
 
-    # Total equity: cash in vault + cost basis of every open position
-    equity   = w.get("vault_usd", 0) + sum(
-        p.get("usd", 0) for p in open_pos.values()
-    )
+    # Total equity — chain-synced when fresh. NOTE: never add position value on
+    # top of a synced equity figure; the old code double-counted positions here,
+    # which understated drawdown and let the $50/$100 stops fire late.
+    equity   = _wlt_equity(w)
     drawdown = start - equity   # positive = cumulative loss from deposit
     alerted  = w.setdefault("dd_alerted", {})
 
@@ -2785,31 +2819,65 @@ def _wallet_drawdown_check(wid: str, w: Dict):
 
 
 def _wlt_sync_vault(wid: str, w: Dict, live_prices: Dict):
-    """Auto-correct vault_usd to on-chain SOL balance + open position values.
+    """Re-anchor wallet accounting to on-chain truth so the dashboard matches Phantom.
 
-    Runs every 30s so the dashboard always reflects reality regardless of
-    ghost trades, manual sells, or any accounting drift.
+    Semantics (must stay consistent with the trade ledger, which debits buys
+    and credits sells from vault_usd):
+      vault_usd        = on-chain native SOL in USD  (cash)
+      cur_deployed_usd = market value of open positions
+      equity_usd       = cash + positions — the total Phantom shows
+
+    Runs every 10s. Ghost trades, manual sells, gas and slippage drift all
+    self-correct on the next tick.
     """
     addr = w.get("address", "")
     if not addr:
         return
-    bal = _chain_bal_usd(addr, ttl=25.0)
-    sol_usd = bal.get("usd", 0.0)
-    if sol_usd <= 0:
-        return
+    bal = _chain_bal_usd(addr, ttl=8.0)
+    if bal.get("ts", 0) <= 0:
+        return   # RPC failed and nothing cached — keep ledger values, never write zeros
+    sol_usd   = bal.get("usd", 0.0)
     pos_value = sum(
         pos.get("units", 0) * (live_prices.get(sym, {}).get("price") or pos.get("avg", 0))
         for sym, pos in w.get("positions", {}).items()
         if pos.get("units", 0) > 0
     )
-    new_vault = round(sol_usd + pos_value, 2)
-    new_deployed = round(pos_value, 2)
-    if abs(new_vault - w.get("vault_usd", 0)) > 0.50:
-        log(f"[W:{wid}] VAULT SYNC ${w.get('vault_usd',0):.2f}→${new_vault:.2f} "
-            f"(on-chain ${sol_usd:.2f} + positions ${pos_value:.2f})")
-        w["vault_usd"] = new_vault
-        w["cur_deployed_usd"] = new_deployed
+    equity  = round(sol_usd + pos_value, 2)
+    changed = (abs(sol_usd - w.get("vault_usd", 0)) > 0.50
+               or abs(equity - w.get("equity_usd", equity + 1)) > 0.50)
+    if abs(sol_usd - w.get("vault_usd", 0)) > 0.50:
+        log(f"[W:{wid}] VAULT SYNC cash ${w.get('vault_usd',0):.2f}→${sol_usd:.2f} "
+            f"(+ positions ${pos_value:.2f} = equity ${equity:.2f})")
+        w["vault_usd"] = round(sol_usd, 2)
+    w["cur_deployed_usd"] = round(pos_value, 2)
+    w["equity_usd"]       = equity
+    w["equity_ts"]        = time.time()
+    w["on_chain_sol"]     = bal.get("sol", 0.0)
+    if changed:
         save_state()
+
+
+def _wlt_equity(w: Dict) -> float:
+    """Total wallet equity. Live wallets: the chain-synced figure (cash +
+    position market value) when fresh; fallback is ledger cash + open cost basis."""
+    if w.get("live") and time.time() - w.get("equity_ts", 0) < 120:
+        return w.get("equity_usd", 0.0)
+    return w.get("vault_usd", 0.0) + sum(
+        p.get("usd", 0) for p in w.get("positions", {}).values() if p.get("units", 0) > 0)
+
+
+def _wlt_periodic_chain_sync(wid: str, w: Dict, live_prices: Dict):
+    """Chain-truth heartbeat for a live wallet: vault/equity re-anchor every 10s,
+    on-chain token reconcile every 30s. Called every engine tick for EVERY live
+    wallet with an address — even with zero open positions or while paused — so
+    the dashboard never freezes on stale numbers."""
+    now = time.time()
+    if now - w.get("_last_vault_sync_ts", 0) >= 10:
+        _wlt_sync_vault(wid, w, live_prices)
+        w["_last_vault_sync_ts"] = now
+    if now - w.get("_last_reconcile_ts", 0) >= 30:
+        _wlt_reconcile_positions(wid, w)
+        w["_last_reconcile_ts"] = now
 
 
 def _wlt_reconcile_positions(wid: str, w: Dict):
@@ -2871,13 +2939,6 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
     """Run the exit loop for one wallet's open positions using its mode's params."""
     MS        = CONFIG["moonshot"]
     liq_prev  = w.setdefault("liq_prev", {})
-
-    # Periodic on-chain sync for live wallets — reconcile positions + correct vault_usd
-    if w.get("live") and w.get("address"):
-        if time.time() - w.get("_last_reconcile_ts", 0) >= 30:
-            _wlt_reconcile_positions(wid, w)
-            _wlt_sync_vault(wid, w, live_prices)
-            w["_last_reconcile_ts"] = time.time()
 
     for symbol, pos in list(w.get("positions", {}).items()):
         if pos.get("units", 0) <= 0:
@@ -5513,11 +5574,18 @@ def api_wallets_list():
         wins     = [t for t in sells if (t.get("pnl") or 0) > 0]
         net_pnl  = sum(t.get("pnl") or 0 for t in sells)
         floor_pct    = CONFIG.get("absolute_floor_pct", 0.25)
-        at_floor     = w.get("vault_usd", 0) <= w.get("starting_usd", 1) * floor_pct
         hot_addr     = w.get("address", "")
         cold_addr    = (w.get("sweep_address") or os.getenv("SWEEP_SOL_ADDRESS", "")).strip()
-        on_chain     = _chain_bal_usd(hot_addr).get("usd", 0.0) if hot_addr else 0.0
+        on_chain     = _chain_bal_usd(hot_addr, ttl=15.0).get("usd", 0.0) if hot_addr else 0.0
         cold_on_chain = _chain_bal_usd(cold_addr) if cold_addr else {}
+        # Equity + position market value: chain-synced for live wallets, ledger otherwise
+        if w.get("live") and time.time() - w.get("equity_ts", 0) < 120:
+            equity    = w.get("equity_usd", 0.0)
+            pos_value = w.get("cur_deployed_usd", 0.0)
+        else:
+            pos_value = sum(p.get("usd", 0) for p in open_pos.values())
+            equity    = w.get("vault_usd", 0) + pos_value
+        at_floor     = equity <= w.get("starting_usd", 1) * floor_pct
         result[wid] = {
             "wid":          wid,
             "label":        w.get("label", wid),
@@ -5544,6 +5612,10 @@ def api_wallets_list():
             "total_swept_usd": round(w.get("total_swept_usd", 0.0), 2),
             "sweep_log":       (w.get("sweep_log") or [])[-20:],
             "on_chain_usd":    round(on_chain, 2),
+            "equity_usd":      round(equity, 2),
+            "pos_value_usd":   round(pos_value, 2),
+            "equity_ts":       w.get("equity_ts", 0),
+            "on_chain_sol":    round(w.get("on_chain_sol", 0.0), 6),
             "cold_balance_usd": round(cold_on_chain.get("usd", 0.0), 2),
             "cold_balance_sol": round(cold_on_chain.get("sol", 0.0), 6),
         }
@@ -7251,8 +7323,12 @@ def manage_positions():
         if p.get("units", 0) > 0 and time.time() - entry_ts >= CONFIG["autoscale"]["grace_sec"]:
             autoscale_maybe(s, p["chain"], price, liq, velocity_ok=(price > p["avg"]))
 
-    # Run the exit loop for each additional wallet
+    # Chain-truth sync runs for every live wallet unconditionally — the old
+    # positions-gated placement froze the dashboard whenever the wallet was flat
     for _wid, _wlt in STATE.get("wallets", {}).items():
+        if _wlt.get("live") and _wlt.get("address"):
+            _wlt_periodic_chain_sync(_wid, _wlt, live_prices)
+        # Run the exit loop for each additional wallet
         if _wlt.get("active") and _wlt.get("positions"):
             _manage_wallet_positions(_wid, _wlt, live_prices)
 
