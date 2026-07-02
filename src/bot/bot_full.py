@@ -2176,11 +2176,13 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
             # Accumulate per-token daily losses so repeated small losses escalate cooldowns.
             t_pnl = STATE.setdefault("token_pnl_today", {})
             t_pnl[symbol] = t_pnl.get(symbol, 0.0) + pnl
+            send_alert(f"🚫 {symbol} on cooldown (paper loss ${pnl:+.2f}) [{exit_reason}]",
+                       critical=True)
         if pnl <= -30:
             send_alert(
-                f"🚨 HARD STOP ${symbol} — lost ${abs(pnl):.0f} on this trade. "
+                f"🚨 HARD STOP ${symbol} — lost ${abs(pnl):.0f} on this trade (paper). "
                 f"Blacklisting for 4 hours to prevent re-entry.",
-                paper=True
+                critical=True
             )
             STATE.setdefault("reject_cache", {})[symbol] = {
                 "ts":        time.time(),
@@ -2359,13 +2361,18 @@ def _sol_confirm_tx(sig: str, max_wait: int = 30):
     raise RuntimeError(f"tx not confirmed within {max_wait}s")
 
 
-def _sol_get_all_token_balances(owner_addr: str) -> Dict[str, float]:
+def _sol_get_all_token_balances(owner_addr: str) -> Optional[Dict[str, float]]:
     """Return {mint: ui_amount} for all non-zero SPL token accounts owned by owner_addr.
 
     ui_amount is already adjusted for token decimals (human-readable units, same scale
     as pos['units']). Uses confirmed commitment to avoid stale reads right after a TX.
     Queries both the classic SPL Token program and Token-2022 — a Token-2022 mint
     read as 0 here would ghost-close a real position.
+
+    Returns None on RPC failure — NEVER {} — so callers can tell "the query failed"
+    apart from "the wallet genuinely holds nothing." Conflating the two used to make
+    a transient RPC hiccup look like "the wallet is empty," spuriously ghost-closing
+    every open position (see _wlt_reconcile_positions).
     """
     rpc = _sol_rpc()
     out: Dict[str, float] = {}
@@ -2393,7 +2400,7 @@ def _sol_get_all_token_balances(owner_addr: str) -> Dict[str, float]:
         return out
     except Exception as e:
         log(f"WARN _sol_get_all_token_balances: {e}")
-        return {}
+        return None
 
 
 def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict:
@@ -2421,7 +2428,7 @@ def _wlt_live_buy(wid: str, w: Dict, symbol: str, usd: float, addr: str) -> Dict
         out_units = 0.0
         for delay in (1, 2, 3, 4):
             time.sleep(delay)
-            out_units = _sol_get_all_token_balances(str(kp.pubkey())).get(addr, 0.0)
+            out_units = (_sol_get_all_token_balances(str(kp.pubkey())) or {}).get(addr, 0.0)
             if out_units > 0:
                 break
         if out_units <= 0:
@@ -2467,7 +2474,7 @@ def _wlt_live_sell(wid: str, w: Dict, pos: Dict, usd: float, price: float,
         base_mint, base_dec = _wlt_base_mint(w)
         tok_dec    = _sol_token_decimals(addr)
         pos_units  = pos.get("units", 0)
-        chain_units = _sol_get_all_token_balances(str(kp.pubkey())).get(addr)
+        chain_units = (_sol_get_all_token_balances(str(kp.pubkey())) or {}).get(addr)
         if chain_units is not None and 0 < chain_units < pos_units:
             pos_units = chain_units
         frac       = min(1.0, usd / max(pos_units * price, 1e-9))
@@ -2729,6 +2736,10 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
             STATE.setdefault("recently_exited", {})[symbol] = {
                 "ts": time.time(), "price": price, "pnl": pnl, "source": f"wallet:{wid}",
             }
+            cd_min = int(CONFIG["moonshot"].get("loss_cooldown_min") or 30)
+            send_alert(
+                f"🚫 {symbol} blocked from re-entry ~{cd_min}min — real loss ${pnl:+.2f} "
+                f"on {w.get('label', wid)} [{exit_reason}]", critical=True)
         w.setdefault("liq_prev", {}).pop(symbol, None)
 
     w.setdefault("pnl_hist", []).append(pnl)
@@ -2937,6 +2948,8 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
         return
 
     balances = _sol_get_all_token_balances(owner_addr)
+    if balances is None:
+        return   # RPC failed this cycle — do NOT treat that as "wallet is empty"
     changed  = False
     now_ts   = time.time()
 
@@ -2989,8 +3002,16 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
         if not rec:
             continue   # not a bot purchase (user's own token) — leave it alone
         symbol = rec.get("symbol") or mint[:6]
-        usd    = float(rec.get("usd") or 0)
-        avg    = usd / ui if ui > 0 else 0.0
+        # Use the TRUE original per-unit entry price, not (original total $) / (units
+        # left now). If this token was already partially sold before getting spuriously
+        # ghost-closed and re-adopted, dividing the full historical spend by only the
+        # remaining units re-charges money already recovered — inflating cost basis by
+        # up to 6x in one real incident (HOOFS, 2026-07-02) and causing a phantom
+        # "DOLLAR STOP" loss on a position that was actually profitable.
+        rec_units = float(rec.get("units") or 0)
+        entry_px  = float(rec.get("price") or 0) or (float(rec.get("usd") or 0) / max(rec_units, 1e-9))
+        usd       = entry_px * ui
+        avg       = entry_px
         w["positions"][symbol] = {
             "chain": "sol", "units": ui, "usd": usd, "avg": avg,
             "time": rec.get("ts") or now_utc().isoformat(), "address": mint,
@@ -5280,6 +5301,7 @@ def api_set_mode():
     m = (flask_request.get_json() or {}).get("mode", "")
     if m not in CONFIG["modes"]:
         return jsonify({"error": "invalid mode"}), 400
+    old_mode = CONFIG["mode"]
     CONFIG["mode"] = m
     STATE["active_mode"] = m   # persist so restarts don't revert to BOT_MODE env
     # If switching to a custom mode, apply its stored global params too
@@ -5287,6 +5309,7 @@ def api_set_mode():
     if custom:
         _apply_custom_mode_globals(custom)
     save_state()
+    send_alert(f"🎛️ Mode changed: {old_mode} → {m} (dashboard)", critical=True)
     return jsonify({"ok": True, "mode": m})
 
 
@@ -5344,6 +5367,7 @@ def api_save_custom_mode():
     STATE.setdefault("custom_modes", {})[name] = params
     _register_custom_mode(name, params)
     save_state()
+    send_alert(f"🎛️ Custom mode saved: '{name}' (dashboard)", critical=True)
     return jsonify({"ok": True, "name": name})
 
 
@@ -5358,6 +5382,7 @@ def api_delete_custom_mode(name):
     if CONFIG["mode"] == name:
         CONFIG["mode"] = "hype"
     save_state()
+    send_alert(f"🎛️ Custom mode deleted: '{name}' (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
@@ -5390,6 +5415,7 @@ def api_mode_push():
 
     save_state()
     log(f"PUSH mode '{mode}': {updated}")
+    send_alert(f"🎛️ Mode '{mode}' tuned (dashboard): {updated}", critical=True)
     return jsonify({"ok": True, "mode": mode, "updated": updated})
 
 
@@ -5432,6 +5458,7 @@ def api_arena_reset(name):
     arenas = STATE.setdefault("arenas", {})
     arenas.pop(name, None)
     save_state()
+    send_alert(f"🎛️ Arena '{name}' reset (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
@@ -5537,6 +5564,7 @@ def api_reset_brake():
         w["pnl_hist"] = []
     save_state()
     log("MANUAL: drawdown brake reset — pnl_hist cleared on main bot + all wallets")
+    send_alert("🎛️ Drawdown brake reset (dashboard)", critical=True)
     return jsonify({"ok": True, "msg": "Drawdown brake cleared"})
 
 
@@ -5549,6 +5577,7 @@ def api_reset_cooldowns():
         w["recently_exited"] = {}
     save_state()
     log("MANUAL: all loss cooldowns cleared (main bot + wallets)")
+    send_alert("🎛️ All token cooldowns cleared (dashboard)", critical=True)
     return jsonify({"ok": True, "msg": "All cooldowns cleared"})
 
 
@@ -5562,6 +5591,7 @@ def api_wallet_reset_cooldowns(wid):
     w["recently_exited"] = {}
     save_state()
     log(f"MANUAL: cooldowns cleared for wallet {w.get('label', wid)}")
+    send_alert(f"🎛️ Cooldowns cleared for {w.get('label', wid)} (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
@@ -5584,6 +5614,7 @@ def api_wallets_bulk():
             STATE["reject_cache"] = {}
         save_state()
         log("MANUAL: all cooldowns + entry caps cleared (bulk)")
+        send_alert(f"🎛️ Bulk: {action} — all wallets (dashboard)", critical=True)
         return jsonify({"ok": True, "action": action})
 
     if action == "clear_entry_caps":
@@ -5595,12 +5626,14 @@ def api_wallets_bulk():
             w["entries_today"] = {}
         save_state()
         log("MANUAL: entry caps + loss tallies reset (bulk)")
+        send_alert(f"🎛️ Bulk: {action} — all wallets (dashboard)", critical=True)
         return jsonify({"ok": True, "action": action})
 
     if action == "clear_reject_cache":
         STATE["reject_cache"] = {}
         save_state()
         log("MANUAL: reject cache cleared — all tokens get a fresh look")
+        send_alert("🎛️ Bulk: reject cache cleared — all tokens get a fresh look (dashboard)", critical=True)
         return jsonify({"ok": True, "action": action})
 
     if action == "set_mode":
@@ -5611,6 +5644,7 @@ def api_wallets_bulk():
             w["mode"] = mode
         save_state()
         log(f"MANUAL: all wallet modes set to '{mode}' (bulk)")
+        send_alert(f"🎛️ Bulk: all wallet modes set to '{mode}' (dashboard)", critical=True)
         return jsonify({"ok": True, "action": action, "mode": mode})
 
     return jsonify({"error": f"unknown action '{action}'"}), 400
@@ -5630,11 +5664,13 @@ def api_reset_vault_floor():
         w["starting_usd"] = w["vault_usd"]
         save_state()
         log(f"MANUAL: vault floor reset for {w.get('label', wid)} → starting_usd={w['vault_usd']:.2f}")
+        send_alert(f"🎛️ Vault floor reset for {w.get('label', wid)} → ${w['vault_usd']:.2f} (dashboard)", critical=True)
         return jsonify({"ok": True, "new_floor": w["vault_usd"] * 0.25})
     else:
         STATE["vault_start"] = STATE["vault_usd"]
         save_state()
         log(f"MANUAL: main-bot vault floor reset → vault_start={STATE['vault_usd']:.2f}")
+        send_alert(f"🎛️ Main-bot vault floor reset → ${STATE['vault_usd']:.2f} (dashboard)", critical=True, paper=True)
         return jsonify({"ok": True, "new_floor": STATE["vault_usd"] * 0.25})
 
 
@@ -5714,6 +5750,7 @@ def api_wallets_create():
     STATE.setdefault("wallets", {})[wid] = _wlt_init(label, starting_usd, mode, address)
     save_state()
     log(f"Wallet created: {wid} '{label}' ${starting_usd} mode={mode or 'global'}")
+    send_alert(f"🎛️ Wallet created: '{label}' ${starting_usd:.0f} (dashboard)", critical=True)
     return jsonify({"wid": wid}), 201
 
 
@@ -5724,29 +5761,44 @@ def api_wallet_update(wid):
     if not w:
         return jsonify({"error": "not found"}), 404
     data = flask_request.get_json() or {}
+    label = w.get("label", wid)
+    was_active = w.get("active", True)
     if "label" in data:
         w["label"]   = str(data["label"])[:40]
     if "mode" in data:
         m = data["mode"]
+        old_wallet_mode = w.get("mode")
         w["mode"] = m if (m and m in CONFIG["modes"]) else None
+        if w["mode"] != old_wallet_mode:
+            send_alert(f"🎛️ {label}: mode → {w['mode'] or 'global default'} (dashboard)", critical=True)
     if "active" in data:
         w["active"]   = bool(data["active"])
         if w["active"]:
             w.pop("paused_new_entries", None)   # re-enable clears hard-stop block
+        if w["active"] != was_active:
+            send_alert(f"{'▶️ RESUMED' if w['active'] else '⏸️ PAUSED'} {label} (dashboard)", critical=True)
+    _other_changed = []
     if "address" in data:
         w["address"] = str(data["address"]).strip()
+        _other_changed.append("address")
     if "starting_usd" in data:
         w["starting_usd"] = float(data["starting_usd"])
+        _other_changed.append("starting_usd")
     if "sweep_address" in data:
         w["sweep_address"] = str(data["sweep_address"]).strip()
+        _other_changed.append("sweep_address")
     if "base_currency" in data and data["base_currency"] in ("sol", "usdc"):
         w["base_currency"] = data["base_currency"]
+        _other_changed.append("base_currency")
     if "ticket_cap_usd" in data:
         cap = float(data["ticket_cap_usd"])
         w["ticket_cap_usd"] = max(0.0, cap)
+        _other_changed.append(f"ticket_cap_usd=${cap:.0f}")
     if "entry_prob" in data:
         w["entry_prob"] = max(0.0, min(1.0, float(data["entry_prob"])))
+        _other_changed.append("entry_prob")
     if "safety" in data and isinstance(data["safety"], dict):
+        _other_changed.append(f"safety={data['safety']}")
         sf = w.setdefault("safety", {})
         allowed = {"dollar_stop_usd", "dollar_stop_pos_mult", "velocity_m5_pct",
                    "rug_liq_drop_pct", "liq_drain_pct", "reserve_pct", "drawdown_brake"}
@@ -5791,6 +5843,12 @@ def api_wallet_update(wid):
             w["vault_snaps"]     = []
             w["positions"]       = {}
             log(f"[W:{wid}] RESET — going live, shadow history cleared")
+            send_alert(f"🔴 {label} is now LIVE — real money (${actual_balance:.2f}) (dashboard)",
+                       critical=True)
+        elif want_live != was_live:
+            send_alert(f"🟡 {label} switched back to shadow mode (dashboard)", critical=True)
+    if _other_changed:
+        send_alert(f"🎛️ {label}: {', '.join(_other_changed)} (dashboard)", critical=True)
     save_state()
     return jsonify({"ok": True})
 
@@ -5804,8 +5862,10 @@ def api_wallet_delete(wid):
     open_pos = [s for s, p in w.get("positions", {}).items() if p.get("units", 0) > 0]
     if open_pos:
         return jsonify({"error": f"close positions first: {open_pos}"}), 400
+    label = w.get("label", wid)
     STATE["wallets"].pop(wid, None)
     save_state()
+    send_alert(f"🎛️ Wallet deleted: '{label}' (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
@@ -5881,6 +5941,8 @@ def api_wallet_test_trade(wid):
         net = round(sell.get("proceeds", 0) - usd, 4)
 
     log(f"[W:{wid}] TEST TRADE {symbol} buy={buy.get('sig','')[:16]}… sell={sell.get('sig','')[:16]}… net=${net}")
+    send_alert(f"🧪 Test trade on {w.get('label', wid)}: {symbol} — real net ${net} (dashboard)",
+               critical=True)
     return jsonify({
         "ok":      "error" not in sell,
         "symbol":  symbol,
@@ -6036,7 +6098,10 @@ def api_opportunity_audit():
 @app.route("/api/shadow", methods=["POST"])
 @_dash_auth
 def api_set_shadow():
+    old = SHADOW_MODE
     set_shadow_mode(bool((flask_request.get_json() or {}).get("enabled", True)))
+    if SHADOW_MODE != old:
+        send_alert(f"🎛️ Main bot SHADOW_MODE: {old} → {SHADOW_MODE} (dashboard)", critical=True)
     return jsonify({"ok": True, "shadow_mode": SHADOW_MODE})
 
 
@@ -6046,15 +6111,22 @@ def api_set_moonshot():
     m = (flask_request.get_json() or {}).get("mode", "")
     if m not in ("enter", "suggest"):
         return jsonify({"error": "invalid mode"}), 400
+    old_m = CONFIG["moonshot"]["mode"]
     CONFIG["moonshot"]["mode"] = m
     STATE["moonshot_mode"] = m   # persist across restarts
+    if m != old_m:
+        send_alert(f"🎛️ Moonshot mode: {old_m} → {m} (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
 @app.route("/api/auto_old", methods=["POST"])
 @_dash_auth
 def api_set_auto_old():
+    old = CONFIG["oldcoin"]["auto_join"]
     CONFIG["oldcoin"]["auto_join"] = bool((flask_request.get_json() or {}).get("enabled", False))
+    if CONFIG["oldcoin"]["auto_join"] != old:
+        send_alert(f"🎛️ Auto-join old pumps: {'ON' if CONFIG['oldcoin']['auto_join'] else 'OFF'} (dashboard)",
+                   critical=True)
     return jsonify({"ok": True})
 
 
@@ -6069,6 +6141,7 @@ def api_set_boost():
     expires = (now_utc() + timedelta(hours=hours)).isoformat()
     STATE["boost"] = {"mult": mult, "expires": expires}
     save_state()
+    send_alert(f"🎛️ Boost {mult}x for {hours}h, until {expires[:16]} (dashboard)", critical=True)
     return jsonify({"ok": True, "expires": expires})
 
 
@@ -6081,6 +6154,7 @@ def api_set_spray():
         datetime.fromisoformat(until)
     STATE["spray_until"] = until
     save_state()
+    send_alert(f"🎛️ Spray mode: {'ON until ' + until if until else 'OFF'} (dashboard)", critical=True)
     return jsonify({"ok": True, "spray_until": until})
 
 
@@ -6091,12 +6165,14 @@ def api_set_objective():
     kind  = data.get("kind", "off")
     if kind == "off":
         CONFIG["objective"]["kind"] = "off"
+        send_alert("🎛️ Objective turned off (dashboard)", critical=True)
         return jsonify({"ok": True})
     target = float(data.get("target_usd", 0))
     weeks  = int(data.get("weeks", 0))
     if target <= 0 or weeks <= 0:
         return jsonify({"error": "target_usd and weeks required"}), 400
     start_objective(target, weeks)
+    send_alert(f"🎛️ Objective set: ${target:.0f} in {weeks}w (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
@@ -6125,6 +6201,8 @@ def api_buy():
         liq = 100000.0
     res = exec_buy(symbol, chain, usd, price, liq, address)
     save_state()
+    send_alert(f"🎛️ Manual paper buy: {symbol} ${usd:.2f} @ {price:.6f} (dashboard)",
+               critical=True, paper=True)
     return jsonify(res)
 
 
@@ -6146,6 +6224,8 @@ def api_sell():
         return jsonify({"error": "nothing to sell"}), 400
     res = exec_sell(symbol, sell_usd, price, liq)
     save_state()
+    send_alert(f"🎛️ Manual paper sell: {symbol} {amount} @ {price:.6f} (dashboard)",
+               critical=True, paper=True)
     return jsonify(res)
 
 
@@ -6162,6 +6242,8 @@ def api_close():
     liq   = px["liq"]
     res   = exec_sell(symbol, pos["usd"], price, liq)
     save_state()
+    send_alert(f"🎛️ Manual paper close: {symbol} @ {price:.6f} (dashboard)",
+               critical=True, paper=True)
     return jsonify(res)
 
 
@@ -6176,8 +6258,10 @@ def api_position_tp():
         return jsonify({"error": "position not found"}), 404
     if tp is None:
         pos.pop("tp_override", None)
+        send_alert(f"🎛️ {symbol}: TP override cleared (dashboard)", critical=True)
     else:
         pos["tp_override"] = [float(x) for x in tp]
+        send_alert(f"🎛️ {symbol}: TP override set to {pos['tp_override']} (dashboard)", critical=True)
     save_state()
     return jsonify({"ok": True})
 
@@ -6193,8 +6277,10 @@ def api_position_sl():
         return jsonify({"error": "position not found"}), 404
     if sl is None:
         pos.pop("sl_override", None)
+        send_alert(f"🎛️ {symbol}: SL override cleared (dashboard)", critical=True)
     else:
         pos["sl_override"] = float(sl)
+        send_alert(f"🎛️ {symbol}: SL override set to {pos['sl_override']} (dashboard)", critical=True)
     save_state()
     return jsonify({"ok": True})
 
@@ -6208,14 +6294,16 @@ def api_watchlist_add():
     if not symbol or not address:
         return jsonify({"error": "symbol and address required"}), 400
     CONFIG["oldcoin"]["watchlist"][symbol] = address
+    send_alert(f"🎛️ Watchlist: added {symbol} (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
 @app.route("/api/watchlist/remove", methods=["POST"])
 @_dash_auth
 def api_watchlist_remove():
-    CONFIG["oldcoin"]["watchlist"].pop(
-        (flask_request.get_json() or {}).get("symbol", "").upper().strip(), None)
+    sym = (flask_request.get_json() or {}).get("symbol", "").upper().strip()
+    CONFIG["oldcoin"]["watchlist"].pop(sym, None)
+    send_alert(f"🎛️ Watchlist: removed {sym} (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
@@ -6228,15 +6316,19 @@ def api_config_oldcoin():
             CONFIG["oldcoin"][key] = float(data[key])
     if "auto_join" in data:
         CONFIG["oldcoin"]["auto_join"] = bool(data["auto_join"])
+    send_alert(f"🎛️ Oldcoin config updated: {data} (dashboard)", critical=True)
     return jsonify({"ok": True})
 
 
 @app.route("/api/skim", methods=["POST"])
 @_dash_auth
 def api_skim():
+    old = STATE.get("skim", {}).get("enabled", False)
     enabled = bool((flask_request.get_json() or {}).get("enabled", False))
     STATE.setdefault("skim", {})["enabled"] = enabled
     save_state()
+    if enabled != old:
+        send_alert(f"🎛️ Profit skim: {'ON' if enabled else 'OFF'} (dashboard)", critical=True)
     return jsonify({"ok": True, "skim_enabled": enabled})
 
 
@@ -6256,6 +6348,7 @@ def api_doge():
             return jsonify({"error": "exit_band must be 0 < lo < hi"}), 400
     if "floor" in data:
         spec["floor"] = float(data["floor"])
+    send_alert(f"🎛️ DOGE trusted-coin config updated: {data} (dashboard)", critical=True)
     return jsonify({"ok": True, "doge": spec})
 
 
@@ -6307,6 +6400,7 @@ def api_config():
         CONFIG["moonshot"]["dynamic_sizing"] = bool(data["dynamic_sizing"])
     if "blacklist" in data and isinstance(data["blacklist"], list):
         CONFIG["blacklist"] = [str(x).strip() for x in data["blacklist"] if str(x).strip()]
+    send_alert(f"🎛️ Config updated (dashboard): {list(data.keys())}", critical=True)
     return jsonify({"ok": True})
 
 
@@ -6395,6 +6489,7 @@ def api_import():
         return jsonify({"error": "expected a JSON object"}), 400
     STATE.update(patch)
     save_state()
+    send_alert(f"⚠️ Raw state import applied (dashboard) — keys: {list(patch.keys())}", critical=True)
     return jsonify({"ok": True, "keys": list(patch.keys())})
 
 
@@ -6410,6 +6505,8 @@ def api_ai_config():
         CONFIG["ai"]["interval_min"] = max(1, int(data["interval_min"]))
     if "min_confidence" in data:
         CONFIG["ai"]["min_confidence"] = max(0.0, min(1.0, float(data["min_confidence"])))
+    send_alert(f"🎛️ AI autopilot: enabled={CONFIG['ai']['enabled']} "
+               f"auto_apply={CONFIG['ai']['auto_apply']} (dashboard)", critical=True)
     return jsonify({"ok": True, "ai": CONFIG["ai"], "key_set": bool(os.getenv(ANTHROPIC_KEY_ENV))})
 
 
@@ -6420,6 +6517,7 @@ def api_ai_run():
     decision = ai_advise(force=True)
     if decision is None:
         return jsonify({"error": "AI unavailable — check ANTHROPIC_API_KEY and that `anthropic` is installed"}), 400
+    send_alert(f"🎛️ AI advisory forced from dashboard: {decision}", critical=True)
     return jsonify({"ok": True, "decision": decision})
 
 
@@ -6428,6 +6526,7 @@ def api_ai_run():
 def api_restart():
     """Flush state and exit; Docker (restart=unless-stopped) brings it back."""
     save_state()
+    send_alert("🔄 Bot restarting (dashboard)", critical=True)
     def _reboot():
         time.sleep(0.3)
         os._exit(0)
@@ -7084,7 +7183,7 @@ def scan_candidates():
                 log(f"PRESALE GATE {symbol}: score {ps} < {ps_threshold}, suggest only")
                 send_alert(
                     f"⚠️ SKIPPED {symbol} ({chain}) — a brand-new token with no social buzz or "
-                    f"audit yet (safety score {ps}/100). Too unproven to buy; just watching.\n{link}", paper=True)
+                    f"audit yet (safety score {ps}/100). Too unproven to buy; just watching.\n{link}")
                 _scout(symbol, chain, "rejected", f"presale score {ps} < {ps_threshold} (no social/audit signal)", sc, addr)
                 continue
             # Scam / rug safety gate — on-chain rug checks
@@ -7093,7 +7192,7 @@ def scan_candidates():
                 log(f"SAFETY GATE {symbol}: {why}")
                 send_alert(
                     f"🛡️ SKIPPED {symbol} ({chain}) — {why}. The bot steered clear to protect you "
-                    f"from a likely scam/rug.\n{link}", paper=True)
+                    f"from a likely scam/rug.\n{link}")
                 _scout(symbol, chain, "rejected", f"safety: {why}", sc, addr)
                 continue
             if CONFIG["moonshot"]["mode"] == "enter":
@@ -7133,7 +7232,7 @@ def scan_candidates():
                 log(f"SUGGEST {symbol} new launch (mode=suggest) [ps:{ps}]")
                 send_alert(
                     f"👀 SPOTTED {symbol} ({chain}) — a new launch that passed the safety filters. "
-                    f"The bot is in 'suggest' mode, so it's flagging it for you instead of auto-buying.\n{link}", paper=True)
+                    f"The bot is in 'suggest' mode, so it's flagging it for you instead of auto-buying.\n{link}")
                 _scout(symbol, chain, "suggested", f"passed filters, ps {ps} (moonshot mode = suggest)", sc, addr)
         else:
             if detect_oldcoin_pump(symbol, CONFIG["oldcoin"]["volume_x"], CONFIG["oldcoin"]["mentions_x"]):
@@ -7151,12 +7250,12 @@ def scan_candidates():
                         log(f"ALERT old pump {symbol} (cap too small)")
                         send_alert(
                             f"⚡ {symbol} ({chain}) is pumping (volume spiking) but your caps are full, "
-                            f"so the bot can't join. Heads-up only.\n{link}", paper=True)
+                            f"so the bot can't join. Heads-up only.\n{link}")
                 else:
                     log(f"ALERT old pump {symbol}")
                     send_alert(
                         f"⚡ PUMP: {symbol} ({chain}) — an older coin with a sudden volume spike. "
-                        f"The bot is alerting you, not buying (auto-join is off).\n{link}", paper=True)
+                        f"The bot is alerting you, not buying (auto-join is off).\n{link}")
 
     # Watchlist — coins not surfaced by the feed
     candidate_symbols = {c["symbol"] for c in candidates}
@@ -7185,11 +7284,11 @@ def scan_candidates():
             else:
                 log(f"ALERT watchlist pump {sym} (cap too small)")
                 send_alert(
-                    f"⚡ {sym} (your watchlist) is pumping but your caps are full — heads-up only.\n{_dex_link(w_chain, addr)}", paper=True)
+                    f"⚡ {sym} (your watchlist) is pumping but your caps are full — heads-up only.\n{_dex_link(w_chain, addr)}")
         else:
             log(f"ALERT watchlist pump {sym}")
             send_alert(
-                f"⚡ PUMP: {sym} (your watchlist) — a sudden volume spike. Alerting you, not buying.\n{_dex_link('sol', addr)}", paper=True)
+                f"⚡ PUMP: {sym} (your watchlist) — a sudden volume spike. Alerting you, not buying.\n{_dex_link('sol', addr)}")
 
     # Re-entry watch + trusted-coin management run on the slow cadence (not time-critical)
     check_reentry_watch()
