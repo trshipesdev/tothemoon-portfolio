@@ -2807,7 +2807,10 @@ function app() {
       // Keep hot wallet in sync on every refresh tick
       if (this.tab === 'Hot Wallet') {
         const wr = await this.get('/api/wallets');
-        if (wr) this.wallets = wr;
+        if (wr) {
+          this.wallets = wr;
+          if (!this.walletDetail) this.walletDetail = Object.keys(wr)[0] || '';
+        }
         if (this.walletDetail) {
           const wid = this.walletDetail;
           const [t, pos2, m] = await Promise.all([
