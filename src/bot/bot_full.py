@@ -304,7 +304,7 @@ CONFIG: Dict[str, Any] = {
     "ai": {
         "enabled":        False,   # master switch (also requires ANTHROPIC_API_KEY)
         "auto_apply":     False,   # True = AI switches modes itself; False = advisory only
-        "model":          "claude-haiku-4-5",
+        "model":          "claude-sonnet-4-6",   # upgraded from haiku 2026-07-02 — real money, real judgment
         "interval_min":   12,      # how often to consult the AI (was 30 — too slow for
                                    # fast memecoin regimes; also event-triggered on drawdown)
         "min_confidence": 0.7,     # only auto-apply at/above this confidence (raised 0.6→0.7)
@@ -4824,6 +4824,13 @@ AI_SYSTEM = (
     "expectancy is genuinely negative AND it's not explained by noise stops. "
     "Otherwise prefer default or hype/degen. Pull back to 'default' (not 'safe') when market is BTC-dominated "
     "or candidates are thin.\n\n"
+    "IMPORTANT: the context includes both PAPER engine stats (instant, zero-slippage simulated "
+    "fills — always looks better than reality) and real_wallet_execution (what's actually happening "
+    "with real money — real swaps can fail, take seconds to land, and give back most of a fast move "
+    "waiting to retry). Weight real_wallet_execution heavily when it disagrees with the paper numbers — "
+    "if real_sell_failures_recent is high or real_win_rate is meaningfully worse than the paper win "
+    "rate, that's a signal the current mode's aggressiveness is outrunning what real execution can "
+    "actually capture, regardless of how good the paper backtest looks.\n\n"
     "Return strict JSON only: {recommended_mode, confidence (0-1), aggressive (bool), reasoning (one sentence)}"
 )
 
@@ -4867,6 +4874,36 @@ def _ai_exit_breakdown(n: int = 50) -> Dict[str, Any]:
     return breakdown
 
 
+def _ai_wallet_reality(n: int = 30) -> Dict[str, Any]:
+    """Real hot-wallet execution stats — separate from the paper engine's theoretical
+    numbers above. Paper trades assume instant, zero-slippage fills; real swaps can
+    fail, take seconds to land, and give back most of a move while waiting to retry
+    (DIRT, 2026-07-02: paper banked ~$42 on a spike, the real wallet banked $2.95
+    after a failed sell forced a 60s wait). The mode recommendation governs REAL
+    money via the wallet, so it needs to see execution reality, not just backtest math."""
+    live_wallets = [w for w in STATE.get("wallets", {}).values() if w.get("live")]
+    if not live_wallets:
+        return {"live_wallets": 0}
+    sells = []
+    fails = 0
+    for w in live_wallets:
+        for t in w.get("trade_log", []):
+            if t.get("side") == "sell" and t.get("pnl") is not None:
+                sells.append(t)
+            elif t.get("side") == "sell_failed":
+                fails += 1
+    sells = sells[-n:]
+    pnls = [t.get("pnl", 0) for t in sells]
+    wr = (sum(1 for p in pnls if p > 0) / len(pnls)) if pnls else 0.0
+    return {
+        "live_wallets":       len(live_wallets),
+        "real_recent_trades": len(pnls),
+        "real_win_rate":      round(wr, 2),
+        "real_recent_pnl":    round(sum(pnls), 2),
+        "real_sell_failures_recent": fails,
+    }
+
+
 def _ai_market_context() -> Dict[str, Any]:
     hist     = STATE.get("pnl_hist", [])[-30:]
     wins_l   = [x for x in hist if x > 0]
@@ -4894,6 +4931,10 @@ def _ai_market_context() -> Dict[str, Any]:
         "exit_reason_breakdown": _ai_exit_breakdown(50),
         "scout_last_40":        _scout_reason_summary(40),
         "drawdown_brake":       drawdown_brake_active(),
+        "note":                 "the above (recent_trades, win_rate, pnl, exit_reason_breakdown) is the "
+                                 "PAPER engine — instant, zero-slippage simulated fills. See "
+                                 "real_wallet_execution below for what's actually happening with real money.",
+        "real_wallet_execution": _ai_wallet_reality(30),
     }
 
 
