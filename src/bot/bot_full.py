@@ -1514,6 +1514,30 @@ def compute_heat(btc_d: Optional[float]) -> Optional[str]:
     return "btc_max"
 
 
+_TRUSTED_QUOTE_SYMBOLS = {"SOL", "WSOL", "USDC", "USDT"}
+
+
+def _best_dex_pair(pairs: List[Dict]) -> Optional[Dict]:
+    """Pick the most reliable pair for one token address from a DexScreener
+    pairs list. Highest-liquidity-wins alone is unsafe: a pool quoted against an
+    obscure/illiquid token can have BOTH its price and its liquidity fields
+    wildly wrong at once — DexScreener derives both from the quote token's own
+    USD rate, which can itself be broken or manipulated for exotic quote assets.
+    Found live 2026-07-03: a real wallet position's equity read $14,672 because
+    a Fartcoin/PUMP pool reported $22.5M liquidity and $815/token, while 20+
+    other pools for the SAME address (quoted in SOL/USDC) all agreed on the
+    real price, ~$0.167 — a ~4900x gap on both fields simultaneously, from one
+    bad pool. Real, liquid pairs are almost always quoted against SOL/USDC/USDT;
+    prefer those, and only fall back to raw-highest-liquidity if none exist.
+    """
+    if not pairs:
+        return None
+    trusted = [p for p in pairs
+               if (p.get("quoteToken") or {}).get("symbol", "").upper() in _TRUSTED_QUOTE_SYMBOLS]
+    pool = trusted or pairs
+    return max(pool, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+
+
 def _degen_hype_bonus(symbol: str) -> int:
     """Small hype boost for provocative/vulgar names that reliably pull degen volume."""
     dt = CONFIG.get("degen_terms", {})
@@ -1682,22 +1706,18 @@ def fetch_positions_prices() -> Dict[str, Dict]:
         if addr_map:
             data    = _get(DEXSCREENER_TOKEN + ",".join(addr_map))
             pairs   = (data or {}).get("pairs") or []
-            by_addr: Dict[str, Dict] = {}
+            pairs_by_addr: Dict[str, List[Dict]] = {}
             for pair in pairs:
                 addr = ((pair.get("baseToken") or {}).get("address") or "").lower()
-                if not addr:
-                    continue
-                # A token can have many pools (ANSEM, 2026-07-02: 30 pairs across
-                # pumpswap/meteora/orca/raydium, four of them long-dead at exactly
-                # $0 liquidity while the real pool held $1.7M). Taking "whichever
-                # pair the API lists first" is a coin flip — that exact ordering
-                # produced a false "RUG liq 1.69M→0" and exited a position that
-                # then ran another +35%. Always keep the pair with the highest
-                # liquidity for a given token address, not just the first one seen.
-                cur_liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-                prev    = by_addr.get(addr)
-                if prev is None or cur_liq > float((prev.get("liquidity") or {}).get("usd") or 0):
-                    by_addr[addr] = pair
+                if addr:
+                    pairs_by_addr.setdefault(addr, []).append(pair)
+            # A token can have many pools (ANSEM, 2026-07-02: 30 pairs across
+            # pumpswap/meteora/orca/raydium, four of them long-dead at exactly
+            # $0 liquidity while the real pool held $1.7M; Fartcoin, 2026-07-03:
+            # a pool quoted in an obscure token reported $22.5M liq / $815 vs the
+            # real $0.167 that 20+ SOL/USDC-quoted pools agreed on). See
+            # _best_dex_pair for the trusted-quote-token selection logic.
+            by_addr: Dict[str, Dict] = {addr: _best_dex_pair(ps) for addr, ps in pairs_by_addr.items()}
             for addr, sym in addr_map.items():
                 px = _parse_dex_pair(by_addr[addr]) if addr in by_addr else None
                 if px:
@@ -5306,18 +5326,15 @@ def check_reentry_watch():
         return
     data    = _get(DEXSCREENER_TOKEN + ",".join(addr_map))
     pairs   = (data or {}).get("pairs") or []
-    by_addr: Dict[str, Dict] = {}
+    pairs_by_addr: Dict[str, List[Dict]] = {}
     for pair in pairs:
         addr = ((pair.get("baseToken") or {}).get("address") or "").lower()
-        if not addr:
-            continue
-        # Highest-liquidity pair wins, not just the first one the API lists —
-        # same reasoning as fetch_positions_prices (2026-07-02, ANSEM: 30 pairs,
-        # several long-dead at $0 liq alongside a real $1.7M pool).
-        cur_liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-        prev    = by_addr.get(addr)
-        if prev is None or cur_liq > float((prev.get("liquidity") or {}).get("usd") or 0):
-            by_addr[addr] = pair
+        if addr:
+            pairs_by_addr.setdefault(addr, []).append(pair)
+    # Trusted-quote-token pair selection, not just highest-liquidity — same
+    # reasoning as fetch_positions_prices (2026-07-02 ANSEM / 2026-07-03
+    # Fartcoin — see _best_dex_pair).
+    by_addr: Dict[str, Dict] = {addr: _best_dex_pair(ps) for addr, ps in pairs_by_addr.items()}
 
     to_remove: List[str] = []
     for sym, w in list(watch.items()):
