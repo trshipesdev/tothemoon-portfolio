@@ -8060,20 +8060,29 @@ def send_approval_prompt(msg: str, callback_yes: str, callback_no: str, no_label
     """
     ALERT_LOG.appendleft({"ts": now_utc().isoformat(), "msg": msg, "critical": True})
     if not TG_STATE.get("bot") or not TG_STATE.get("loop"):
+        log("WARN send_approval_prompt: TG_STATE bot/loop not ready — prompt not sent")
         return
     chat_id = STATE.get("telegram", {}).get("owner_chat_id")
     if not chat_id:
+        log("WARN send_approval_prompt: no owner_chat_id set — prompt not sent")
         return
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Yes", callback_data=callback_yes),
         InlineKeyboardButton(no_label, callback_data=callback_no),
     ]])
 
+    # Delivery failures here used to be fully silent (bare `except: pass`) — the
+    # ALERT_LOG append above happens regardless of whether the actual Telegram
+    # send succeeds, so "it's in the alert log" was NOT proof the message (or its
+    # buttons) ever reached the user. Found 2026-07-03 investigating "im not sure
+    # telegram is receiving my yes or nos" — logging failures now so a delivery
+    # problem is visible instead of indistinguishable from the user just not
+    # replying in time.
     async def _send():
         try:
             await TG_STATE["bot"].send_message(chat_id=chat_id, text=msg, reply_markup=kb)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"WARN send_approval_prompt: Telegram send FAILED: {e}")
 
     asyncio.run_coroutine_threadsafe(_send(), TG_STATE["loop"])
 
@@ -8735,7 +8744,20 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         total = len(pending_buys) + len(pending_sells)
         if total == 0:
-            return   # nothing pending — silently ignore (could be ordinary chat)
+            if not symbol:
+                # A bare "yes"/"no" in a private DM to the bot is essentially
+                # always meant as an answer, not ordinary chat — unlike "no
+                # thanks"/"yes please" (has a second word, stays silent below).
+                # Found live 2026-07-03: a reply that arrived after the ask had
+                # already expired hit this path and got ZERO response, which
+                # read exactly like "the bot is ignoring me / broken" — the ask
+                # HAD fired (confirmed in the alert log) and expired on schedule
+                # 120s later, before the reply came in. Always answering here
+                # makes that state visible instead of a silent black hole.
+                await update.message.reply_text(
+                    "Nothing pending to answer right now — either it already timed out "
+                    "(2min for buys, 90s for sells) or there's nothing waiting on you.")
+            return   # symbol given but no match — stays silent, likely ordinary chat
 
         # Ambiguous even WITH a symbol — e.g. wallet A has a pending sell-ask on
         # SYMBOL while wallet B independently has a pending buy-ask on the same
@@ -8809,8 +8831,10 @@ async def on_approval_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     the chat shows exactly what was decided instead of piling up new messages."""
     query = update.callback_query
     await query.answer()
+    log(f"Telegram: approval button tapped — data={query.data!r}")
     parts = (query.data or "").split(":")
     if len(parts) != 4:
+        log(f"WARN on_approval_button: malformed callback_data {query.data!r}")
         return
     kind, decision, wid, symbol = parts
     approve = decision == "yes"
