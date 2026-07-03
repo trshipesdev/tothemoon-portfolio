@@ -175,7 +175,7 @@ CONFIG: Dict[str, Any] = {
     "daily_deploy_cap_pct": 5.0,
     "drawdown_brake":       {"lookback": 30, "dd": 0.25, "size_mult": 0.60, "reserve_pct": 0.40},
     # Risk guardrails
-    "max_open_positions":   12,     # cap concurrent positions (memecoins dump together)
+    "max_open_positions":   20,     # cap concurrent positions (memecoins dump together) — raised from 12, user 2026-07-03: "allow more positions"
     "blacklist":            [],     # symbols/addresses to never buy (manual, dashboard-editable)
 
     "vaults": {"hot_native_pct": 0.75, "hot_usdc_pct": 0.25},
@@ -2881,6 +2881,7 @@ def _wlt_init(label: str, starting_usd: float, mode: Optional[str] = None,
         "live":           False,       # True → submit real Jupiter swaps using W_<wid>_PK
         "sweep_address":  "",          # cold wallet address for profit sweep (overrides global)
         "ticket_cap_usd": 0.0,         # if > 0, caps ticket size (e.g. 5.0 to run testing 3 at $5/trade)
+        "cash_reserve_pct": 0.0,       # fraction of vault_usd never deployed on a new buy (e.g. 0.25)
         # Per-wallet safety overrides — None means use the global/mode default
         "safety": {
             "dollar_stop_usd":      None,  # None → _mode_dollar_stop() ($12 default)
@@ -4204,6 +4205,18 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
         # Hard ceiling AFTER jitter — ticket_cap_usd must never be exceeded
         if cap > 0:
             usd = min(usd, cap)
+
+        # Cash reserve — never deploy the wallet down below this fraction of its
+        # current cash. User (2026-07-03): "dont use 25% of my solana left."
+        # Caps the ticket itself (not just a downstream min-ticket rejection) so
+        # a single buy can't eat into the reserve even partially.
+        _reserve_pct = float(w.get("cash_reserve_pct") or 0)
+        if _reserve_pct > 0:
+            _avail_for_buy = max(0.0, w.get("vault_usd", 0.0) * (1 - _reserve_pct))
+            usd = min(usd, _avail_for_buy)
+            if usd < _min_t:
+                _miss(w, "vault_reserve")
+                continue
 
         if age_min < 60:
             # Ask-before-buy (2026-07-03). User: "can the bot ask me if it can buy
