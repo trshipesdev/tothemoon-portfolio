@@ -1234,6 +1234,7 @@ def fetch_coingecko_trending() -> List[Dict[str, Any]]:
                 break
         out.append({
             "symbol": sym, "chain": chain, "address": address,
+            "coingecko_id": coin.get("id", ""),
             "market_cap_rank": coin.get("market_cap_rank"),
             "source": "coingecko_trending",
         })
@@ -1242,6 +1243,27 @@ def fetch_coingecko_trending() -> List[Dict[str, Any]]:
 
 _coingecko_trending_cache: Dict[str, Any] = {"ts": 0.0, "data": []}
 _COINGECKO_TRENDING_TTL = 300.0   # trending lists don't move fast enough to justify calling every ~8s scan
+_coingecko_platform_cache: Dict[str, Any] = {}   # coingecko_id -> {ts, platforms}
+_COINGECKO_PLATFORM_TTL = 3600.0   # a coin's contract address never changes; long TTL just limits API calls
+
+
+def _coingecko_resolve_platforms(coin_id: str) -> Dict[str, str]:
+    """CoinGecko's /search/trending response (2026-07-03 audit) doesn't actually
+    include platform/contract data for most coins — every trending coin came back
+    with an empty platforms dict, so every single one got silently dropped before
+    ever reaching a filter. This is the real fix: a follow-up call to /coins/{id},
+    which does return real contract addresses, cached an hour since a coin's
+    contract address never changes."""
+    if not coin_id:
+        return {}
+    cached = _coingecko_platform_cache.get(coin_id)
+    if cached and time.time() - cached["ts"] < _COINGECKO_PLATFORM_TTL:
+        return cached["platforms"]
+    data = _get(f"{COINGECKO_BASE}/coins/{coin_id}?localization=false&tickers=false"
+                f"&market_data=false&community_data=false&developer_data=false")
+    platforms = (data or {}).get("platforms") or {}
+    _coingecko_platform_cache[coin_id] = {"ts": time.time(), "platforms": platforms}
+    return platforms
 
 
 def _coingecko_trending_candidates() -> List[Dict[str, Any]]:
@@ -1263,7 +1285,17 @@ def _coingecko_trending_candidates() -> List[Dict[str, Any]]:
         _coingecko_trending_cache["data"] = raw
     out: List[Dict[str, Any]] = []
     active_chains = set(CONFIG["chains"])
+    chain_map = {"ethereum": "eth", "binance-smart-chain": "bsc",
+                 "base": "base", "polygon-pos": "poly", "solana": "sol"}
     for item in raw:
+        if not item.get("address"):
+            # Trending response didn't carry usable platform data — resolve it
+            # via the follow-up call instead of silently dropping the candidate.
+            platforms = _coingecko_resolve_platforms(item.get("coingecko_id", ""))
+            for k, addr in platforms.items():
+                if addr and chain_map.get(k) in active_chains:
+                    item = {**item, "chain": chain_map[k], "address": addr}
+                    break
         if item.get("chain") not in active_chains or not item.get("address"):
             continue
         dex = fetch_dexscreener_token(item["address"])
