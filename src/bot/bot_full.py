@@ -242,7 +242,11 @@ CONFIG: Dict[str, Any] = {
     },
 
     "oldcoin": {
-        "auto_join":      False,
+        "auto_join":      True,   # 2026-07-02: user turned this on after wiring in
+                                   # CoinGecko trending — requires a real 10x volume
+                                   # spike (volume_x below) before auto-buying, same
+                                   # wallet safety checks (active/sizing/entry_prob)
+                                   # as every other entry.
         "tiny_entry_usd": 20.0,
         "volume_x":       10.0,  # fires if h1 ≥ 10× the 24h hourly average
         "mentions_x":     2.0,   # reserved for social feed
