@@ -3309,6 +3309,33 @@ def _wlt_realized_pnl_recent(w: Dict, n: int = 10) -> Dict[str, Any]:
     }
 
 
+def _clear_hard_stop(wid: str, w: Dict) -> float:
+    """Clears a tripped hard-stop and raises its threshold 20% so the wallet gets
+    more room to run instead of just re-tripping on the exact same drawdown —
+    it hard-stops again at the new (higher) threshold, repeating until the user
+    stops approving. Returns the new threshold. User (2026-07-03): "it should
+    run more up to 20% more and then repeat hard stop again until i approve."
+    """
+    new_threshold = round(float(w.get("dd_hard_stop_threshold") or 100.0) * 1.20, 2)
+    w["dd_hard_stop_threshold"] = new_threshold
+    dd = w.setdefault("dd_alerted", {})
+    dd["stop"]    = False
+    dd["warning"] = False
+    dd["velocity"] = False
+    w["paused_new_entries"] = False
+    # Only reactivate if the hard stop itself was what deactivated the wallet
+    # (the "no open positions" trip branch sets both this flag and active=False
+    # together). If active=False for some UNRELATED reason — e.g. the user
+    # separately issued a manual "stop" while this approval was still pending —
+    # leave it alone; clearing a hard stop shouldn't silently reverse a
+    # different, deliberate manual stop. Audited 2026-07-03.
+    if w.pop("_deactivated_by_hard_stop", False):
+        w["active"] = True
+    save_state()
+    log(f"[W:{wid}] hard stop cleared — threshold now ${new_threshold:.2f}")
+    return new_threshold
+
+
 def _wallet_drawdown_check(wid: str, w: Dict):
     """Three-tier drawdown protection on live wallets vs the real deposit (starting_usd).
 
@@ -3342,8 +3369,9 @@ def _wallet_drawdown_check(wid: str, w: Dict):
 
     # ── If already draining after hard stop: wait for positions to clear ──
     if w.get("paused_new_entries") and not open_pos:
-        w["active"]             = False
-        w["paused_new_entries"] = False
+        w["active"]                    = False
+        w["paused_new_entries"]        = False
+        w["_deactivated_by_hard_stop"] = True   # see _clear_hard_stop
         send_alert(
             f"🛑 FULLY PAUSED — {label}\n"
             f"All positions closed. Bot deactivated. Re-enable from dashboard when ready.",
@@ -3368,46 +3396,61 @@ def _wallet_drawdown_check(wid: str, w: Dict):
         + "."
     ) if real["count"] else "No closed trades yet to compare against."
 
-    # ── Tier 3: Hard stop at $100 loss ───────────────────────────────────
-    if drawdown >= 100 and not alerted.get("stop"):
+    # ── Tier 3: Hard stop, threshold escalates 20% each time it's cleared ──
+    # User (2026-07-03): "theres a bug where even if i hit ok after a hard
+    # stop its not allowing more." The alert text always promised "reply ok
+    # to clear this and re-arm," but the 'ok' handler deliberately never
+    # cleared the "stop" tier — a real, standing inconsistency between what
+    # the bot said and what it did. Fixed: 'ok' (or the button below) now
+    # actually clears it AND raises the threshold 20% so it doesn't just
+    # re-trip on the exact same drawdown — it runs with more room, then hard
+    # stops again at the new (higher) threshold, repeating until you stop
+    # approving. See _clear_hard_stop().
+    _dd_threshold = float(w.get("dd_hard_stop_threshold") or 100.0)
+    if drawdown >= _dd_threshold and not alerted.get("stop"):
         alerted["stop"]           = True
         w["paused_new_entries"]   = True   # block new entries immediately
         n_open = len(open_pos)
+        _next_threshold = round(_dd_threshold * 1.20, 2)
         if n_open == 0:
             # No open positions — deactivate now
-            w["active"]             = False
-            w["paused_new_entries"] = False
-            send_alert(
+            w["active"]                    = False
+            w["paused_new_entries"]        = False
+            w["_deactivated_by_hard_stop"] = True   # see _clear_hard_stop
+            send_approval_prompt(
                 f"🛑 HARD STOP — {label}\n"
                 f"Equity down ${drawdown:.0f} vs your ${start:.0f} deposit (includes any capital "
                 f"currently deployed in positions, not necessarily a real loss). No open positions "
                 f"— bot DEACTIVATED.\n"
                 f"Equity: ${equity:.2f}. {_real_line}\n"
-                f"Reply 'ok' to clear this and re-arm, or re-enable from the dashboard when ready.",
-                critical=True)
+                f"Approve to clear and re-arm with ${_next_threshold:.0f} of room, or leave it paused.",
+                callback_yes=f"dd:ok:{wid}:_", callback_no=f"dd:stay:{wid}:_",
+                no_label="🛑 Leave paused")
             log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — no positions, deactivated immediately")
         else:
-            send_alert(
+            send_approval_prompt(
                 f"🛑 HARD STOP — {label}\n"
                 f"Equity down ${drawdown:.0f} vs your ${start:.0f} deposit (includes any capital "
                 f"currently deployed in positions, not necessarily a real loss). No new entries.\n"
                 f"Letting {n_open} open position(s) run to their exits, then fully pausing.\n"
-                f"{_real_line} Reply 'ok' to clear this and re-arm.\n"
-                f"Equity: ${equity:.2f}.",
-                critical=True)
+                f"{_real_line}\n"
+                f"Equity: ${equity:.2f}. Approve to clear and re-arm with ${_next_threshold:.0f} of room.",
+                callback_yes=f"dd:ok:{wid}:_", callback_no=f"dd:stay:{wid}:_",
+                no_label="🛑 Leave paused")
             log(f"[W:{wid}] HARD STOP — drawdown ${drawdown:.2f} — draining {n_open} position(s)")
         return
 
     # ── Tier 2: Serious warning at $50 loss ──────────────────────────────
     if drawdown >= 50 and not alerted.get("warning"):
         alerted["warning"] = True
-        send_alert(
+        send_approval_prompt(
             f"🚨 WARNING — {label}\n"
             f"Equity down ${drawdown:.0f} vs your ${start:.0f} deposit (includes any capital "
             f"currently deployed in positions, not necessarily a real loss). Equity: ${equity:.2f}.\n"
             f"{_real_line}\n"
-            f"Hard stop triggers at $100. Reply 'ok' to clear this if it's a false alarm.",
-            critical=True)
+            f"Hard stop triggers at ${_dd_threshold:.0f}.",
+            callback_yes=f"ddclear:ok:{wid}:_", callback_no=f"ddclear:no:{wid}:_",
+            no_label="🔕 Noted")
         log(f"[W:{wid}] WARNING — drawdown ${drawdown:.2f}")
 
     # ── Tier 1: Velocity — losing $15+ in 30 min ─────────────────────────
@@ -3423,14 +3466,15 @@ def _wallet_drawdown_check(wid: str, w: Dict):
         velocity_loss = old[-1][1] - equity             # positive = lost money
         if velocity_loss >= 15 and not alerted.get("velocity"):
             alerted["velocity"] = True
-            send_alert(
+            send_approval_prompt(
                 f"⚡ VELOCITY — {label}\n"
                 f"Equity down ${velocity_loss:.0f} in the last 30 min (can include capital that just "
                 f"moved into a new position, not necessarily lost). Total vs deposit: ${drawdown:.0f} "
                 f"of ${start:.0f}.\n"
                 f"{_real_line}\n"
-                f"Equity: ${equity:.2f}. No action taken — heads up. Reply 'ok' to clear.",
-                critical=True)
+                f"Equity: ${equity:.2f}. No action taken — heads up.",
+                callback_yes=f"ddclear:ok:{wid}:_", callback_no=f"ddclear:no:{wid}:_",
+                no_label="🔕 Noted")
             log(f"[W:{wid}] VELOCITY WARNING — ${velocity_loss:.2f} in 30min")
         elif velocity_loss < 5:
             alerted.pop("velocity", None)   # reset once pace stabilises
@@ -3488,13 +3532,12 @@ def _wlt_night_mode_record_sell(wid: str, w: Dict, pnl: float):
         nm["trip_loss"]      = net
         nm["last_alert_ts"]  = now
         label = w.get("label", wid)
-        send_alert(
+        send_approval_prompt(
             f"🌙🚨 LOSS PAUSE TRIPPED — {label}\n"
             f"Lost ${abs(net):.2f} realized in the last hour (threshold ${threshold:.0f}). "
-            f"New buys are paused — existing positions still trade normally.\n"
-            f"Reply 'ok' if this is a false alarm (resumes buying), or 'hello' when you're up "
-            f"and will handle it yourself.",
-            critical=True)
+            f"New buys are paused — existing positions still trade normally.",
+            callback_yes=f"nm:ok:{wid}:_", callback_no=f"nm:hello:{wid}:_",
+            no_label="☀️ Hello, I'll handle it")
         log(f"[W:{wid}] LOSS PAUSE TRIPPED — ${abs(net):.2f} realized loss in 1h (threshold ${threshold:.0f})")
 
 
@@ -3512,11 +3555,11 @@ def _wlt_night_mode_tick(wid: str, w: Dict):
         nm["last_alert_ts"] = now
         label = w.get("label", wid)
         loss  = nm.get("trip_loss", 0.0)
-        send_alert(
+        send_approval_prompt(
             f"🌙🚨 LOSS PAUSE — {label} still paused\n"
-            f"Lost ${abs(loss):.2f} realized in the hour before this tripped. New buys still paused.\n"
-            f"Reply 'ok' (false alarm, resume) or 'hello' (good morning, I'll handle it).",
-            critical=True)
+            f"Lost ${abs(loss):.2f} realized in the hour before this tripped. New buys still paused.",
+            callback_yes=f"nm:ok:{wid}:_", callback_no=f"nm:hello:{wid}:_",
+            no_label="☀️ Hello, I'll handle it")
 
 
 def _wlt_sync_vault(wid: str, w: Dict, live_prices: Dict):
@@ -8522,11 +8565,18 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Also clear drawdown warning/velocity tiers — user (2026-07-02) wants
             # a way to dismiss a false-alarm equity-drop alert (e.g. right after a
             # manual buy that hasn't been adopted yet) without waiting for equity
-            # to naturally recover. Deliberately does NOT clear "stop" (the hard
-            # stop that already paused new entries) — that one needs a real look,
-            # not a quick dismiss, so it's untouched here.
+            # to naturally recover.
             dd = w.get("dd_alerted") or {}
-            if dd.get("warning") or dd.get("velocity"):
+            if dd.get("stop"):
+                # Fixed 2026-07-03: the hard-stop alert always SAID "reply ok to
+                # clear this and re-arm," but this handler deliberately never
+                # actually cleared "stop" — a real, standing bug. Now it does,
+                # via _clear_hard_stop (also raises the threshold 20% so it
+                # doesn't just re-trip on the identical drawdown next tick).
+                new_threshold = _clear_hard_stop(wid, w)
+                cleared_dd.append(f"{w.get('label', wid)} (hard stop, now ${new_threshold:.0f} room)")
+                changed = True
+            elif dd.get("warning") or dd.get("velocity"):
                 dd.pop("warning", None)
                 dd.pop("velocity", None)
                 cleared_dd.append(w.get("label", wid))
@@ -8535,7 +8585,7 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_state()
             msg = "👍 Cleared."
             if cleared_dd:
-                msg += f" Drawdown warning reset for {', '.join(cleared_dd)} — will re-arm if it happens again."
+                msg += f" Drawdown reset for {', '.join(cleared_dd)} — will re-arm if it happens again."
             msg += " Night mode (if armed) still watching for the rest of the night."
             await update.message.reply_text(msg)
         return
@@ -8873,6 +8923,70 @@ async def _handle_approval_button(query) -> None:
     kind, decision, wid, symbol = parts
     approve = decision == "yes"
     orig = query.message.text or ""
+
+    if kind == "dd":
+        w = STATE.get("wallets", {}).get(wid)
+        if not w:
+            await query.edit_message_text(f"{orig}\n\n⚠️ Wallet no longer found.")
+            return
+        if not w.get("dd_alerted", {}).get("stop"):
+            await query.edit_message_text(f"{orig}\n\n(already resolved)")
+            return
+        if decision == "ok":
+            new_threshold = _clear_hard_stop(wid, w)
+            await query.edit_message_text(
+                f"{orig}\n\n✅ Cleared — running again with ${new_threshold:.0f} of room "
+                f"before the next hard stop.")
+        else:
+            await query.edit_message_text(f"{orig}\n\n🛑 Left paused.")
+        return
+
+    if kind == "ddclear":
+        # WARNING/VELOCITY tiers — informational only, nothing was paused, so
+        # both buttons just resolve the prompt: "ok" clears the tier now,
+        # "noted" leaves it (it clears on its own once equity recovers anyway).
+        w = STATE.get("wallets", {}).get(wid)
+        if not w:
+            await query.edit_message_text(f"{orig}\n\n⚠️ Wallet no longer found.")
+            return
+        dd = w.get("dd_alerted", {})
+        if not (dd.get("warning") or dd.get("velocity")):
+            await query.edit_message_text(f"{orig}\n\n(already resolved)")
+            return
+        if decision == "ok":
+            dd.pop("warning", None)
+            dd.pop("velocity", None)
+            save_state()
+            await query.edit_message_text(f"{orig}\n\n✅ Cleared — will re-arm if it happens again.")
+        else:
+            await query.edit_message_text(f"{orig}\n\n👍 Noted.")
+        return
+
+    if kind == "nm":
+        w = STATE.get("wallets", {}).get(wid)
+        if not w:
+            await query.edit_message_text(f"{orig}\n\n⚠️ Wallet no longer found.")
+            return
+        nm = w.get("night_mode") or {}
+        if not (nm.get("armed") or nm.get("tripped")):
+            await query.edit_message_text(f"{orig}\n\n(already resolved)")
+            return
+        if decision == "ok":
+            nm["tripped"]       = False
+            nm["trip_ts"]       = 0.0
+            nm["last_alert_ts"] = 0.0
+            nm["loss_events"]   = []
+            save_state()
+            await query.edit_message_text(f"{orig}\n\n✅ Cleared — resuming. Still watching for the rest of the night.")
+        else:
+            still_paused = nm.get("tripped", False)
+            nm["armed"] = False
+            save_state()
+            await query.edit_message_text(
+                f"{orig}\n\n☀️ Night mode off." +
+                (" New buys stay paused until you resume them yourself." if still_paused
+                 else " Everything's normal, have a good day."))
+        return
 
     if kind == "buy":
         p = STATE.get("pending_buy_approvals", {}).pop(f"{wid}:{symbol}", None)
