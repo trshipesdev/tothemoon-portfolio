@@ -8832,6 +8832,23 @@ async def on_approval_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     log(f"Telegram: approval button tapped — data={query.data!r}")
+    try:
+        await _handle_approval_button(query)
+    except Exception as e:
+        # A bare tap with no visible outcome ("I was def tapping it") is exactly
+        # what an unhandled exception here looks like from the user's side — PTB
+        # has no global error handler configured (found 2026-07-03), so any
+        # exception past query.answer() used to vanish: the loading spinner
+        # clears (tap registered), but the message never updates and nothing
+        # gets bought/sold/paused. Surface it both ways now.
+        log(f"WARN on_approval_button crashed on data={query.data!r}: {e}")
+        try:
+            await query.edit_message_text(f"{query.message.text}\n\n⚠️ Something went wrong — try again or act manually.")
+        except Exception:
+            pass
+
+
+async def _handle_approval_button(query) -> None:
     parts = (query.data or "").split(":")
     if len(parts) != 4:
         log(f"WARN on_approval_button: malformed callback_data {query.data!r}")
@@ -10297,6 +10314,17 @@ def start_telegram():
             traceback.print_exc()
 
     tg = Application.builder().token(token).post_init(_post_init).build()
+
+    async def _on_tg_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # No global error handler existed before 2026-07-03 — any exception raised
+        # inside a handler AFTER it had already done something visible (e.g.
+        # query.answer() clearing a button's loading spinner) was fully silent:
+        # no log line, no user-facing message, nothing. That's indistinguishable
+        # from a real tap/command just not working. Every handler now at least
+        # gets logged here as a last resort, even ones with their own try/except.
+        log(f"WARN Telegram handler error: {context.error}")
+
+    tg.add_error_handler(_on_tg_error)
     tg.add_handler(CommandHandler("whoami",       whoami))
     tg.add_handler(CommandHandler("start",        cmd_start))
     tg.add_handler(CommandHandler("status",       cmd_status))
@@ -10332,7 +10360,13 @@ def start_telegram():
         log("WARN Telegram: owner_chat_id not set — proactive alerts (drawdown/sell/rug/digest) "
             "won't send until you message the bot once (any command works, e.g. /status)")
     log("Telegram polling started")
-    tg.run_polling(allowed_updates=["message"], drop_pending_updates=False)
+    # "callback_query" added 2026-07-03 — the inline-keyboard ask-before-buy/sell
+    # buttons are a SEPARATE Telegram update type from "message". Restricting
+    # allowed_updates to just ["message"] meant Telegram was filtering every
+    # button tap out at the API level before it ever reached CallbackQueryHandler
+    # — the handler was registered and correct, but literally never invoked.
+    # Root-caused via user report: "no the issue is that i was def tapping it."
+    tg.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=False)
 
 
 def main():
