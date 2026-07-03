@@ -1559,8 +1559,24 @@ def _pair_to_candidate(pair: Dict[str, Any], our_chain: str) -> Optional[Dict[st
 
 def fetch_new_candidates() -> List[Dict[str, Any]]:
     active_ids = {CHAIN_IDS[c] for c in CONFIG["chains"] if c in CHAIN_IDS}
-    seen: set = set()
-    out: List[Dict[str, Any]] = []
+    # Keyed by (symbol, chain) — NOT address. Every downstream gate (recently_exited
+    # cooldowns, entries_today caps, symbol_peaks, reject_cache, positions dict) is
+    # keyed by symbol, so letting two different addresses share one symbol through
+    # to the scanner would let a scam clone poison the real coin's cooldown/peak/cap
+    # state (and vice versa) — audited and confirmed 2026-07-03, would have been a
+    # worse bug than the one being fixed. Instead: keep ONE candidate per symbol,
+    # picking whichever has higher liquidity. Found live 2026-07-03: a fake PENGU
+    # clone (liq ~$3k) claimed the "PENGU" slot under first-source-wins ordering,
+    # got entered, lost -80%, while the REAL PENGU (CoinGecko-resolved, real
+    # liquidity) never reached the scanner. Liquidity-as-tiebreaker fixes that
+    # without needing every downstream dict re-keyed to address.
+    by_symbol: Dict[tuple, Dict[str, Any]] = {}
+
+    def _consider(c: Dict[str, Any]) -> None:
+        key = (c["symbol"], c["chain"])
+        existing = by_symbol.get(key)
+        if existing is None or c.get("liq", 0) > existing.get("liq", 0):
+            by_symbol[key] = c
 
     # Collect addresses per chain from boosts + profiles lists (both cached 60s).
     # Then batch-fetch in groups of 30 — 1-2 API calls instead of 25+.
@@ -1594,27 +1610,18 @@ def fetch_new_candidates() -> List[Dict[str, Any]]:
             for pair in (pairs_list or []):
                 c = _pair_to_candidate(pair, our_chain)
                 if c:
-                    key = (c["symbol"], c["chain"])
-                    if key not in seen:
-                        seen.add(key)
-                        out.append(c)
+                    _consider(c)
 
     # Birdeye — trending Solana tokens (only if API key set)
     for c in fetch_birdeye_sol_candidates():
-        key = (c["symbol"], c["chain"])
-        if key not in seen:
-            seen.add(key)
-            out.append(c)
+        _consider(c)
 
     # CoinGecko trending — the whole crypto market, any cap size, not just
     # fresh pump.fun-style launches like the two feeds above.
     for c in _coingecko_trending_candidates():
-        key = (c["symbol"], c["chain"])
-        if key not in seen:
-            seen.add(key)
-            out.append(c)
+        _consider(c)
 
-    return out
+    return list(by_symbol.values())
 
 def _px_dict(price: float, liq: float = 0.0, vol_h1: float = 0.0, change_m5: float = 0.0) -> Dict:
     return {"price": price, "liq": liq, "vol_h1": vol_h1, "change_m5": change_m5}
@@ -2924,6 +2931,44 @@ SPRAY_STOP_PCT        = 0.30
 SPRAY_MAX_CONCURRENT  = 5
 SPRAY_MAX_LEG_FRAC    = 0.40   # never sell more than this fraction of the position in one leg
 
+# Liquidity-scaled auto-hold (2026-07-03). Real-trade audit: entry liquidity is a
+# near-linear predictor of outcome — <$20k liq: 44% win/-$1.73 avg pnl, >=$20k: 64%/
+# +$0.96, >=$30k: 80%/+$2.13, >=$40k (n=10): 100%/+$3.71. User: "hold should be
+# reserved for coins that have good liquidity, and allows much bigger swings... if
+# that actually worked, i wouldnt mind the bot putting its own holds on certain
+# coins." This replaces manual HOLD for qualifying coins — the bot automatically
+# gives high-liquidity positions more room to swing (wider trail/dollar/fixed-SL)
+# instead of requiring the user to pause them by hand.
+_LIQ_HOLD_MIN = 20000.0   # below this, no extra tolerance — normal risk parameters
+_LIQ_HOLD_MAX = 40000.0   # at/above this, full tolerance — the tier with 100% win rate
+
+
+def _liq_hold_mult(liq: float) -> float:
+    """1.0 (no extra room) at/below $20k liq, scaling linearly to 2.0 (double the
+    normal trail/dollar-stop room) at/above $40k liq. Applied to trailing_stop_pct
+    and the effective dollar-stop before the profit-lock tightening carve-outs, so
+    it only widens INITIAL risk tolerance — it doesn't loosen the separate logic
+    that tightens the trail once a position is already up big."""
+    if liq <= _LIQ_HOLD_MIN:
+        return 1.0
+    if liq >= _LIQ_HOLD_MAX:
+        return 2.0
+    frac = (liq - _LIQ_HOLD_MIN) / (_LIQ_HOLD_MAX - _LIQ_HOLD_MIN)
+    return 1.0 + frac
+
+
+def _liq_cooldown_scale(liq: float) -> float:
+    """Shrinks the post-loss re-entry cooldown for coins liquid enough to have
+    earned auto-hold treatment — a coin liquid enough to trust with bigger swings
+    is liquid enough to trust with a faster re-entry once it stabilizes. User
+    (2026-07-03), confirming this should apply: "yes, shorter cooldown for these."
+    """
+    if liq >= _LIQ_HOLD_MAX:
+        return 0.2   # e.g. the 30min tier becomes 6min
+    if liq >= _LIQ_HOLD_MIN:
+        return 0.5   # e.g. the 30min tier becomes 15min
+    return 1.0
+
 
 def _symbol_tier_mult(addr: str) -> float:
     tier = STATE.get("symbol_tier", {}).get(addr, {}).get("tier", 0)
@@ -2996,11 +3041,12 @@ def _wlt_can_enter(w: Dict, symbol: str, chain: str) -> bool:
     max_per_day = CONFIG.get("max_entries_per_token_day", 4)
     if w.get("entries_today", {}).get(symbol, 0) >= max_per_day:
         return False
-    # Loss cooldown (same as main bot: 30 min after a losing sell)
+    # Loss cooldown (same as main bot: 30 min after a losing sell) — scaled down
+    # for high-liquidity exits, same reasoning as the main scanner's tiered gate.
     rex = w.get("recently_exited", {}).get(symbol)
     if rex and rex.get("pnl", 0) < 0:
         elapsed = time.time() - rex.get("ts", 0)
-        cooldown = int(CONFIG["moonshot"].get("loss_cooldown_min") or 30) * 60
+        cooldown = int(CONFIG["moonshot"].get("loss_cooldown_min") or 30) * 60 * _liq_cooldown_scale(rex.get("liq", 0))
         if elapsed < cooldown:
             return False
     # Don't double-enter a symbol already open in this wallet
@@ -3143,8 +3189,9 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
             _tiers[_addr] = {"tier": (_cur_tier + 1) if episode_pnl > 0 else 0,
                              "last_episode_pnl": round(episode_pnl, 2)}
         w["positions"].pop(symbol, None)
+        _exit_liq = pos.get("entry_liq", 0)
         w.setdefault("recently_exited", {})[symbol] = {
-            "ts": time.time(), "price": price, "pnl": pnl,
+            "ts": time.time(), "price": price, "pnl": pnl, "liq": _exit_liq,
         }
         # Cross-wallet cooldown: a loss in any wallet blocks ALL wallets and the main
         # scanner from re-entering the same token. Prevents the BOGE/DUVAL pattern where
@@ -3152,6 +3199,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         if pnl < 0:
             STATE.setdefault("recently_exited", {})[symbol] = {
                 "ts": time.time(), "price": price, "pnl": pnl, "source": f"wallet:{wid}",
+                "liq": _exit_liq,
             }
             cd_min = int(CONFIG["moonshot"].get("loss_cooldown_min") or 30)
             send_alert(
@@ -3780,7 +3828,12 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         ladder = mode_cfg.get("tp_ladder") or [[t, 0.5] for t in mode_cfg.get("tp", MS["tp"])]
         moonbag_frac = max(0.0, 1.0 - sum(f for _, f in ladder))
         in_moonbag   = pos.get("tp_index", 0) >= len(ladder) and moonbag_frac > 0
-        trail_pct    = MS["trailing_stop_pct"]
+        # Liquidity-scaled auto-hold: widen the base trail BEFORE the profit-lock
+        # tightening below runs, so a big winner still gets clamped tight regardless
+        # of liquidity (protecting realized gains), but the INITIAL swing room a
+        # position gets scales with how much liquidity it entered with.
+        _liq_mult    = _liq_hold_mult(pos.get("entry_liq", 0))
+        trail_pct    = MS["trailing_stop_pct"] * _liq_mult
         gain_now     = (price / max(pos.get("avg") or 1e-9, 1e-9)) - 1
         if   gain_now >= 1.0 and not in_moonbag: trail_pct = min(trail_pct, 0.10)
         elif gain_now >= 0.5 and not in_moonbag: trail_pct = min(trail_pct, 0.12)
@@ -3804,7 +3857,14 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         _dollar_stop = _sf.get("dollar_stop_usd") or _mode_dollar_stop(mode_name)
         _cost        = pos.get("usd", 0) or 1e-9
         _cur_val     = pos["units"] * price
-        _eff_stop    = max(_dollar_stop, _cost * 0.10)
+        # Capped at 75% of cost basis — audit finding (2026-07-03): at small ticket
+        # sizes (e.g. $10), the un-capped base $12 dollar-stop was ALREADY larger
+        # than the position, and the 2x liq multiplier made it worse ($24), making
+        # the dollar stop mathematically unreachable — trailing stop / fixed SL
+        # would have to do all the work. This cap keeps the dollar stop meaningful
+        # (still fires before near-total loss) regardless of ticket size or how
+        # wide the liquidity multiplier scales in the future.
+        _eff_stop    = min(max(_dollar_stop, _cost * 0.10) * _liq_mult, _cost * 0.75)
         if pos.get("spray"):
             # Sprays need a real, tight mathematical ceiling regardless of the
             # wallet's normal (much wider) dollar stop — user (2026-07-02):
@@ -3943,8 +4003,11 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
                         critical=True)
             continue   # skip fixed SL execution only — TP ladder already ran above
 
-        # Fixed SL fallback
-        sl_level = pos.get("sl_override") or mode_cfg.get("sl", 0.18)
+        # Fixed SL fallback — liquidity-scaled auto-hold widens this too, but capped
+        # at 1.5x (not the full 2x trail/dollar-stop cap) since this is the last-
+        # resort backstop and shouldn't be loosened as aggressively as the more
+        # adaptive exits above.
+        sl_level = (pos.get("sl_override") or mode_cfg.get("sl", 0.18)) * min(_liq_mult, 1.5)
         if pos.get("units", 0) > 0 and price <= pos["avg"] * (1 - sl_level):
             _wlt_sell(wid, w, symbol, price, "fixed_sl")
 
@@ -4041,6 +4104,15 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
             _new_pos = w.get("positions", {}).get(symbol)
             if _new_pos:
                 _new_pos["spray"] = True
+                # _wlt_buy() already called save_state() before this flag was set —
+                # without a second save here, a restart landing in this gap loads a
+                # copy of the position with no spray flag, silently falling through
+                # to normal (unprotected-for-young-coins) exit management from then
+                # on. Root-caused 2026-07-03: zero live positions ever showed
+                # spray=True and zero real sells ever carried a SPRAY exit reason,
+                # despite young coins clearly being bought — this save-ordering gap
+                # was why "the new logic never engaged."
+                save_state()
         scan_entered.setdefault(wid, set()).add(symbol)
 
 
@@ -9156,28 +9228,34 @@ def scan_candidates():
                 # e.g. two -$4 trades = -$8 cumulative → escalates to 15-min tier automatically.
                 _cumul_pnl = STATE.get("token_pnl_today", {}).get(symbol, _rex_pnl)
                 _eff_pnl   = min(_rex_pnl, _cumul_pnl)   # whichever is more negative
+                # Liquidity-scaled auto-hold, re-entry side: a coin liquid enough to
+                # earn wider exit tolerance is liquid enough to trust with a faster
+                # re-entry once it stabilizes. User (2026-07-03): "yes, shorter
+                # cooldown for these." Only shrinks these tiered thresholds — the
+                # profit-chase block below is unrelated (not a loss cooldown).
+                _cd_scale = _liq_cooldown_scale(_rex.get("liq", 0))
                 if _eff_pnl <= -50:
                     # Catastrophic loss ($50+): 8h hard stop. TJR lost $89 then re-entered
                     # at exactly 4h05m and lost $42 more — the 4h window was too narrow.
-                    if _rex_elapsed < 8 * 3600:
+                    if _rex_elapsed < 8 * 3600 * _cd_scale:
                         _scout(symbol, chain, "rejected",
                                f"hard-stop: lost ${abs(_eff_pnl):.0f} here today, paused 8h ({_rex_elapsed/60:.0f}min ago)", sc, addr)
                         continue
                 elif _eff_pnl <= -30:
                     # Major loss ($30–50): 4h hard stop.
-                    if _rex_elapsed < 4 * 3600:
+                    if _rex_elapsed < 4 * 3600 * _cd_scale:
                         _scout(symbol, chain, "rejected",
                                f"hard-stop: lost ${abs(_eff_pnl):.0f} here today, paused 4h ({_rex_elapsed/60:.0f}min ago)", sc, addr)
                         continue
                 elif _eff_pnl <= -15:
                     # Significant loss: 30 min cooldown
-                    if _rex_elapsed < 30 * 60:
+                    if _rex_elapsed < 30 * 60 * _cd_scale:
                         _scout(symbol, chain, "rejected",
                                f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, cumul=${_eff_pnl:.2f})", sc, addr)
                         continue
                 elif _eff_pnl <= -5:
                     # Moderate loss: 15 min cooldown
-                    if _rex_elapsed < 15 * 60:
+                    if _rex_elapsed < 15 * 60 * _cd_scale:
                         _scout(symbol, chain, "rejected",
                                f"post-loss cooldown ({_rex_elapsed/60:.0f}min ago, cumul=${_eff_pnl:.2f})", sc, addr)
                         continue
