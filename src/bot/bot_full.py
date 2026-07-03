@@ -3267,6 +3267,7 @@ ASK_BEFORE_BUY_SEC  = 120
 # just needs to get out of the way fast, not lock the token/position out.
 BUY_DECLINE_COOLDOWN_SEC = 180    # re-offer a declined young coin this soon if it's still around
 SELL_DECLINE_PAUSE_SEC   = 600    # a declined/timed-out sell auto-resumes normal exits after this
+MIN_ENTRY_AGE_MIN        = 15.0   # user (2026-07-03): "can we wait till tickets are like 15 min old" — skip the newest, highest-rug-risk launches entirely
 
 
 def _offer_sell_approval(wid: str, w: Dict, symbol: str, pos: Dict, reason: str) -> None:
@@ -9641,6 +9642,19 @@ def scan_candidates():
                 if not (_price_ok and _liq_ok):
                     continue   # silent skip — price hasn't spiked enough AND cache not expired
 
+        # Minimum age floor — user (2026-07-03): "can we wait till tickets are
+        # like 15 min old." The very newest launches (seconds to a few minutes
+        # old) are the highest-rug-risk window; this rejects the scanner's own
+        # autonomous entries outright until a candidate clears 15min, regardless
+        # of everything else about it (young/spray coins still only run up to
+        # the existing 60min cutoff, just with a floor under them now). Manual
+        # buys (/buy, /wbuy) are unaffected — this only gates the bot's own
+        # autonomous decision-making.
+        if c["age_min"] < MIN_ENTRY_AGE_MIN:
+            _scout(symbol, chain, "rejected",
+                   f"too young — {c['age_min']:.1f}min old, waiting for {MIN_ENTRY_AGE_MIN:.0f}min",
+                   sc, addr)
+            continue
         # Manual blacklist — never buy these (by symbol or address), dashboard-editable
         bl = {str(x).lower() for x in CONFIG.get("blacklist", [])}
         if symbol.lower() in bl or (addr and addr.lower() in bl):
