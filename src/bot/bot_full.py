@@ -3269,6 +3269,11 @@ BUY_DECLINE_COOLDOWN_SEC = 180    # re-offer a declined young coin this soon if 
 SELL_DECLINE_PAUSE_SEC   = 900    # base pause (15min) — see _next_sell_snooze_sec for the escalating version actually used
 SELL_DECLINE_PAUSE_MAX_SEC = 4 * 3600
 MIN_ENTRY_AGE_MIN        = 15.0   # user (2026-07-03): "can we wait till tickets are like 15 min old" — skip the newest, highest-rug-risk launches entirely
+# Young-coin ask-before-buy narrowed to the actually-risky case (2026-07-03) —
+# user: "can it auto join still. its still supposed to auto join. just on
+# extra risky ask like if its dead idk." See profitable-era liquidity tiers.
+YOUNG_COIN_RISKY_LIQ_MAX  = 30000.0   # below this, ask; at/above, auto-join
+YOUNG_COIN_RISKY_HYPE_MIN = 30        # hype below this ("looks dead"), ask
 
 
 def _next_sell_snooze_sec(pos: Dict) -> float:
@@ -4319,36 +4324,49 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
                 continue
 
         if age_min < 60:
-            # Ask-before-buy (2026-07-03). User: "can the bot ask me if it can buy
-            # a token that its unsure of... same for sell." Every young/spray-mode
-            # coin is inherently the least liquidity-proven category (the whole
-            # reason spray exists as a bounded-risk sub-strategy in the first
-            # place), so ALL of them ask first instead of just the borderline ones.
-            # Established/non-young candidates below still enter automatically —
-            # nothing changes there.
-            _declined_until = STATE.get("declined_buy_until", {}).get(symbol, 0)
-            if time.time() < _declined_until:
-                _miss(w, "recently_declined")
+            # Ask-before-buy, narrowed to actually-risky young coins (2026-07-03).
+            # User first wanted EVERY young coin to ask; after watching it in
+            # practice: "can it auto join still. its still supposed to auto
+            # join. just on extra risky ask like if its dead idk." Liquidity is
+            # the strongest real signal here — the profitable-era audit found
+            # liq>=$40k had a 100% win rate, liq>=$30k 80%, down near the $20k
+            # floor 44-64%. A low hype score (near-zero recent volume relative
+            # to liquidity) is the "looks dead" case the user described. Only
+            # THIS combination asks now; a young coin with real liquidity and
+            # real activity auto-joins exactly like an established candidate.
+            _risky = liq < YOUNG_COIN_RISKY_LIQ_MAX or (hype or 0) < YOUNG_COIN_RISKY_HYPE_MIN
+            if _risky:
+                _declined_until = STATE.get("declined_buy_until", {}).get(symbol, 0)
+                if time.time() < _declined_until:
+                    _miss(w, "recently_declined")
+                    continue
+                _pending_key = f"{wid}:{symbol}"
+                if _pending_key in STATE.get("pending_buy_approvals", {}):
+                    continue   # already asked, awaiting a reply or the timeout sweep
+                deadline = time.time() + ASK_BEFORE_BUY_SEC
+                STATE.setdefault("pending_buy_approvals", {})[_pending_key] = {
+                    "wid": wid, "symbol": symbol, "chain": chain, "address": addr,
+                    "price": price, "liq": liq, "usd": usd,
+                    "asked_ts": time.time(), "deadline": deadline,
+                }
+                save_state()
+                send_approval_prompt(
+                    f"🤔 Buy {symbol}? young coin ({age_min:.0f}min old), ${usd:.2f} ticket, "
+                    f"liq ${liq:,.0f}, hype {hype or 0} — looks risky/thin\n"
+                    f"({ASK_BEFORE_BUY_SEC}s, then skips for now if no answer)",
+                    callback_yes=f"buy:yes:{wid}:{symbol}", callback_no=f"buy:no:{wid}:{symbol}",
+                    no_label="⏭️ Not now")
+                scan_entered.setdefault(wid, set()).add(symbol)
                 continue
-            _pending_key = f"{wid}:{symbol}"
-            if _pending_key in STATE.get("pending_buy_approvals", {}):
-                continue   # already asked, awaiting a reply or the timeout sweep
-            deadline = time.time() + ASK_BEFORE_BUY_SEC
-            STATE.setdefault("pending_buy_approvals", {})[_pending_key] = {
-                "wid": wid, "symbol": symbol, "chain": chain, "address": addr,
-                "price": price, "liq": liq, "usd": usd,
-                "asked_ts": time.time(), "deadline": deadline,
-            }
-            save_state()
-            send_approval_prompt(
-                f"🤔 Buy {symbol}? young coin ({age_min:.0f}min old), ${usd:.2f} ticket, "
-                f"liq ${liq:,.0f}\n({ASK_BEFORE_BUY_SEC}s, then skips for now if no answer)",
-                callback_yes=f"buy:yes:{wid}:{symbol}", callback_no=f"buy:no:{wid}:{symbol}",
-                no_label="⏭️ Not now")
-            scan_entered.setdefault(wid, set()).add(symbol)
-            continue
+            # Not risky — auto-join, same as an established candidate below,
+            # but still tagged spray so it keeps the bounded-risk exit profile.
 
         _wlt_buy(wid, w, symbol, chain, usd, price, liq, addr)
+        if age_min < 60:
+            _new_pos = w.get("positions", {}).get(symbol)
+            if _new_pos:
+                _new_pos["spray"] = True
+                save_state()   # see the spray-flag persistence fix earlier this session
         scan_entered.setdefault(wid, set()).add(symbol)
 
 
