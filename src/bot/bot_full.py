@@ -9104,6 +9104,9 @@ def scan_candidates():
                 _scout(symbol, chain, "suggested", f"passed filters, ps {ps} (moonshot mode = suggest)", sc, addr)
         else:
             if detect_oldcoin_pump(symbol, CONFIG["oldcoin"]["volume_x"], CONFIG["oldcoin"]["mentions_x"]):
+                # This whole branch never called _scout() before (2026-07-02) —
+                # user: "will i see these in scout" — no, silently invisible.
+                _old_sc = Score(0, liq, 9999, True, price=price)
                 if CONFIG["oldcoin"]["auto_join"]:
                     usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(chain, symbol=symbol))
                     if usd >= CONFIG["moonshot"]["min_ticket_usd"]:
@@ -9114,16 +9117,19 @@ def scan_candidates():
                         send_alert(
                             f"⚡ BOUGHT a tiny ${usd:.0f} of {symbol} ({chain}) — an older coin whose "
                             f"trading volume just spiked (a 'pump'). Small bet to ride the momentum.\n{link}", paper=True)
+                        _scout(symbol, chain, "entered", f"old-coin volume spike, auto-joined ${usd:.2f}", _old_sc, addr)
                     else:
                         log(f"ALERT old pump {symbol} (cap too small)")
                         send_alert(
                             f"⚡ {symbol} ({chain}) is pumping (volume spiking) but your caps are full, "
                             f"so the bot can't join. Heads-up only.\n{link}")
+                        _scout(symbol, chain, "suggested", "old-coin volume spike, but caps/min-ticket too small to join", _old_sc, addr)
                 else:
                     log(f"ALERT old pump {symbol}")
                     send_alert(
                         f"⚡ PUMP: {symbol} ({chain}) — an older coin with a sudden volume spike. "
                         f"The bot is alerting you, not buying (auto-join is off).\n{link}")
+                    _scout(symbol, chain, "suggested", "old-coin volume spike detected, auto-join is off", _old_sc, addr)
 
     # Watchlist — coins not surfaced by the feed
     candidate_symbols = {c["symbol"] for c in candidates}
@@ -9143,6 +9149,7 @@ def scan_candidates():
                 cid     = p0.get("chainId", "solana")
                 w_chain = next((k for k, v in CHAIN_IDS.items() if v == cid), "sol")
             usd = min(CONFIG["oldcoin"]["tiny_entry_usd"], size_ticket_usd(w_chain, symbol=sym))
+            _wl_sc = Score(0, w_liq, 9999, True, price=w_price)
             if usd >= CONFIG["moonshot"]["min_ticket_usd"]:
                 shadow_buy(sym, w_chain, usd, w_price, w_liq, addr)
                 _wallets_offer_entry(sym, w_chain, w_price, w_liq, addr, _wallet_scan_entered)
@@ -9150,14 +9157,17 @@ def scan_candidates():
                 send_alert(
                     f"⚡ BOUGHT a tiny ${usd:.0f} of {sym} ({w_chain}) — a coin on your watchlist just "
                     f"spiked in volume. Small bet to ride it.\n{_dex_link(w_chain, addr)}", paper=True)
+                _scout(sym, w_chain, "entered", f"watchlist volume spike, auto-joined ${usd:.2f}", _wl_sc, addr)
             else:
                 log(f"ALERT watchlist pump {sym} (cap too small)")
                 send_alert(
                     f"⚡ {sym} (your watchlist) is pumping but your caps are full — heads-up only.\n{_dex_link(w_chain, addr)}")
+                _scout(sym, w_chain, "suggested", "watchlist volume spike, but caps/min-ticket too small to join", _wl_sc, addr)
         else:
             log(f"ALERT watchlist pump {sym}")
             send_alert(
                 f"⚡ PUMP: {sym} (your watchlist) — a sudden volume spike. Alerting you, not buying.\n{_dex_link('sol', addr)}")
+            _scout(sym, "sol", "suggested", "watchlist volume spike detected, auto-join is off", Score(0, 0, 9999, True), addr)
 
     # Re-entry watch + trusted-coin management run on the slow cadence (not time-critical)
     check_reentry_watch()
