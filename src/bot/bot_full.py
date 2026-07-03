@@ -15,8 +15,8 @@ except Exception:
 
 from flask import Flask, jsonify, request as flask_request, abort, send_from_directory
 from functools import wraps
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
 # ---------------------------------------------------------------------------
 # Config
@@ -361,6 +361,8 @@ STATE: Dict[str, Any] = {
     "ai":               {"last_run": None, "last": None, "history": []},  # AI advisor state
     "entries_today":    {},  # symbol → count of fresh entries today (anti-churn), reset daily
     "recently_exited":  {},  # symbol → {ts, price, pnl} — blocks scanner re-entry after full close
+    "pending_buy_approvals": {},  # "{wid}:{symbol}" → ask-before-buy record awaiting yes/no/timeout
+    "declined_buy_until":    {},  # symbol → epoch ts; don't re-ask before this (declined or timed out)
     "custom_modes":     {},  # user-saved backtest configs {name → btParams}
     "reject_cache":     {},  # symbol → {ts, reason_type, price} — skip re-eval until price spikes
     # Wallet goal: Phase 1 = grow to $1000. Phase 2 = skim 50% of profit above $100 threshold.
@@ -1427,7 +1429,7 @@ def fetch_birdeye_sol_candidates() -> List[Dict[str, Any]]:
             return []
         out: List[Dict[str, Any]] = []
         for t in (resp.json().get("data", {}).get("tokens") or []):
-            sym   = (t.get("symbol") or "").upper()
+            sym   = (t.get("symbol") or "").upper()[:20]
             price = float(t.get("price") or 0)
             liq   = float(t.get("liquidity") or 0)
             vol24 = float(t.get("v24h") or 0)
@@ -1523,7 +1525,12 @@ def _degen_hype_bonus(symbol: str) -> int:
 
 def _pair_to_candidate(pair: Dict[str, Any], our_chain: str) -> Optional[Dict[str, Any]]:
     try:
-        symbol = (pair.get("baseToken") or {}).get("symbol", "").upper()
+        # Capped at 20 chars — an unbounded ticker (DexScreener doesn't enforce a
+        # length) can blow Telegram's 64-byte inline-button callback_data limit
+        # ("{kind}:{decision}:{wid}:{symbol}"), silently dropping an ask-before-
+        # buy/sell prompt. Found in audit 2026-07-03; degrades gracefully to the
+        # timeout default either way, but no reason to leave the edge case open.
+        symbol = ((pair.get("baseToken") or {}).get("symbol", "").upper())[:20]
         if not symbol:
             return None
         created_at = pair.get("pairCreatedAt")
@@ -3232,6 +3239,38 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
     save_state()
 
 
+ASK_BEFORE_SELL_SEC = 90    # user (2026-07-03): "a few moments to spare on sketchy ones"
+ASK_BEFORE_BUY_SEC  = 120
+# "Not now" is not "forever" — user: "not a completely ignore it for forever yes
+# or no. but a not rn" + "its a bull market rn my bot needs to MOVEEE." A decline
+# just needs to get out of the way fast, not lock the token/position out.
+BUY_DECLINE_COOLDOWN_SEC = 180    # re-offer a declined young coin this soon if it's still around
+SELL_DECLINE_PAUSE_SEC   = 600    # a declined/timed-out sell auto-resumes normal exits after this
+
+
+def _offer_sell_approval(wid: str, w: Dict, symbol: str, pos: Dict, reason: str) -> None:
+    """Starts (or re-confirms) an ask-before-sell for a non-urgent exit. Only ever
+    called for reasons that aren't already urgent (RUG/LIQ DRAIN bypass this
+    entirely) and aren't already manually held (_sell_paused positions never reach
+    here — they go through the existing hold-alert path instead). Actual yes/no
+    execution happens in msg_night_mode when the reply arrives; the timeout default
+    (no reply) is handled at the top of _manage_wallet_positions's per-position loop.
+    """
+    if pos.get("sell_pending_approval"):
+        return   # already asked this position, waiting on a reply or the timeout
+    now = time.time()
+    pos["sell_pending_approval"] = {
+        "reason": reason, "reason_cat": reason.split(" ")[0],
+        "asked_ts": now, "deadline": now + ASK_BEFORE_SELL_SEC,
+    }
+    save_state()
+    send_approval_prompt(
+        f"🤔 Sell {symbol} on {w.get('label', wid)}? {reason}\n"
+        f"({ASK_BEFORE_SELL_SEC}s, then pauses for ~{SELL_DECLINE_PAUSE_SEC // 60}min if no answer)",
+        callback_yes=f"sell:yes:{wid}:{symbol}", callback_no=f"sell:no:{wid}:{symbol}",
+        no_label="⏸️ Not now")
+
+
 def _wlt_realized_pnl_recent(w: Dict, n: int = 10) -> Dict[str, Any]:
     """Real, completed-trade P&L only — immune to the equity-drawdown false-alarm
     below. Used to answer the user's actual question: 'am I genuinely losing over
@@ -3769,6 +3808,31 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         else:
             pos["price_misses"] = 0
 
+        # Ask-before-sell (2026-07-03). User: "same for sell... i still want it
+        # to override me if something massive instantly is happening. but if i
+        # have a few moments to spare on sketchy ones, id like to have a say."
+        # A pending ask blocks re-evaluating exit conditions THIS tick (don't
+        # want to ask again or silently decide while waiting) — but true
+        # emergencies (price-feed-lost above, RUG/LIQ DRAIN below) never create
+        # a pending ask in the first place, so they're never blocked by this.
+        _pending_sell = pos.get("sell_pending_approval")
+        if _pending_sell and time.time() >= _pending_sell.get("deadline", 0):
+            pos.pop("sell_pending_approval", None)
+            pos["sell_paused"]      = True   # no reply = default no-act = hold, not sell
+            pos["sell_pause_until"] = time.time() + SELL_DECLINE_PAUSE_SEC   # temporary, auto-resumes
+            send_alert(
+                f"⏸️ {symbol} on {w.get('label', wid)} — no reply within "
+                f"{ASK_BEFORE_SELL_SEC}s on '{_pending_sell.get('reason')}', pausing "
+                f"its auto-exit for ~{SELL_DECLINE_PAUSE_SEC // 60}min instead of "
+                f"guessing, then back to auto.", critical=True)
+        # Deliberately NOT `continue`-ing while a pending ask is still within its
+        # window. Audited 2026-07-03: an earlier version continued here, which
+        # skipped the RUG/LIQ DRAIN checks further down for the entire wait —
+        # exactly the "override me if something massive instantly is happening"
+        # case the user asked to keep automatic. _offer_sell_approval() below
+        # already no-ops while a pending record exists, so nothing here creates
+        # a duplicate ask.
+
         # Track peak
         if price > pos.get("peak_price", 0):
             pos["peak_price"] = price
@@ -3848,6 +3912,18 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         # ALSO stays active while held (2026-07-02: "when im also holding them, they
         # are allowed to do the tiered profits still") — banking profit on the way up
         # isn't the noise HOLD is meant to silence.
+        # A pause set BY this feature (declining/timing-out a sell ask) carries a
+        # "sell_pause_until" expiry and auto-resumes on its own — user (2026-07-03):
+        # "not a completely ignore it for forever yes or no. but a not rn." A pause
+        # set by the user's own explicit "hold SYMBOL" command has no expiry and
+        # stays indefinite, exactly as before — that's a deliberate manual choice,
+        # not a "give me a minute" one, so it's untouched here.
+        if pos.get("sell_pause_until") and time.time() >= pos["sell_pause_until"]:
+            pos.pop("sell_paused", None)
+            pos.pop("sell_pause_until", None)
+            pos.pop("hold_alert_reason", None)
+            pos.pop("hold_alert_ts", None)
+
         _manual_grace = time.time() < pos.get("manual_grace_until", 0)
         _sell_paused = bool(pos.get("sell_paused")) or _manual_grace
 
@@ -3878,13 +3954,28 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         # position can still tell the user "I would have sold here" instead of just
         # going silent. Kept separate from exit_reason (which only the two always-on
         # liquidity checks below can set while paused).
+        # _soft_reason is the ask-before-sell counterpart: a non-urgent exit (dollar
+        # stop / velocity / trail / fixed SL) that ISN'T paused, so the bot would
+        # normally act on it immediately — but the user asked to be given "a few
+        # moments to spare on sketchy ones" first. Spray positions are exempted
+        # (exit_reason, not _soft_reason) — their whole design is a small, hard,
+        # mathematically-bounded ceiling that's meant to never need a human in the
+        # loop. RUG and LIQ DRAIN below are exempted too — genuine liquidity danger
+        # is exactly the "override me if something massive instantly is happening"
+        # case the user asked to keep automatic.
         _would_reason: Optional[str] = None
+        _soft_reason:  Optional[str] = None
         if _dollar_stop > 0 and (_cur_val - _cost) < -_eff_stop:
             _would_reason = f"DOLLAR STOP -${abs(_cur_val - _cost):.2f}"
             if not _sell_paused:
-                exit_reason = _would_reason
+                if pos.get("spray"):
+                    exit_reason = _would_reason
+                else:
+                    _soft_reason = _would_reason
 
-        # Rug liq drop — wallet override → global. NEVER gated by _sell_paused.
+        # Rug liq drop — wallet override → global. NEVER gated by _sell_paused
+        # OR the ask-before-sell flow — a real liquidity crash is the emergency
+        # override case, not a "few moments to spare" case.
         _rug_drop = _sf.get("rug_liq_drop_pct") or MS["rug_liq_drop"]
         prev_liq = liq_prev.get(symbol, liq)
         if liq < prev_liq * (1 - _rug_drop):
@@ -3896,7 +3987,10 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         if exit_reason is None and _would_reason is None and change_m5 < -(_vel_pct * 100):
             _would_reason = f"VELOCITY {change_m5:.1f}% in 5m"
             if not _sell_paused:
-                exit_reason = _would_reason
+                if pos.get("spray"):
+                    exit_reason = _would_reason
+                else:
+                    _soft_reason = _would_reason
 
         # Slow liq drain — wallet override → global. NEVER gated by _sell_paused
         # (same reasoning as RUG liq drop — this is the gradual version of the same risk).
@@ -3910,7 +4004,10 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         if exit_reason is None and _would_reason is None and price <= peak * (1 - trail_pct):
             _would_reason = f"TRAIL STOP {((price/peak)-1)*100:.1f}% from peak"
             if not _sell_paused:
-                exit_reason = _would_reason
+                if pos.get("spray"):
+                    exit_reason = _would_reason
+                else:
+                    _soft_reason = _would_reason
 
         if exit_reason:
             _wlt_sell(wid, w, symbol, price, exit_reason)
@@ -4006,10 +4103,19 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         # Fixed SL fallback — liquidity-scaled auto-hold widens this too, but capped
         # at 1.5x (not the full 2x trail/dollar-stop cap) since this is the last-
         # resort backstop and shouldn't be loosened as aggressively as the more
-        # adaptive exits above.
+        # adaptive exits above. Spray positions still execute this instantly
+        # (bounded-risk design, no human in the loop by intent); everything else
+        # routes through the same ask-before-sell flow as dollar/velocity/trail.
         sl_level = (pos.get("sl_override") or mode_cfg.get("sl", 0.18)) * min(_liq_mult, 1.5)
         if pos.get("units", 0) > 0 and price <= pos["avg"] * (1 - sl_level):
-            _wlt_sell(wid, w, symbol, price, "fixed_sl")
+            if pos.get("spray"):
+                _wlt_sell(wid, w, symbol, price, "fixed_sl")
+                continue
+            if _soft_reason is None:
+                _soft_reason = "fixed_sl"
+
+        if _soft_reason:
+            _offer_sell_approval(wid, w, symbol, pos, _soft_reason)
 
     # Periodic drawdown check — takes velocity snapshots even between sells
     _wallet_drawdown_check(wid, w)
@@ -4099,21 +4205,66 @@ def _wallets_offer_entry(symbol: str, chain: str, price: float, liq: float,
         if cap > 0:
             usd = min(usd, cap)
 
-        _wlt_buy(wid, w, symbol, chain, usd, price, liq, addr)
         if age_min < 60:
-            _new_pos = w.get("positions", {}).get(symbol)
-            if _new_pos:
-                _new_pos["spray"] = True
-                # _wlt_buy() already called save_state() before this flag was set —
-                # without a second save here, a restart landing in this gap loads a
-                # copy of the position with no spray flag, silently falling through
-                # to normal (unprotected-for-young-coins) exit management from then
-                # on. Root-caused 2026-07-03: zero live positions ever showed
-                # spray=True and zero real sells ever carried a SPRAY exit reason,
-                # despite young coins clearly being bought — this save-ordering gap
-                # was why "the new logic never engaged."
-                save_state()
+            # Ask-before-buy (2026-07-03). User: "can the bot ask me if it can buy
+            # a token that its unsure of... same for sell." Every young/spray-mode
+            # coin is inherently the least liquidity-proven category (the whole
+            # reason spray exists as a bounded-risk sub-strategy in the first
+            # place), so ALL of them ask first instead of just the borderline ones.
+            # Established/non-young candidates below still enter automatically —
+            # nothing changes there.
+            _declined_until = STATE.get("declined_buy_until", {}).get(symbol, 0)
+            if time.time() < _declined_until:
+                _miss(w, "recently_declined")
+                continue
+            _pending_key = f"{wid}:{symbol}"
+            if _pending_key in STATE.get("pending_buy_approvals", {}):
+                continue   # already asked, awaiting a reply or the timeout sweep
+            deadline = time.time() + ASK_BEFORE_BUY_SEC
+            STATE.setdefault("pending_buy_approvals", {})[_pending_key] = {
+                "wid": wid, "symbol": symbol, "chain": chain, "address": addr,
+                "price": price, "liq": liq, "usd": usd,
+                "asked_ts": time.time(), "deadline": deadline,
+            }
+            save_state()
+            send_approval_prompt(
+                f"🤔 Buy {symbol}? young coin ({age_min:.0f}min old), ${usd:.2f} ticket, "
+                f"liq ${liq:,.0f}\n({ASK_BEFORE_BUY_SEC}s, then skips for now if no answer)",
+                callback_yes=f"buy:yes:{wid}:{symbol}", callback_no=f"buy:no:{wid}:{symbol}",
+                no_label="⏭️ Not now")
+            scan_entered.setdefault(wid, set()).add(symbol)
+            continue
+
+        _wlt_buy(wid, w, symbol, chain, usd, price, liq, addr)
         scan_entered.setdefault(wid, set()).add(symbol)
+
+
+def _process_pending_buy_approvals():
+    """Expires unanswered ask-before-buy prompts (default on timeout: skip, same
+    as an explicit 'no'). A 'yes'/'no' reply is handled immediately in
+    msg_night_mode — this only needs to run periodically to catch silence.
+    Called every engine cycle regardless of whether a new scan found candidates,
+    so a pending ask can't get stuck waiting on the next scan tick to notice
+    its own deadline passed."""
+    pending = STATE.get("pending_buy_approvals")
+    if not pending:
+        return
+    now = time.time()
+    for key in list(pending.keys()):
+        # .pop(key, None), not `pending[key]` — a Telegram reply resolving (and
+        # removing) this SAME key can race this sweep from the other thread.
+        # Audited 2026-07-03: a plain lookup/`del` here could raise a KeyError.
+        p = pending.pop(key, None)
+        if p is None:
+            continue
+        if now >= p.get("deadline", 0):
+            STATE.setdefault("declined_buy_until", {})[p["symbol"]] = now + BUY_DECLINE_COOLDOWN_SEC
+            save_state()
+            send_alert(
+                f"⏱ No reply on {p['symbol']} within {ASK_BEFORE_BUY_SEC}s — skipping for now "
+                f"(you can still buy it manually any time).", critical=True)
+        else:
+            pending[key] = p   # not expired yet — put it back
 
 
 _followup_last_run: float = 0.0
@@ -7885,6 +8036,35 @@ def send_alert(msg: str, critical: bool = False, paper: bool = False):
     asyncio.run_coroutine_threadsafe(_send(), TG_STATE["loop"])
 
 
+def send_approval_prompt(msg: str, callback_yes: str, callback_no: str, no_label: str = "❌ Not now") -> None:
+    """Same delivery mechanism as send_alert (thread-safe call from the sync engine
+    loop into the async Telegram bot) but attaches two inline buttons instead of
+    relying on a typed 'yes SYMBOL'/'no SYMBOL' reply. User (2026-07-03): "as soon
+    as the bot blows me up on telegram, it wont know which yes is which and which
+    no is no" — callback_data is bound to the exact request (kind:decision:wid:
+    symbol), so a tap can't be ambiguous no matter how many asks are in flight.
+    Typed 'yes SYMBOL'/'no SYMBOL' still works too (msg_night_mode) as a fallback.
+    """
+    ALERT_LOG.appendleft({"ts": now_utc().isoformat(), "msg": msg, "critical": True})
+    if not TG_STATE.get("bot") or not TG_STATE.get("loop"):
+        return
+    chat_id = STATE.get("telegram", {}).get("owner_chat_id")
+    if not chat_id:
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data=callback_yes),
+        InlineKeyboardButton(no_label, callback_data=callback_no),
+    ]])
+
+    async def _send():
+        try:
+            await TG_STATE["bot"].send_message(chat_id=chat_id, text=msg, reply_markup=kb)
+        except Exception:
+            pass
+
+    asyncio.run_coroutine_threadsafe(_send(), TG_STATE["loop"])
+
+
 # ---------------------------------------------------------------------------
 # Market trend digest (2026-07-02) — user: "i want telegram to alert me
 # different with a more stand out message that lets me know if the solana
@@ -8515,6 +8695,164 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state()
         await update.message.reply_text(
             "🔔 Back on — all alerts resumed." if was_snoozed else "Wasn't snoozed, but noted — all alerts are on.")
+        return
+
+    # "yes"/"no" (optionally "yes SYMBOL") — answers a pending ask-before-buy or
+    # ask-before-sell prompt. User (2026-07-03): "can the bot ask me if it can buy
+    # a token that its unsure of. and i can say yes or no. and same for sell."
+    # Typed fallback for the ask-before-buy/sell buttons (primary UX is the
+    # inline-keyboard tap in send_approval_prompt/on_approval_button — this only
+    # exists for someone who'd rather type). Ticker-shaped second word required
+    # (2-10 alnum) so ordinary chat like "no thanks"/"yes please"/"no clue" can't
+    # match — audited 2026-07-03, the looser \w+ pattern was sending a spurious
+    # "No pending ask for X" reply to normal conversation.
+    _yn = re.match(r"(yes|no|y|n)(?:\s+([A-Za-z0-9]{2,10}))?$", text)
+    if _yn:
+        decision, sym_arg = _yn.groups()
+        approve = decision in ("yes", "y")
+        symbol  = sym_arg.upper() if sym_arg else None
+
+        pending_buys = [(k, p) for k, p in STATE.get("pending_buy_approvals", {}).items()
+                        if not symbol or p["symbol"] == symbol]
+        pending_sells = []
+        for wid, w in live_wallets:
+            for sym, pos in w.get("positions", {}).items():
+                if pos.get("sell_pending_approval") and (not symbol or sym == symbol):
+                    pending_sells.append((wid, w, sym, pos))
+
+        total = len(pending_buys) + len(pending_sells)
+        if total == 0:
+            return   # nothing pending — silently ignore (could be ordinary chat)
+
+        # Ambiguous even WITH a symbol — e.g. wallet A has a pending sell-ask on
+        # SYMBOL while wallet B independently has a pending buy-ask on the same
+        # SYMBOL. Audited 2026-07-03: only checking `not symbol` here let a plain
+        # "yes SYMBOL" silently approve both at once.
+        if total > 1:
+            names = [p["symbol"] for _, p in pending_buys] + [s for *_, s, _ in pending_sells]
+            await update.message.reply_text(
+                f"More than one pending ask right now ({', '.join(names)}) — use the "
+                f"buttons on each message, or reply '{decision} SYMBOL' won't be enough "
+                f"to disambiguate here.")
+            return
+
+        for key, _ in pending_buys:
+            # .pop(key, None), not a bare lookup/del — the timeout sweep on the
+            # engine thread can remove this same key concurrently.
+            p = STATE.get("pending_buy_approvals", {}).pop(key, None)
+            if p is None:
+                await update.message.reply_text("That ask already resolved (timed out or answered).")
+                continue
+            if approve:
+                w = STATE.get("wallets", {}).get(p["wid"])
+                dex   = fetch_dexscreener_token(p["address"])
+                price = float((dex or {}).get("pairs", [{}])[0].get("priceUsd") or 0) if dex and dex.get("pairs") else 0
+                liq   = float(((dex or {}).get("pairs", [{}])[0].get("liquidity") or {}).get("usd") or 0) if dex and dex.get("pairs") else p["liq"]
+                if not w:
+                    await update.message.reply_text(f"Couldn't buy {p['symbol']} — wallet no longer found.")
+                elif price <= 0:
+                    await update.message.reply_text(f"Couldn't fetch a current price for {p['symbol']} — buy manually if you still want it.")
+                else:
+                    _wlt_buy(p["wid"], w, p["symbol"], p["chain"], p["usd"], price, liq, p["address"])
+                    _new_pos = w.get("positions", {}).get(p["symbol"])
+                    if _new_pos:
+                        _new_pos["spray"] = True
+                    save_state()
+                    await update.message.reply_text(f"✅ Bought {p['symbol']} — ${p['usd']:.2f}.")
+            else:
+                STATE.setdefault("declined_buy_until", {})[p["symbol"]] = time.time() + BUY_DECLINE_COOLDOWN_SEC
+                save_state()
+                await update.message.reply_text(f"⏭️ Not now — {p['symbol']}.")
+
+        for wid, w, sym, pos in pending_sells:
+            if not pos.get("sell_pending_approval"):
+                await update.message.reply_text("That ask already resolved (timed out or answered).")
+                continue
+            reason = pos["sell_pending_approval"].get("reason", "manual approval")
+            pos.pop("sell_pending_approval", None)
+            if approve:
+                addr  = pos.get("address", "")
+                dex   = fetch_dexscreener_token(addr) if addr else None
+                price = float((dex or {}).get("pairs", [{}])[0].get("priceUsd") or 0) if dex and dex.get("pairs") else 0
+                if price <= 0:
+                    price = pos.get("peak_price") or pos.get("avg", 0)
+                _wlt_sell(wid, w, sym, price, reason)
+                await update.message.reply_text(f"✅ Sold {sym}.")
+            else:
+                pos["sell_paused"]      = True
+                pos["sell_pause_until"] = time.time() + SELL_DECLINE_PAUSE_SEC
+                save_state()
+                await update.message.reply_text(
+                    f"⏸️ {sym} paused for ~{SELL_DECLINE_PAUSE_SEC // 60}min, then back to auto.")
+        return
+
+
+@require_auth
+async def on_approval_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the inline-keyboard buttons from send_approval_prompt. callback_data
+    is "{kind}:{decision}:{wid}:{symbol}" — self-contained, so a tap can't be
+    ambiguous no matter how many asks are in flight (the problem with typed
+    replies the buttons exist to solve). Edits the original message in place so
+    the chat shows exactly what was decided instead of piling up new messages."""
+    query = update.callback_query
+    await query.answer()
+    parts = (query.data or "").split(":")
+    if len(parts) != 4:
+        return
+    kind, decision, wid, symbol = parts
+    approve = decision == "yes"
+    orig = query.message.text or ""
+
+    if kind == "buy":
+        p = STATE.get("pending_buy_approvals", {}).pop(f"{wid}:{symbol}", None)
+        if p is None:
+            await query.edit_message_text(f"{orig}\n\n(already resolved)")
+            return
+        if approve:
+            w = STATE.get("wallets", {}).get(wid)
+            dex   = fetch_dexscreener_token(p["address"])
+            price = float((dex or {}).get("pairs", [{}])[0].get("priceUsd") or 0) if dex and dex.get("pairs") else 0
+            liq   = float(((dex or {}).get("pairs", [{}])[0].get("liquidity") or {}).get("usd") or 0) if dex and dex.get("pairs") else p["liq"]
+            if not w:
+                await query.edit_message_text(f"{orig}\n\n⚠️ Couldn't buy — wallet no longer found.")
+            elif price <= 0:
+                await query.edit_message_text(f"{orig}\n\n⚠️ Couldn't fetch a current price — buy manually if you still want it.")
+            else:
+                _wlt_buy(wid, w, symbol, p["chain"], p["usd"], price, liq, p["address"])
+                _new_pos = w.get("positions", {}).get(symbol)
+                if _new_pos:
+                    _new_pos["spray"] = True
+                save_state()
+                await query.edit_message_text(f"{orig}\n\n✅ Bought — ${p['usd']:.2f}.")
+        else:
+            STATE.setdefault("declined_buy_until", {})[symbol] = time.time() + BUY_DECLINE_COOLDOWN_SEC
+            save_state()
+            await query.edit_message_text(
+                f"{orig}\n\n⏭️ Not now (I'll ask again in ~{BUY_DECLINE_COOLDOWN_SEC // 60}min if it's still around).")
+        return
+
+    if kind == "sell":
+        w = STATE.get("wallets", {}).get(wid)
+        pos = w.get("positions", {}).get(symbol) if w else None
+        if not pos or not pos.get("sell_pending_approval"):
+            await query.edit_message_text(f"{orig}\n\n(already resolved)")
+            return
+        reason = pos["sell_pending_approval"].get("reason", "manual approval")
+        pos.pop("sell_pending_approval", None)
+        if approve:
+            addr  = pos.get("address", "")
+            dex   = fetch_dexscreener_token(addr) if addr else None
+            price = float((dex or {}).get("pairs", [{}])[0].get("priceUsd") or 0) if dex and dex.get("pairs") else 0
+            if price <= 0:
+                price = pos.get("peak_price") or pos.get("avg", 0)
+            _wlt_sell(wid, w, symbol, price, reason)
+            await query.edit_message_text(f"{orig}\n\n✅ Sold.")
+        else:
+            pos["sell_paused"]      = True
+            pos["sell_pause_until"] = time.time() + SELL_DECLINE_PAUSE_SEC
+            save_state()
+            await query.edit_message_text(
+                f"{orig}\n\n⏸️ Paused ~{SELL_DECLINE_PAUSE_SEC // 60}min, then back to auto.")
         return
 
 
@@ -9716,6 +10054,7 @@ def manage_positions():
 
     _manage_arenas(live_prices)
     _run_price_followup()
+    _process_pending_buy_approvals()
 
 
 def engine_once():
@@ -9951,6 +10290,7 @@ def start_telegram():
     tg.add_handler(CommandHandler("wsell_at",     cmd_wsell_at))
     tg.add_handler(CommandHandler("wbuy_at",      cmd_wbuy_at))
     tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_night_mode))
+    tg.add_handler(CallbackQueryHandler(on_approval_button))
     if not STATE.get("telegram", {}).get("owner_chat_id"):
         log("WARN Telegram: owner_chat_id not set — proactive alerts (drawdown/sell/rug/digest) "
             "won't send until you message the bot once (any command works, e.g. /status)")
