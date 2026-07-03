@@ -5939,6 +5939,38 @@ def _ai_market_context() -> Dict[str, Any]:
     }
 
 
+def _maybe_alert_ai_credits_low(e: Exception) -> None:
+    """AI advisor/position-review calls fail with a distinct "credit balance is
+    too low" error when the Anthropic API key runs dry. User (2026-07-03):
+    "have it message me to top of my anthropic api credits. a max of 5x per
+    day. spread out." Capped at 5/day with a minimum gap between reminders —
+    a single review cycle can hit this for every open position at once (4-5
+    calls within the same second), which would otherwise blow through "5x
+    spread out" almost instantly on the very first failed cycle.
+    """
+    msg = str(e).lower()
+    if "credit balance" not in msg and "insufficient" not in msg:
+        return
+    rec = STATE.setdefault("ai_credit_alert", {"day": "", "count": 0, "last_ts": 0.0})
+    today = now_utc().strftime("%Y-%m-%d")
+    if rec.get("day") != today:
+        rec["day"]   = today
+        rec["count"] = 0
+    if rec["count"] >= 5:
+        return
+    _MIN_GAP_SEC = 4 * 3600   # spreads the 5/day allowance roughly every 4h+ apart
+    if time.time() - rec.get("last_ts", 0) < _MIN_GAP_SEC:
+        return
+    rec["count"]   += 1
+    rec["last_ts"]  = time.time()
+    save_state()
+    send_alert(
+        f"💳 AI advisor is out of Anthropic API credits — mode advice and position "
+        f"reviews are paused until you top up at console.anthropic.com. "
+        f"({rec['count']}/5 reminders today)",
+        critical=True)
+
+
 def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
     """Consult Claude Haiku for a risk-mode recommendation. Returns the decision dict or None.
     Gated on CONFIG['ai']['enabled'] + ANTHROPIC_API_KEY; auto-applies the mode if configured."""
@@ -5980,6 +6012,7 @@ def ai_advise(force: bool = False) -> Optional[Dict[str, Any]]:
         decision = json.loads(_clean)
     except Exception as e:
         log(f"AI advise failed: {e} | raw response: {text[:300]!r}")
+        _maybe_alert_ai_credits_low(e)
         return None
 
     decision["confidence"] = max(0.0, min(1.0, float(decision.get("confidence", 0))))
@@ -6132,6 +6165,7 @@ def ai_review_position(wid: str, w: Dict, symbol: str, pos: Dict, price: float) 
         decision = json.loads(_clean)
     except Exception as e:
         log(f"AI position review failed for {symbol}: {e} | raw: {text[:300]!r}")
+        _maybe_alert_ai_credits_low(e)
         return None
 
     emoji = {"good_entry": "✅", "bad_entry": "⚠️", "uncertain": "🤔"}.get(decision.get("read"), "🤖")
