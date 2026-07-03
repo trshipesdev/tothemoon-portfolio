@@ -3481,7 +3481,7 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
                 pos["usd"]   = pos.get("usd", 0.0) + added_usd
                 pos["avg"]   = pos["usd"] / max(actual, 1e-9)   # blended cost basis
                 pos["deployed_usd"] = pos.get("deployed_usd", pos["usd"]) + added_usd
-                pos["manual_grace_until"] = time.time() + 300   # same 5min room as a fresh manual adopt
+                pos["manual_grace_until"] = time.time() + 120   # same grace window as a fresh manual adopt
                 w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + added_usd
                 log(f"[W:{wid}] RECONCILE {symbol}: manual top-up detected, +{added_units:.4f} units "
                     f"(${added_usd:.2f}) merged, new avg {pos['avg']:.8f}")
@@ -3564,9 +3564,10 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
             # into a live scan cycle already in progress; the exit checks below can
             # fire within seconds on a token the bot never evaluated the trend on,
             # -$11 gone before the user even sees it show up on the dashboard. Give it
-            # a real 5-minute grace window — same "tell but don't act" treatment as
-            # the manual HOLD toggle (rug/liq-drain protection still active).
-            w["positions"][symbol]["manual_grace_until"] = time.time() + 300
+            # a real grace window — same "tell but don't act" treatment as the manual
+            # HOLD toggle (rug/liq-drain protection still active). Shortened to 2min
+            # (2026-07-03, user: "shorten the watch on manuals to 2 minutes").
+            w["positions"][symbol]["manual_grace_until"] = time.time() + 120
         w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + usd
         log(f"[W:{wid}] RECONCILE ADOPT {symbol}: {ui:.4f} on-chain tokens from "
             f"{src} @ {entry_ts[:19]} — now tracked and exit-managed")
@@ -3821,7 +3822,7 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
                     pos["hold_alert_reason"] = _would_reason
                     pos["hold_alert_ts"]     = _now
                     _why = (f"still settling in — {int(pos['manual_grace_until'] - _now)}s left "
-                            f"on its 5min manual-add grace window" if _manual_grace else "it's on HOLD")
+                            f"on its manual-add grace window" if _manual_grace else "it's on HOLD")
                     send_alert(
                         f"⏸️👀 {symbol} on {w.get('label', wid)} would have sold — "
                         f"{_would_reason} — but {_why}. Still watching.",
