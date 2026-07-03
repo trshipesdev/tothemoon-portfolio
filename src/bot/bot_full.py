@@ -1236,6 +1236,43 @@ def fetch_coingecko_trending() -> List[Dict[str, Any]]:
     return out
 
 
+_coingecko_trending_cache: Dict[str, Any] = {"ts": 0.0, "data": []}
+_COINGECKO_TRENDING_TTL = 300.0   # trending lists don't move fast enough to justify calling every ~8s scan
+
+
+def _coingecko_trending_candidates() -> List[Dict[str, Any]]:
+    """CoinGecko's global trending list, enriched with real DexScreener market
+    data so it's usable by the same filters (liquidity/hype/trend/safety) as
+    every other candidate. User (2026-07-02): "i wanted my bot to scan the
+    market for any crypto to make a quick buck on. not JUST NEW ones." The
+    primary feeds (token-boosts/latest, token-profiles/latest) are both
+    "latest"-only by construction — established coins structurally can't
+    appear there. This is chain-agnostic in itself, but filtered down to
+    CONFIG["chains"] (currently sol-only) same as everywhere else.
+    """
+    now = time.time()
+    if now - _coingecko_trending_cache["ts"] < _COINGECKO_TRENDING_TTL:
+        raw = _coingecko_trending_cache["data"]
+    else:
+        raw = fetch_coingecko_trending()
+        _coingecko_trending_cache["ts"] = now
+        _coingecko_trending_cache["data"] = raw
+    out: List[Dict[str, Any]] = []
+    active_chains = set(CONFIG["chains"])
+    for item in raw:
+        if item.get("chain") not in active_chains or not item.get("address"):
+            continue
+        dex = fetch_dexscreener_token(item["address"])
+        pairs = (dex or {}).get("pairs") or []
+        if not pairs:
+            continue
+        best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+        c = _pair_to_candidate(best, item["chain"])
+        if c:
+            out.append(c)
+    return out
+
+
 def fetch_birdeye_price(token_addr: str) -> Optional[Dict[str, Any]]:
     """Fetch Solana token price from Birdeye. Returns {price, liquidity, volume24h} or None."""
     key = os.getenv(BIRDEYE_KEY_ENV, "")
@@ -1460,6 +1497,14 @@ def fetch_new_candidates() -> List[Dict[str, Any]]:
 
     # Birdeye — trending Solana tokens (only if API key set)
     for c in fetch_birdeye_sol_candidates():
+        key = (c["symbol"], c["chain"])
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+
+    # CoinGecko trending — the whole crypto market, any cap size, not just
+    # fresh pump.fun-style launches like the two feeds above.
+    for c in _coingecko_trending_candidates():
         key = (c["symbol"], c["chain"])
         if key not in seen:
             seen.add(key)
