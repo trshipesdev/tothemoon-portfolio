@@ -2365,8 +2365,12 @@ def shadow_sell(symbol: str, usd: float, price: float, liq_usd: float, exit_reas
             # Accumulate per-token daily losses so repeated small losses escalate cooldowns.
             t_pnl = STATE.setdefault("token_pnl_today", {})
             t_pnl[symbol] = t_pnl.get(symbol, 0.0) + pnl
+            # Missing paper=True (2026-07-03) — this alert was unconditionally sent to
+            # Telegram regardless of wallet-live status, unlike every other paper-engine
+            # BOUGHT/SOLD alert. User: "why is my bot still telling me about coins it
+            # joined and entered like jerry... never entered with hot."
             send_alert(f"🚫 {symbol} on cooldown (paper loss ${pnl:+.2f}) [{exit_reason}]",
-                       critical=True)
+                       critical=True, paper=True)
         if pnl <= -30:
             send_alert(
                 f"🚨 HARD STOP ${symbol} — lost ${abs(pnl):.0f} on this trade (paper). "
