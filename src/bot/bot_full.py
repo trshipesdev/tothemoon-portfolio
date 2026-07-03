@@ -3266,8 +3266,29 @@ ASK_BEFORE_BUY_SEC  = 120
 # or no. but a not rn" + "its a bull market rn my bot needs to MOVEEE." A decline
 # just needs to get out of the way fast, not lock the token/position out.
 BUY_DECLINE_COOLDOWN_SEC = 180    # re-offer a declined young coin this soon if it's still around
-SELL_DECLINE_PAUSE_SEC   = 600    # a declined/timed-out sell auto-resumes normal exits after this
+SELL_DECLINE_PAUSE_SEC   = 900    # base pause (15min) — see _next_sell_snooze_sec for the escalating version actually used
+SELL_DECLINE_PAUSE_MAX_SEC = 4 * 3600
 MIN_ENTRY_AGE_MIN        = 15.0   # user (2026-07-03): "can we wait till tickets are like 15 min old" — skip the newest, highest-rug-risk launches entirely
+
+
+def _next_sell_snooze_sec(pos: Dict) -> float:
+    """Escalating auto-pause after a declined/ignored sell ask: 15min, 30min, 1h,
+    2h, capped at 4h. Doubles each time the SAME position gets re-asked and
+    ignored/declined again, instead of a flat 10min every time.
+
+    Found live 2026-07-03 — user: "i feel like its throwing errors at me as it
+    gets better like drops 50%, up 20%, so now only down 30%, boom another
+    message." A flat 10min pause meant a stuck, unanswered position got a fresh
+    "Sell X?" ask roughly every ~12 minutes forever (90s ask + 10min pause,
+    repeating) — real Telegram history showed BULLANA re-asked at 19:24, then
+    again at 19:34, then paused again at 19:35. Escalating this makes the nagging
+    taper off for a position nobody's responding to, while still eventually
+    checking back in (never fully "forever," per the same user's earlier "not a
+    completely ignore it for forever yes or no" — see BUY_DECLINE_COOLDOWN_SEC).
+    """
+    n = int(pos.get("sell_ask_snooze_count", 0))
+    pos["sell_ask_snooze_count"] = n + 1
+    return min(SELL_DECLINE_PAUSE_SEC * (2 ** n), SELL_DECLINE_PAUSE_MAX_SEC)
 
 
 def _offer_sell_approval(wid: str, w: Dict, symbol: str, pos: Dict, reason: str) -> None:
@@ -3883,12 +3904,13 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
         _pending_sell = pos.get("sell_pending_approval")
         if _pending_sell and time.time() >= _pending_sell.get("deadline", 0):
             pos.pop("sell_pending_approval", None)
-            pos["sell_paused"]      = True   # no reply = default no-act = hold, not sell
-            pos["sell_pause_until"] = time.time() + SELL_DECLINE_PAUSE_SEC   # temporary, auto-resumes
+            pos["sell_paused"] = True   # no reply = default no-act = hold, not sell
+            _snooze = _next_sell_snooze_sec(pos)
+            pos["sell_pause_until"] = time.time() + _snooze   # temporary, auto-resumes
             send_alert(
                 f"⏸️ {symbol} on {w.get('label', wid)} — no reply within "
                 f"{ASK_BEFORE_SELL_SEC}s on '{_pending_sell.get('reason')}', pausing "
-                f"its auto-exit for ~{SELL_DECLINE_PAUSE_SEC // 60}min instead of "
+                f"its auto-exit for ~{_snooze // 60:.0f}min instead of "
                 f"guessing, then back to auto.", critical=True)
         # Deliberately NOT `continue`-ing while a pending ask is still within its
         # window. Audited 2026-07-03: an earlier version continued here, which
@@ -4151,10 +4173,24 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
                 # this morning [instead]." Same real-time behavior, just far less
                 # frequent — a stuck trail-stop condition is still worth knowing about,
                 # just not every 5 minutes.
-                _HOLD_ALERT_COOLDOWN_SEC = 3 * 3600
+                # Minimum gap before a category CHANGE can bypass the cooldown, too
+                # (2026-07-03): user reported BULLANA/MENSA-style whiplash — "drops
+                # 50%, up 20%, so now only down 30%, boom another message." A
+                # position sitting near two thresholds at once (e.g. trail stop AND
+                # velocity) flips which one currently "wins" every tick as price
+                # jitters, and unconditional category-change bypass meant every
+                # flip re-alerted regardless of how recently the last one fired.
+                # Real one hit VELOCITY at 19:35:40 then TRAIL at 19:39:29 — 4
+                # minutes apart. Category change still short-circuits the full 3h
+                # wait (a genuinely different problem is worth knowing about
+                # promptly), but only after this minimum gap, so pure flapping
+                # near a threshold can't fire faster than this floor.
+                _HOLD_ALERT_COOLDOWN_SEC     = 3 * 3600
+                _HOLD_ALERT_MIN_GAP_SEC      = 15 * 60
                 _reason_cat      = _would_reason.split(" ")[0]
                 _last_reason_cat = (_last_reason or "").split(" ")[0]
-                if _reason_cat != _last_reason_cat or _now - _last_ts >= _HOLD_ALERT_COOLDOWN_SEC:
+                _gap_ok = _now - _last_ts >= _HOLD_ALERT_MIN_GAP_SEC
+                if (_gap_ok and _reason_cat != _last_reason_cat) or _now - _last_ts >= _HOLD_ALERT_COOLDOWN_SEC:
                     pos["hold_alert_reason"] = _would_reason
                     pos["hold_alert_ts"]     = _now
                     _why = (f"still settling in — {int(pos['manual_grace_until'] - _now)}s left "
@@ -8882,11 +8918,12 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _wlt_sell(wid, w, sym, price, reason)
                 await update.message.reply_text(f"✅ Sold {sym}.")
             else:
-                pos["sell_paused"]      = True
-                pos["sell_pause_until"] = time.time() + SELL_DECLINE_PAUSE_SEC
+                pos["sell_paused"] = True
+                _snooze = _next_sell_snooze_sec(pos)
+                pos["sell_pause_until"] = time.time() + _snooze
                 save_state()
                 await update.message.reply_text(
-                    f"⏸️ {sym} paused for ~{SELL_DECLINE_PAUSE_SEC // 60}min, then back to auto.")
+                    f"⏸️ {sym} paused for ~{_snooze // 60:.0f}min, then back to auto.")
         return
 
 
@@ -9034,11 +9071,12 @@ async def _handle_approval_button(query) -> None:
             _wlt_sell(wid, w, symbol, price, reason)
             await query.edit_message_text(f"{orig}\n\n✅ Sold.")
         else:
-            pos["sell_paused"]      = True
-            pos["sell_pause_until"] = time.time() + SELL_DECLINE_PAUSE_SEC
+            pos["sell_paused"] = True
+            _snooze = _next_sell_snooze_sec(pos)
+            pos["sell_pause_until"] = time.time() + _snooze
             save_state()
             await query.edit_message_text(
-                f"{orig}\n\n⏸️ Paused ~{SELL_DECLINE_PAUSE_SEC // 60}min, then back to auto.")
+                f"{orig}\n\n⏸️ Paused ~{_snooze // 60:.0f}min, then back to auto.")
         return
 
 
