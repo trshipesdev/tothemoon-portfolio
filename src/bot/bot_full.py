@@ -3475,8 +3475,19 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
     for mint, ui in balances.items():
         if mint in tracked_mints or ui <= 0 or mint in dust_ignore:
             continue
+        # CATFISH incident (2026-07-03): matching on "buy_failed" here was a real bug —
+        # a failed buy has no units/price (nothing was ever bought), so
+        # rec_units defaulted to 0 below, and usd/max(0, 1e-9) produced an
+        # entry price of $4.7 BILLION from a $4.70 failed-buy attempt. That
+        # got multiplied by real on-chain units into a cost basis of $200+
+        # trillion, which then poisoned recently_exited on the eventual sell
+        # (-$236 trillion "loss") and hard-stopped re-entry on this token for
+        # 8 hours globally. Only match on a REAL "buy" — a token actually in
+        # the wallet after a recorded buy_failed got there some other way
+        # (a later successful retry, manual buy, etc), so fall through to the
+        # on-chain lookup below, which computes price from the real delivering tx.
         rec = next((t for t in reversed(w.get("trade_log", []))
-                    if t.get("address") == mint and t.get("side") in ("buy", "buy_failed")), None)
+                    if t.get("address") == mint and t.get("side") == "buy"), None)
         if rec:
             # Use the TRUE original per-unit entry price, not (original total $) / (units
             # left now). If this token was already partially sold before getting spuriously
