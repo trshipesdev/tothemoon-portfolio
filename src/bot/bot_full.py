@@ -7670,6 +7670,15 @@ def send_alert(msg: str, critical: bool = False, paper: bool = False):
     ALERT_LOG.appendleft({"ts": now_utc().isoformat(), "msg": msg, "critical": critical})
     if paper and _any_wallet_live():
         return
+    # Snooze (2026-07-03) — user: "build a snooze button for everything besides
+    # buys and sells." "🟢 BOUGHT"/"🔴 SOLD" are the two consistent prefixes
+    # _wlt_buy/_wlt_sell use for every REAL trade confirmation regardless of
+    # source (auto, manual, spray, oldcoin) — everything else (market pulse,
+    # AI tips, scout suggestions, hold-alerts, drawdown warnings, night mode)
+    # gets suppressed while snoozed, but still logged to ALERT_LOG above.
+    snooze_until = STATE.get("telegram_snooze_until", 0)
+    if time.time() < snooze_until and not (msg.startswith("🟢 BOUGHT") or msg.startswith("🔴 SOLD")):
+        return
     if not TG_STATE.get("bot") or not TG_STATE.get("loop"):
         return
     chat_id = STATE.get("telegram", {}).get("owner_chat_id")
@@ -7945,6 +7954,7 @@ _CHAT_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("audit"), KeyboardButton("history"), KeyboardButton("market")],
         [KeyboardButton("scout"), KeyboardButton("scout entries"),
          KeyboardButton("scout rejections"), KeyboardButton("scout suggested")],
+        [KeyboardButton("snooze 30"), KeyboardButton("snooze"), KeyboardButton("wake")],
         [KeyboardButton("/wallet"), KeyboardButton("/help_long")],
     ],
     resize_keyboard=True,
@@ -8300,6 +8310,27 @@ async def msg_night_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_market_trend_report())
         return
 
+    # "snooze" / "snooze 30" — user: "build a snooze button for everything
+    # besides buys and sells." Real trade confirmations (🟢 BOUGHT / 🔴 SOLD)
+    # always get through regardless — this only silences everything else
+    # (market pulse, AI tips, scout suggestions, hold-alerts, etc).
+    _snooze_m = re.match(r"snooze(?:\s+(\d+))?$", text)
+    if _snooze_m:
+        minutes = int(_snooze_m.group(1)) if _snooze_m.group(1) else 60
+        STATE["telegram_snooze_until"] = time.time() + minutes * 60
+        save_state()
+        await update.message.reply_text(
+            f"🔕 Snoozed for {minutes} min — you'll only hear about real buys/sells. "
+            f"Say 'wake' to end it early.")
+        return
+    if text in ("wake", "unsnooze", "unmute"):
+        was_snoozed = time.time() < STATE.get("telegram_snooze_until", 0)
+        STATE["telegram_snooze_until"] = 0
+        save_state()
+        await update.message.reply_text(
+            "🔔 Back on — all alerts resumed." if was_snoozed else "Wasn't snoozed, but noted — all alerts are on.")
+        return
+
 
 @require_auth
 async def cmd_skim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8441,7 +8472,9 @@ async def cmd_help_long(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "watch SYMBOL                         — reviews it every ~60s instead of 5min\n"
         "audit                                — win rate, avg win/loss, exit-type breakdown\n"
         "history                              — last 12 trades\n"
-        "scout / scout entries / scout rejections / scout suggested — scout log summary\n\n"
+        "scout / scout entries / scout rejections / scout suggested — scout log summary\n"
+        "snooze [N]                          — mute everything except real buy/sell alerts for N min (default 60)\n"
+        "wake                                 — end snooze early\n\n"
         "── REAL WALLET (acts on your live hot wallet) ──\n"
         "/wallet                              — status: mode, equity, open positions, flags\n"
         "/wmode <mode>                        — change the wallet's mode\n"
