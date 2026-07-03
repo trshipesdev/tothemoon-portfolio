@@ -8890,13 +8890,24 @@ def scan_candidates():
         # Replaced with two checks — a real crash still gets caught fast, normal chop
         # within an uptrend no longer does:
         #  1. FREE-FALL — a genuine crash in the last ~60s (>20% down) is still
-        #     worth blocking immediately, tight window on purpose.
+        #     worth blocking immediately, tight window on purpose. Applies
+        #     regardless of liquidity — no data yet showing liquidity predicts
+        #     free-fall outcomes the way it does sustained decline (below), and
+        #     an active fast dump is dangerous even in a deep pool.
         #  2. SUSTAINED DECLINE — down more than 10% over a real 5-minute window.
-        #     Wide enough to separate noise from an actual bleed; the existing h1/h6
-        #     trend checks elsewhere already require the longer trend to be green,
-        #     so this only needs to catch what those miss.
+        #     Audited real outcomes 2026-07-03 on 24 real rejections: dip SIZE had
+        #     ~zero predictive power (FRIGGER dipped -94.5% and stayed dead; MITCH
+        #     dipped only -19% and went to +6633%; PAGING dipped -37.6%, one of the
+        #     biggest, and went to +481%). But LIQUIDITY split the sample almost
+        #     perfectly: every single winner (9/9) had liq >= $21k; every single
+        #     real disaster (13/13) had liq < $12.4k. A thin pool showing a decline
+        #     is usually genuinely dying; a deep pool showing the same dip is more
+        #     often just shaking out weak hands before continuing. Exempted once a
+        #     candidate already clears real liquidity depth — the existing h1/h6
+        #     trend checks elsewhere still apply either way.
         # Exempt on <2 readings (a token's very first sighting) — never blocks a
         # brand-new candidate with no history yet.
+        _LIQ_RESILIENCE_THRESHOLD = 20000.0
         if len(_tick_hist) >= 2:
             _now_ts   = time.time()
             _recent_1m = [px for ts, px in _tick_hist if _now_ts - ts <= 60]
@@ -8906,11 +8917,12 @@ def scan_candidates():
                        f"free-fall — {_dip_pct:.1f}% in the last ~60s", sc, addr)
                 continue
             _oldest_5m = _tick_hist[0][1]
-            if _oldest_5m > 0 and price < _oldest_5m * 0.90:
+            if liq < _LIQ_RESILIENCE_THRESHOLD and _oldest_5m > 0 and price < _oldest_5m * 0.90:
                 _dip_pct = (price / _oldest_5m - 1) * 100
                 _scout(symbol, chain, "rejected",
                        f"sustained decline — {_dip_pct:.1f}% over last "
-                       f"{max(1, int((_now_ts - _tick_hist[0][0]) / 60))}min", sc, addr)
+                       f"{max(1, int((_now_ts - _tick_hist[0][0]) / 60))}min "
+                       f"(liq ${liq:,.0f})", sc, addr)
                 continue
         # Lower-high guard — blocks buying a WEAKER bounce than a peak the bot itself
         # already HELD a position through today, no matter how long ago or how many
