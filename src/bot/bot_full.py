@@ -3920,9 +3920,19 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
                 # was true almost every single tick, completely bypassing the 300s
                 # cooldown — POKERBULL alone fired 61 alerts in 32 minutes (~1 every
                 # 30s) this way.
+                #
+                # Cooldown widened 300s -> 3h (2026-07-03): with the category-compare
+                # fix above, spam per se was gone, but a HELD position sitting past a
+                # trail-stop level for hours still got re-pinged every 5min all night —
+                # most of those coins were fine by morning. User: "the bot was trying
+                # to sell them over and over all night long... i could've used help
+                # this morning [instead]." Same real-time behavior, just far less
+                # frequent — a stuck trail-stop condition is still worth knowing about,
+                # just not every 5 minutes.
+                _HOLD_ALERT_COOLDOWN_SEC = 3 * 3600
                 _reason_cat      = _would_reason.split(" ")[0]
                 _last_reason_cat = (_last_reason or "").split(" ")[0]
-                if _reason_cat != _last_reason_cat or _now - _last_ts >= 300:
+                if _reason_cat != _last_reason_cat or _now - _last_ts >= _HOLD_ALERT_COOLDOWN_SEC:
                     pos["hold_alert_reason"] = _would_reason
                     pos["hold_alert_ts"]     = _now
                     _why = (f"still settling in — {int(pos['manual_grace_until'] - _now)}s left "
