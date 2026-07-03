@@ -3833,7 +3833,16 @@ def _manage_wallet_positions(wid: str, w: Dict, live_prices: Dict):
                 _now = time.time()
                 _last_reason = pos.get("hold_alert_reason")
                 _last_ts     = pos.get("hold_alert_ts", 0)
-                if _would_reason != _last_reason or _now - _last_ts >= 300:
+                # Compare only the reason CATEGORY (first word — "TRAIL"/"VELOCITY"/
+                # "DOLLAR"/"fixed_sl"), not the full string. Found live 2026-07-03:
+                # comparing the full text (which embeds a live-changing %, e.g.
+                # "TRAIL STOP -39.4%" vs "-40.1%") meant _would_reason != _last_reason
+                # was true almost every single tick, completely bypassing the 300s
+                # cooldown — POKERBULL alone fired 61 alerts in 32 minutes (~1 every
+                # 30s) this way.
+                _reason_cat      = _would_reason.split(" ")[0]
+                _last_reason_cat = (_last_reason or "").split(" ")[0]
+                if _reason_cat != _last_reason_cat or _now - _last_ts >= 300:
                     pos["hold_alert_reason"] = _would_reason
                     pos["hold_alert_ts"]     = _now
                     _why = (f"still settling in — {int(pos['manual_grace_until'] - _now)}s left "
