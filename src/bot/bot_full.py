@@ -8155,11 +8155,17 @@ def send_alert(msg: str, critical: bool = False, paper: bool = False):
         if q[0] <= hour < q[1]:
             return
 
+    # Delivery failures here used to be fully silent (bare `except: pass`) —
+    # unlike send_approval_prompt (fixed 2026-07-03), this is the function behind
+    # almost everything (market pulse, hold-alerts, buy/sell confirmations), so a
+    # real Telegram outage would leave zero trace anywhere. Logging failures now
+    # so "did I actually get that message" is answerable from the logs instead
+    # of a guess.
     async def _send():
         try:
             await TG_STATE["bot"].send_message(chat_id=chat_id, text=msg)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"WARN send_alert: Telegram send FAILED: {e}")
 
     asyncio.run_coroutine_threadsafe(_send(), TG_STATE["loop"])
 
