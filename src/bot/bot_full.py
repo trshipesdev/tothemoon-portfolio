@@ -381,6 +381,11 @@ SAVEFILE        = _state_path_env if _state_path_env else f"state_{CONFIG['tenan
 TRADELOG_FILE   = os.path.join(os.path.dirname(SAVEFILE) or ".", "trades.jsonl")
 SCAN_LOG_FILE   = os.path.join(os.path.dirname(SAVEFILE) or ".", "scan_log.jsonl")
 WALLETS_FILE    = os.path.join(os.path.dirname(SAVEFILE) or ".", "wallets.json")
+# Real-money trade history, append-only — never truncated, never overwritten by a
+# stale wallets.json rewrite. User (2026-07-03), after a ~$175 real loss with no
+# way to trace what happened because the wallet's trade_log had silently lost its
+# first ~10 hours: "we need to keep the entire history... this is real money."
+WALLET_TRADELOG_FILE = os.path.join(os.path.dirname(SAVEFILE) or ".", "wallet_trades.jsonl")
 _SCAN_LOG_MAX_LINES = 100_000   # rotate oldest half when exceeded
 
 
@@ -499,6 +504,41 @@ def _load_tradelog_file() -> List[Dict]:
     return records
 
 
+def _append_wallet_trade(wid: str, entry: Dict) -> None:
+    """Append one real-money trade to the append-only JSONL file — survives
+    wallets.json corruption, a stale-read overwrite, or any full-file rewrite.
+    Call this at the SAME time as w["trade_log"].append(entry), never instead of."""
+    try:
+        with open(WALLET_TRADELOG_FILE, "a") as f:
+            f.write(json.dumps({"wid": wid, **entry}, default=str) + "\n")
+    except Exception as e:
+        log(f"WARN _append_wallet_trade failed: {e}")
+
+
+def _load_wallet_tradelog_file() -> Dict[str, List[Dict]]:
+    """Read wallet_trades.jsonl and return records grouped by wallet id,
+    skipping corrupt lines."""
+    by_wid: Dict[str, List[Dict]] = {}
+    try:
+        with open(WALLET_TRADELOG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    wid = rec.pop("wid", None)
+                    if wid:
+                        by_wid.setdefault(wid, []).append(rec)
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"WARN _load_wallet_tradelog_file failed: {e}")
+    return by_wid
+
+
 def _save_wallets():
     """Persist wallets to a separate file so they survive state.json corruption."""
     try:
@@ -525,6 +565,34 @@ def _load_wallets():
         pass
     except Exception as e:
         log(f"WARN _load_wallets failed: {e}")
+
+    # Merge the append-only trade log back in — recovers any history that's
+    # missing from wallets.json (stale-read overwrite, corruption, an old bug —
+    # whatever the cause, this file is the one thing that can't be silently
+    # truncated by a full-wallet-dict rewrite). Dedup by (ts, symbol, side, usd)
+    # so a normal restart doesn't produce duplicates.
+    file_trades = _load_wallet_tradelog_file()
+    for wid, w in STATE.get("wallets", {}).items():
+        recs = file_trades.get(wid)
+        if not recs:
+            continue
+        existing_keys = {
+            (t.get("ts"), t.get("symbol"), t.get("side"), t.get("usd"))
+            for t in w.get("trade_log", [])
+        }
+        merged = list(w.get("trade_log", []))
+        added = 0
+        for t in recs:
+            k = (t.get("ts"), t.get("symbol"), t.get("side"), t.get("usd"))
+            if k not in existing_keys:
+                merged.append(t)
+                existing_keys.add(k)
+                added += 1
+        if added:
+            merged.sort(key=lambda t: t.get("ts", ""))
+            w["trade_log"] = merged
+            log(f"load_wallets: recovered {added} trade(s) for {wid} from wallet_trades.jsonl "
+                f"— trade_log now {len(merged)} total")
 
 
 def save_state():
@@ -2948,11 +3016,13 @@ def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
         result = _wlt_live_buy(wid, w, symbol, usd, addr, ref_price=price)
         if "error" in result:
             log(f"[W:{wid}] LIVE BUY FAILED {symbol}: {result['error']}")
-            w.setdefault("trade_log", []).append({
+            _fail_rec = {
                 "ts": now_utc().isoformat(), "symbol": symbol, "chain": chain,
                 "side": "buy_failed", "usd": usd, "error": result["error"],
                 "address": addr, "mode": w.get("mode") or CONFIG["mode"],
-            })
+            }
+            w.setdefault("trade_log", []).append(_fail_rec)
+            _append_wallet_trade(wid, _fail_rec)
             save_state()
             return
         filled   = result["price"]
@@ -2993,6 +3063,7 @@ def _wlt_buy(wid: str, w: Dict, symbol: str, chain: str,
         "sig": _buy_sig,
     }
     w.setdefault("trade_log", []).append(entry)
+    _append_wallet_trade(wid, entry)
     log(f"[W:{wid}] BUY {symbol} ${usd:.2f} @ {filled:.6f}")
     if w.get("live") and _buy_sig:
         send_alert(
@@ -3021,11 +3092,13 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
             # flat 60s wait on every failure. Urgent exits retry in 10s instead.
             pos["sell_fail_cooldown"] = 10 if urgent else 60
             pos["sell_fails"]   = int(pos.get("sell_fails", 0)) + 1
-            w.setdefault("trade_log", []).append({
+            _fail_rec = {
                 "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "sol"),
                 "side": "sell_failed", "usd": target_usd, "error": result["error"],
                 "exit_reason": exit_reason, "address": pos.get("address", ""),
-            })
+            }
+            w.setdefault("trade_log", []).append(_fail_rec)
+            _append_wallet_trade(wid, _fail_rec)
             save_state()
             return
         # Use actual proceeds to derive the effective exit price
@@ -3099,6 +3172,7 @@ def _wlt_sell(wid: str, w: Dict, symbol: str, price: float,
         "sig": _sell_sig,
     }
     w.setdefault("trade_log", []).append(sell_rec)
+    _append_wallet_trade(wid, sell_rec)
     log(f"[W:{wid}] SELL {symbol} pnl ${pnl:.2f} [{exit_reason}]")
     if w.get("live") and _sell_sig:
         send_alert(
@@ -3465,12 +3539,14 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
         if actual <= 0:
             cost = pos.get("usd", 0.0)
             log(f"[W:{wid}] RECONCILE {symbol}: on-chain balance=0 → closing ghost position (cost=${cost:.2f})")
-            w.setdefault("trade_log", []).append({
+            _close_rec = {
                 "ts": now_utc().isoformat(), "symbol": symbol, "chain": pos.get("chain", "sol"),
                 "side": "closed", "usd": 0.0, "pnl": None,
                 "exit_reason": "manual_sell_detected", "address": mint,
                 "entry_price": pos.get("avg", 0),
-            })
+            }
+            w.setdefault("trade_log", []).append(_close_rec)
+            _append_wallet_trade(wid, _close_rec)
             w["positions"].pop(symbol, None)
             w["cur_deployed_usd"] = max(0.0, w.get("cur_deployed_usd", 0.0) - cost)
             changed = True
