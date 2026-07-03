@@ -2906,9 +2906,19 @@ def _wlt_size(w: Dict, symbol: str, chain: str, liq: float, addr: str = "",
 def _wlt_can_enter(w: Dict, symbol: str, chain: str) -> bool:
     MS = CONFIG["moonshot"]
     mode_name = w.get("mode") or CONFIG["mode"]
-    # Max open positions
-    open_pos = sum(1 for p in w.get("positions", {}).values() if p.get("units", 0) > 0)
-    if open_pos >= MS.get("max_open_positions", 8):
+    # Max open positions — manually-added positions don't count against this.
+    # User (2026-07-03): "my manual positions shouldn't effect the bots caps."
+    # Real incident: all 8 open positions were manual trending-coin buys,
+    # silently maxing out the cap and blocking every automated entry all
+    # night — the bot never had a chance to enter anything on its own.
+    # Also fixed the cap itself reading MS (moonshot sub-config, never
+    # explicitly set there, silently falling back to 8) instead of the real,
+    # dashboard-visible CONFIG["max_open_positions"] (12) — those had drifted
+    # apart and nothing surfaced that the wallet was enforcing a different,
+    # lower number than what was actually shown.
+    open_pos = sum(1 for p in w.get("positions", {}).values()
+                   if p.get("units", 0) > 0 and not p.get("manual"))
+    if open_pos >= CONFIG.get("max_open_positions", 12):
         return False
     # Daily entry count per token
     max_per_day = CONFIG.get("max_entries_per_token_day", 4)
@@ -3482,12 +3492,13 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
                 pos["avg"]   = pos["usd"] / max(actual, 1e-9)   # blended cost basis
                 pos["deployed_usd"] = pos.get("deployed_usd", pos["usd"]) + added_usd
                 pos["manual_grace_until"] = time.time() + 120   # same grace window as a fresh manual adopt
+                pos["manual"] = True   # permanent — excludes from max_open_positions, see _wlt_can_enter
                 w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + added_usd
                 log(f"[W:{wid}] RECONCILE {symbol}: manual top-up detected, +{added_units:.4f} units "
                     f"(${added_usd:.2f}) merged, new avg {pos['avg']:.8f}")
                 send_alert(f"🔎 Added to {symbol} on {w.get('label', wid)}: manual buy of "
                            f"${added_usd:.2f} merged into the tracked position (now managing "
-                           f"{actual:.0f} units total) — 5min grace protection applied.",
+                           f"{actual:.0f} units total) — 2min grace protection applied.",
                            critical=True)
                 changed = True
 
@@ -3568,6 +3579,10 @@ def _wlt_reconcile_positions(wid: str, w: Dict):
             # HOLD toggle (rug/liq-drain protection still active). Shortened to 2min
             # (2026-07-03, user: "shorten the watch on manuals to 2 minutes").
             w["positions"][symbol]["manual_grace_until"] = time.time() + 120
+            # Permanent marker (unlike manual_grace_until, this never expires) —
+            # excludes this position from the max_open_positions count so manual
+            # buys can never silently block the bot's own automated entries.
+            w["positions"][symbol]["manual"] = True
         w["cur_deployed_usd"] = w.get("cur_deployed_usd", 0.0) + usd
         log(f"[W:{wid}] RECONCILE ADOPT {symbol}: {ui:.4f} on-chain tokens from "
             f"{src} @ {entry_ts[:19]} — now tracked and exit-managed")
