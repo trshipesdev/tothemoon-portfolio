@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 .venv/
@@ -10,9 +10,7 @@ state_*.json
 .DS_Store
 Thumbs.db
 
-# Private hand-off docs (kept local, never published)
-HANDOFF-SETUP.md
-
 # Live runtime state (per-deploy, never versioned)
 data/state.json
 data/trades.jsonl
+recordings/
