@@ -53,7 +53,7 @@ python3 src/bot/tests.py -v TestShadowRoundTrip
 python3 src/bot/tests.py -v TestFlaskAPI
 ```
 
-243 tests, all covering core logic in-process without live network calls.
+380 tests covering core logic in-process without live network calls.
 
 ---
 
