@@ -4,6 +4,8 @@ Multi-chain crypto scalping bot. Scans DexScreener for new launches and old-coin
 
 Chains: Solana, Ethereum, Base, BSC, Polygon.
 
+This started as an idea and got out of hand lol. Most of it lives in one very large file because it grew one late-night fix at a time.
+
 ---
 
 ## Quickstart (local)
@@ -112,9 +114,9 @@ python3 src/bot/tests.py -v TestFlaskAPI
 | Mode | TP | SL | Slippage | Min liq |
 |---|---|---|---|---|
 | `safe` | +15% | −7% | 0.6% | $50k |
-| `default` | +28% | −12% | 1.0% | $30k |
-| `hype` | +45%, +90% | −18% | 1.5% | $20k |
-| `degen` | +80%, +150% | −28% | 2.2% | $10k |
+| `default` | +28% | −12% | 3.0% | $30k |
+| `hype` | +45%, +90% | −18% | 5.0% | $20k |
+| `degen` | +80%, +150% | −28% | 2.2% | $15k |
 
 Moonshot positions use separate TP cascades: +35% / +60% / +120%.
 

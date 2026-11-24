@@ -131,7 +131,7 @@ class TestHelpers(unittest.TestCase):
     def test_px_dict_defaults(self):
         d = bot._px_dict(1.5)
         self.assertEqual(d["price"], 1.5)
-        self.assertEqual(d["liq"], 100000.0)
+        self.assertEqual(d["liq"], 0.0)   # unknown liquidity is treated as none
         self.assertEqual(d["vol_h1"], 0.0)
         self.assertEqual(d["change_m5"], 0.0)
 
@@ -162,7 +162,7 @@ class TestHelpers(unittest.TestCase):
     def test_parse_dex_pair_missing_fields_use_defaults(self):
         d = bot._parse_dex_pair({"priceUsd": "1.0"})
         self.assertIsNotNone(d)
-        self.assertEqual(d["liq"], 100000.0)
+        self.assertEqual(d["liq"], 0.0)
         self.assertEqual(d["vol_h1"], 0.0)
 
     def test_now_utc_is_timezone_aware(self):
@@ -375,8 +375,10 @@ class TestMoonshotFilters(unittest.TestCase):
         # a 1000%+ pump to enter under 1h old) and past the h1/h6 20min exemption — so
         # h1/h6 must be explicitly positive here for the baseline candidate to pass,
         # same as a real healthy candidate would need.
+        # price_chg_m5 must also be positive: the filters require upward movement
+        # in the last 5 minutes, not just a green hour.
         return bot.Score(hype, liq, age_min, positive, buy_ratio=buy_ratio,
-                         price_chg_h1=5.0, price_chg_h6=5.0)
+                         price_chg_h1=5.0, price_chg_h6=5.0, price_chg_m5=5.0)
 
     def test_passes_valid_candidate(self):
         self.assertTrue(bot.passes_moonshot_filters(self._sc()))
@@ -420,12 +422,16 @@ class TestMoonshotFilters(unittest.TestCase):
         self.assertTrue(bot.passes_moonshot_filters(self._sc(liq=spray_min)))
 
     def test_mode_liq_floor_applies(self):
-        # degen ($10k) accepts a $12k token that default ($30k) would reject
-        sc12k = self._sc(liq=12000)
+        # a token just above degen's floor passes in degen but is rejected by
+        # default's higher floor
+        degen_min   = bot.CONFIG["modes"]["degen"]["liq_min"]
+        default_min = bot.CONFIG["modes"]["default"]["liq_min"]
+        self.assertLess(degen_min, default_min * 0.9)
+        sc = self._sc(liq=degen_min + 1000)
         bot.CONFIG["mode"] = "default"
-        self.assertIsNotNone(bot.moonshot_reject_reason(sc12k))   # rejected at $30k
+        self.assertIsNotNone(bot.moonshot_reject_reason(sc))
         bot.CONFIG["mode"] = "degen"
-        self.assertIsNone(bot.moonshot_reject_reason(sc12k))      # passes at $10k
+        self.assertIsNone(bot.moonshot_reject_reason(sc))
         bot.CONFIG["mode"] = "default"
 
     def test_spray_relaxes_hype_min(self):
@@ -481,7 +487,7 @@ class TestCapitalSizing(unittest.TestCase):
         self.assertGreater(bot.per_chain_room("unknown_xyz"), 0.0)
 
     def test_per_token_cap_room(self):
-        self.assertAlmostEqual(bot.per_token_cap_room(),
+        self.assertAlmostEqual(bot.per_token_cap_room("NEW"),
                                bot.CONFIG["per_token_cap_pct"] * 750.0, places=2)
 
     def test_size_ticket_positive(self):
@@ -501,7 +507,8 @@ class TestCapitalSizing(unittest.TestCase):
     def test_size_ticket_daily_cap_near_limit(self):
         cap = bot.CONFIG["daily_deploy_cap_pct"] * 750.0
         bot.STATE["open_today_usd"] = cap - 1.0
-        self.assertLessEqual(bot.size_ticket_usd("sol"), 1.0)
+        with patch.object(bot.random, "uniform", return_value=1.0):   # no sizing jitter
+            self.assertLessEqual(bot.size_ticket_usd("sol"), 1.0)
 
     def test_size_ticket_brake_reduces(self):
         bot.STATE["pnl_hist"] = [-200, -100, -50]
@@ -511,10 +518,11 @@ class TestCapitalSizing(unittest.TestCase):
         self.assertLessEqual(braked, brake_max)
 
     def test_size_ticket_expired_boost_ignored(self):
-        bot.STATE["boost"] = {"mult": 5.0, "expires": "2000-01-01T00:00:00+00:00"}
-        t_with_expired = bot.size_ticket_usd("sol")
-        bot.STATE["boost"] = {"mult": 1.0, "expires": None}
-        t_no_boost = bot.size_ticket_usd("sol")
+        with patch.object(bot.random, "uniform", return_value=1.0):
+            bot.STATE["boost"] = {"mult": 5.0, "expires": "2000-01-01T00:00:00+00:00"}
+            t_with_expired = bot.size_ticket_usd("sol")
+            bot.STATE["boost"] = {"mult": 1.0, "expires": None}
+            t_no_boost = bot.size_ticket_usd("sol")
         self.assertAlmostEqual(t_with_expired, t_no_boost, places=4)
 
 
@@ -1677,14 +1685,14 @@ class TestBoost(unittest.TestCase):
     def test_unexpired_boost_active(self):
         future = (bot.now_utc().replace(year=bot.now_utc().year + 1)).isoformat()
         bot.STATE["boost"] = {"mult": 2.0, "expires": future}
-        # Ticket with boost should be >= ticket without (subject to caps)
-        t_boost    = bot.size_ticket_usd("sol")
-        bot.STATE["boost"] = {"mult": 1.0, "expires": None}
-        t_no_boost = bot.size_ticket_usd("sol")
-        room = bot.per_chain_room("sol")
-        base = bot.CONFIG["base_size_usd"] * bot.CONFIG["modes"]["default"]["size_mult"]
-        if room > base * 2:
-            self.assertGreater(t_boost, t_no_boost)
+        # Ticket with boost should be >= ticket without (the risk caps can hold
+        # both to the same ceiling). Pin the +/-5% sizing jitter so the two
+        # calls are comparable.
+        with patch.object(bot.random, "uniform", return_value=1.0):
+            t_boost    = bot.size_ticket_usd("sol")
+            bot.STATE["boost"] = {"mult": 1.0, "expires": None}
+            t_no_boost = bot.size_ticket_usd("sol")
+        self.assertGreaterEqual(t_boost, t_no_boost)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1695,7 +1703,9 @@ class TestAutoscaleMaybe(unittest.TestCase):
 
     def setUp(self):
         _reset(1000.0)
-        bot.shadow_buy("TST", "sol", 100.0, 1.0, 100000.0)
+        # $64 leaves room under the per-token cap (12% of $750 = $90) for a 25%
+        # add ($16) that also clears the $15 minimum ticket.
+        bot.shadow_buy("TST", "sol", 64.0, 1.0, 100000.0)
         bot.STATE["positions"]["TST"]["add_count"]   = 0
         bot.STATE["positions"]["TST"]["last_add_ts"] = 0.0
 
@@ -2015,7 +2025,8 @@ class TestScoutLog(unittest.TestCase):
     def _sc(self, hype=90, liq=50000, age_min=65, positive=True):
         # age_min=65: same reasoning as the sibling helper in TestMoonshotFilters —
         # past both the 2026-07-02 "just hatched" gate and the h1/h6 20min exemption.
-        return bot.Score(hype, liq, age_min, positive, price_chg_h1=5.0, price_chg_h6=5.0)
+        return bot.Score(hype, liq, age_min, positive, price_chg_h1=5.0, price_chg_h6=5.0,
+                         price_chg_m5=5.0)
 
     def test_reject_reason_none_when_passing(self):
         self.assertIsNone(bot.moonshot_reject_reason(self._sc()))
@@ -2343,6 +2354,7 @@ class TestSafetyGate(unittest.TestCase):
         _reset()
         bot._reddit_cache.clear()
         bot._x_cache.clear()
+        bot._rugcheck_cache.clear()
         os.environ.pop("X_BEARER_TOKEN", None)
         bot.CONFIG["safety"].update({
             "reddit_enabled": True, "x_enabled": True, "onchain_enabled": True,
